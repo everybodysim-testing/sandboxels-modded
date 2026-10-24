@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Little Worlds — Voxel Sandbox</title>
+<style>
+:root{--panel:rgba(14,22,29,.88);--line:rgba(255,255,255,.13);--text:#edf5f0;--muted:#a5b8b2;--accent:#9be6a8}
+*{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#91c9d5;color:var(--text);font:14px/1.35 system-ui,-apple-system,Segoe UI,sans-serif}canvas{display:block;width:100%;height:100%;outline:none}
+#hud{position:fixed;inset:0;pointer-events:none}.panel{pointer-events:auto;background:var(--panel);border:1px solid var(--line);box-shadow:0 12px 40px #15242a2b;backdrop-filter:blur(16px);border-radius:16px}
+.brand{position:absolute;left:18px;top:18px;padding:13px 16px;display:flex;gap:12px;align-items:center}.logo{width:34px;height:34px;border-radius:11px;background:linear-gradient(145deg,#baf3b7,#4f9d76);display:grid;place-items:center;color:#16382c;font-size:20px}.brand strong{display:block;font-size:15px;letter-spacing:.2px}.brand small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.tools{position:absolute;left:18px;top:105px;width:198px;padding:12px}.eyebrow{color:var(--muted);font-size:10px;font-weight:800;letter-spacing:1.5px;margin:3px 5px 9px}.material{display:flex;align-items:center;gap:10px;width:100%;padding:9px 10px;margin:3px 0;border:1px solid transparent;border-radius:10px;color:var(--text);background:transparent;text-align:left;cursor:pointer;font:inherit}.material:hover{background:#ffffff0b}.material.active{background:#a0e6ad1a;border-color:#9be6a866}.swatch{width:22px;height:22px;border-radius:7px;flex-shrink:0;border:1px solid #ffffff35;box-shadow:inset 0 2px 3px #ffffff25}.key{margin-left:auto;color:#8da39d;font-size:10px}
+.right{position:absolute;right:18px;top:18px;width:205px;padding:14px}.stat{display:flex;justify-content:space-between;margin:9px 2px;color:var(--muted);font-size:12px}.stat b{color:var(--text);font-weight:650}.divider{height:1px;background:var(--line);margin:12px 0}.button{border:1px solid var(--line);background:#ffffff0b;color:var(--text);border-radius:10px;padding:9px 11px;cursor:pointer;font:inherit}.button:hover{background:#ffffff16}.button.primary{background:#b8efc0;color:#173c2a;border-color:#b8efc0;font-weight:750}.row{display:flex;gap:7px}.row .button{flex:1}
+.bottom{position:absolute;left:50%;bottom:18px;transform:translateX(-50%);padding:10px 14px;display:flex;gap:12px;align-items:center;white-space:nowrap}.bottom .sep{width:1px;height:24px;background:var(--line)}.bottom span{color:var(--muted);font-size:12px}.bottom b{color:var(--text);font-weight:650}.brush{display:flex;align-items:center;gap:8px}.brush input{width:86px;accent-color:#a7eab3}
+#toast{position:absolute;top:90px;left:50%;transform:translateX(-50%);background:#14241fe8;border:1px solid #ffffff22;padding:9px 14px;border-radius:10px;opacity:0;transition:opacity .2s;white-space:nowrap}#toast.show{opacity:1}
+#crosshair{position:fixed;left:50%;top:50%;width:14px;height:14px;transform:translate(-50%,-50%);pointer-events:none;opacity:.8}#crosshair:before,#crosshair:after{content:"";position:absolute;background:#fff;border-radius:2px;box-shadow:0 1px 4px #0008}#crosshair:before{width:14px;height:2px;top:6px}#crosshair:after{height:14px;width:2px;left:6px}
+#start{position:fixed;inset:0;background:linear-gradient(120deg,#0d211dcc,#122b28aa);display:grid;place-items:center;z-index:5}.startcard{max-width:460px;margin:20px;padding:28px;border-radius:22px;background:#101d20f2;border:1px solid #ffffff24;box-shadow:0 25px 90px #0005}.startcard h1{font-size:30px;margin:0 0 9px;letter-spacing:-1px}.startcard p{color:#b5c7c0;line-height:1.6}.startcard .button{margin-top:10px;width:100%;padding:12px}.tag{display:inline-block;padding:5px 9px;border-radius:99px;background:#a1e6ae1a;color:#a9edb6;font-size:11px;font-weight:800;letter-spacing:1px;margin-bottom:13px}
+@media(max-width:700px){.tools{top:95px;left:10px;width:155px;padding:8px}.material{padding:7px;font-size:12px}.right{right:10px;top:10px;width:150px;padding:10px}.brand{left:10px;top:10px;padding:9px}.brand small{display:none}.bottom{bottom:10px;gap:8px;padding:8px;font-size:11px}.bottom span{font-size:10px}.brush input{width:55px}.logo{width:28px;height:28px}}
+</style>
+</head>
+<body>
+<div id="hud">
+ <div class="brand panel"><div class="logo">✳</div><div><strong>Little Worlds</strong><small>voxel material playground</small></div></div>
+ <div class="tools panel"><div class="eyebrow">MATERIALS</div><div id="materials"></div><div class="divider"></div><button class="button" id="erase" style="width:100%">⌫ Eraser <span class="key">E</span></button></div>
+ <div class="right panel"><div class="eyebrow">WORLD STATUS</div><div class="stat"><span>Simulation</span><b id="simstatus">Running</b></div><div class="stat"><span>Particles</span><b id="particlecount">—</b></div><div class="stat"><span>Brush size</span><b id="brushlabel">3</b></div><div class="divider"></div><div class="row"><button class="button primary" id="pause">Ⅱ Pause</button><button class="button" id="step">Step →</button></div><div class="row" style="margin-top:7px"><button class="button" id="reset">↻ Reset</button><button class="button" id="save">↓ Save</button></div><div class="row" style="margin-top:7px"><button class="button" id="load">↑ Load</button><button class="button" id="clear">Clear</button></div><div class="divider"></div><div class="stat"><span>Simulation speed</span><b id="speedlabel">1×</b></div><input id="speed" type="range" min="1" max="4" value="1" style="width:100%;accent-color:#a7eab3"><div class="stat"><span>Water level</span><b>dynamic</b></div></div>
+ <div class="bottom panel"><div class="brush"><span>Brush</span><input id="brush" type="range" min="1" max="8" value="3"><b id="brushbottom">3</b></div><div class="sep"></div><span><b>Left click</b> paint</span><span><b>Right click</b> erase</span><div class="sep"></div><span><b>Drag</b> orbit</span><span><b>Wheel</b> zoom</span></div>
+ <div id="toast"></div>
+</div><div id="crosshair"></div>
+<div id="start"><div class="startcard"><div class="tag">A TINY MATERIAL UNIVERSE</div><h1>Make a little mess.</h1><p>Paint materials into a miniature 3D world and watch them interact. Sand tumbles, water settles and spreads, fire consumes plants, and smoke drifts upward. There are no goals—just experiments.</p><p><b>Tip:</b> choose a material, then paint on the world. Orbit with a drag and zoom with the wheel.</p><button class="button primary" id="begin">Enter the sandbox ↗</button></div></div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script>
+(()=>{
+const defs={
+ sand:{name:'Sand',color:'#e7c477',type:1,key:'1'},water:{name:'Water',color:'#4ba9e8',type:2,key:'2'},stone:{name:'Stone',color:'#858f94',type:3,key:'3'},dirt:{name:'Soil',color:'#926348',type:4,key:'4'},grass:{name:'Grass',color:'#65b85d',type:5,key:'5'},wood:{name:'Wood',color:'#96613b',type:6,key:'6'},plant:{name:'Plant',color:'#78d46c',type:7,key:'7'},fire:{name:'Fire',color:'#ff762e',type:8,key:'8'},smoke:{name:'Smoke',color:'#9da9b1',type:9,key:'9'},lava:{name:'Lava',color:'#f04425',type:10,key:'0'}
+};
+let selected=1,paused=false,brush=3,speed=1,world,scene,camera,renderer,raycaster,plane,instanced,matMeshes={},last=0,acc=0,drag=false,prev={x:0,y:0},yaw=.65,pitch=.58,dist=24,toastTimer;
+const W=48,H=30,D=36,N=W*H*D;let grid=new Uint8Array(N),life=new Uint16Array(N),updated=new Uint8Array(N),tick=0;
+const idx=(x,y,z)=>x+y*W+z*W*H,inside=(x,y,z)=>x>=0&&x<W&&y>=0&&y<H&&z>=0&&z<D;
+function get(x,y,z){return inside(x,y,z)?grid[idx(x,y,z)]:3}
+function put(x,y,z,t){if(!inside(x,y,z))return;let i=idx(x,y,z);grid[i]=t;life[i]=0}
+function swap(x,y,z,nx,ny,nz){if(!inside(nx,ny,nz))return false;let a=idx(x,y,z),b=idx(nx,ny,nz);if(grid[b]!==0)return false;grid[b]=grid[a];life[b]=life[a];grid[a]=0;life[a]=0;return true}
+function buildTerrain(){
+ grid.fill(0);life.fill(0);
+ for(let x=0;x<W;x++)for(let z=0;z<D;z++){
+  let h=5+Math.floor(1.8*Math.sin(x*.24)+1.3*Math.cos(z*.28)+.8*Math.sin((x+z)*.32));
+  h=Math.max(2,Math.min(9,h));
+  for(let y=0;y<h;y++)put(x,y,z,y===h-1?5:y>h-3?4:3);
+ }
+ // stone outcrops and little sandy beach
+ for(let x=0;x<W;x++)for(let z=0;z<D;z++){
+  let h=-1;for(let y=H-1;y>=0;y--)if(get(x,y,z)!==0){h=y;break}
+  if(h>=0&&((x<5)||(z<4)||(x>W-5)))put(x,h,z,1);
+ }
+ // pond basin
+ for(let x=28;x<38;x++)for(let z=8;z<18;z++){
+  let h=-1;for(let y=H-1;y>=0;y--)if(get(x,y,z)!==0){h=y;break}
+  if(h>=0){for(let yy=h;yy>=Math.max(1,h-2);yy--)put(x,yy,z,4);for(let yy=h-1;yy<h+2&&yy<H;yy++)if(yy>0)put(x,yy,z,0);}
+ }
+ // fill pond with water to a level
+ for(let x=29;x<37;x++)for(let z=9;z<17;z++)for(let y=5;y<8;y++)if(get(x,y,z)===0)put(x,y,z,2);
+ // tree trunks + leafy canopies
+ for(const [tx,tz] of [[8,8],[15,23],[23,6],[39,24],[42,10],[19,15]]){
+  let base=0;for(let y=H-1;y>=0;y--)if(get(tx,y,tz)!==0){base=y+1;break}
+  for(let y=base;y<base+4;y++)put(tx,y,tz,6);
+  for(let dx=-2;dx<=2;dx++)for(let dz=-2;dz<=2;dz++)for(let dy=2;dy<=5;dy++)if(Math.abs(dx)+Math.abs(dz)+Math.abs(dy-3)<=5&&inside(tx+dx,base+dy,tz+dz)&&get(tx+dx,base+dy,tz+dz)===0)put(tx+dx,base+dy,tz+dz,7);
+ }
+}
+function stepSim(){
+ tick++;updated.fill(0);
+ // bottom-up and alternating horizontal scan avoids obvious directional bias
+ let rev=tick%2===0;
+ for(let y=1;y<H-1;y++)for(let zz=0;zz<D;zz++){
+  let z=rev?D-1-zz:zz;
+  for(let xx=0;xx<W;xx++){
+   let x=rev?W-1-xx:xx,i=idx(x,y,z),t=grid[i];if(!t||updated[i])continue;
+   if(t===1){ // sand falls, then rolls diagonally
+    if(swap(x,y,z,x,y-1,z))continue;
+    let dirs=Math.random()<.5?[-1,1]:[1,-1],moved=false;
+    for(let dx of dirs){for(let dz of (Math.random()<.5?[-1,1]:[1,-1]))if(get(x+dx,y-1,z+dz)===0&&swap(x,y,z,x+dx,y-1,z+dz)){moved=true;break}if(moved)break;}
+   } else if(t===2||t===10){ // liquid fall and spread
+    if(swap(x,y,z,x,y-1,z))continue;
+    let dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+    if(Math.random()<.5)dirs.reverse();
+    let moved=false;
+    for(let [dx,dz] of dirs){if(get(x+dx,y,z+dz)===0&&Math.random()< (t===10?.14:.48)){swap(x,y,z,x+dx,y,z+dz);moved=true;break}}
+    if(!moved&&Math.random()<.25){let [dx,dz]=dirs[Math.floor(Math.random()*4)];if(get(x+dx,y-1,z+dz)===0)swap(x,y,z,x+dx,y-1,z+dz)}
+    if(t===10){for(let [dx,dz] of [[1,0],[-1,0],[0,1],[0,-1]])if(get(x+dx,y,z+dz)===7||get(x+dx,y,z+dz)===6)put(x+dx,y,z+dz,8)}
+   } else if(t===8){ // fire consumes plant/wood, fades, creates smoke
+    life[i]++;
+    for(let dx=-1;dx<=1;dx++)for(let dz=-1;dz<=1;dz++)for(let dy=0;dy<=1;dy++){let nx=x+dx,ny=y+dy,nz=z+dz,nt=get(nx,ny,nz);if((nt===6||nt===7)&&Math.random()<.12)put(nx,ny,nz,8);else if(nt===1&&Math.random()<.01)put(nx,ny,nz,3)}
+    if(Math.random()<.18&&get(x,y+1,z)===0)put(x,y+1,z,9);
+    if(life[i]>30+Math.random()*45||Math.random()<.018)put(x,y,z,0);
+   } else if(t===9){if(swap(x,y,z,x,y+1,z))continue;life[i]++;if(life[i]>80||Math.random()<.025)put(x,y,z,0);else if(Math.random()<.35){let dx=Math.floor(Math.random()*3)-1,dz=Math.floor(Math.random()*3)-1;if(get(x+dx,y,z+dz)===0)swap(x,y,z,x+dx,y,z+dz)}}
+   else if(t===7){life[i]++;if(life[i]%95===0&&get(x,y+1,z)===0&&Math.random()<.15)put(x,y+1,z,7)}
+  }
+ }
+}
+const matColors={1:0xe7c477,2:0x4ba9e8,3:0x858f94,4:0x926348,5:0x65b85d,6:0x96613b,7:0x78d46c,8:0xff762e,9:0x9da9b1,10:0xf04425};
+function init3d(){
+ scene=new THREE.Scene();scene.background=new THREE.Color(0x9ccbd1);scene.fog=new THREE.Fog(0x9ccbd1,35,78);
+ camera=new THREE.PerspectiveCamera(52,innerWidth/innerHeight,.1,150);
+ renderer=new THREE.WebGLRenderer({antialias:true,alpha:false});renderer.setPixelRatio(Math.min(devicePixelRatio,1.5));renderer.setSize(innerWidth,innerHeight);renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;renderer.outputColorSpace=THREE.SRGBColorSpace;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.18;document.body.insertBefore(renderer.domElement,document.getElementById('hud'));
+ scene.add(new THREE.HemisphereLight(0xdff7ff,0x627052,2));
+ const sun=new THREE.DirectionalLight(0xfff0d5,3.2);sun.position.set(-20,40,18);sun.castShadow=true;sun.shadow.mapSize.set(1024,1024);sun.shadow.camera.left=-32;sun.shadow.camera.right=32;sun.shadow.camera.top=35;sun.shadow.camera.bottom=-30;scene.add(sun);
+ const ground=new THREE.Mesh(new THREE.PlaneGeometry(200,200),new THREE.MeshStandardMaterial({color:0x6f9f82,roughness:1}));ground.rotation.x=-Math.PI/2;ground.position.y=-.56;ground.receiveShadow=true;scene.add(ground);
+ // subtle gridless display platform
+ const base=new THREE.Mesh(new THREE.BoxGeometry(W+.4,.7,D+.4),new THREE.MeshStandardMaterial({color:0x526c65,roughness:.8}));base.position.set(W/2-.5,-.9,D/2-.5);base.receiveShadow=true;base.castShadow=true;scene.add(base);
+ for(let t=1;t<=10;t++){let geo=new THREE.BoxGeometry(.98,.98,.98),material=new THREE.MeshStandardMaterial({color:matColors[t],roughness:t===2?.24:.88,metalness:t===2?.08:0,transparent:t===2,opacity:t===2?.78:1});let mesh=new THREE.InstancedMesh(geo,material,N);mesh.castShadow=t!==2;mesh.receiveShadow=true;mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);mesh.count=0;scene.add(mesh);matMeshes[t]=mesh}
+ raycaster=new THREE.Raycaster();updateCamera();syncMeshes();
+}
+const dummy=new THREE.Object3D();
+function syncMeshes(){
+ let counts={};for(let t=1;t<=10;t++)counts[t]=0;
+ for(let i=0;i<N;i++){let t=grid[i];if(!t)continue;let x=i%W,y=Math.floor(i/W)%H,z=Math.floor(i/(W*H)),mesh=matMeshes[t],n=counts[t]++;dummy.position.set(x,y,z);dummy.updateMatrix();mesh.setMatrixAt(n,dummy.matrix)}
+ for(let t=1;t<=10;t++){matMeshes[t].count=counts[t];matMeshes[t].instanceMatrix.needsUpdate=true;matMeshes[t].computeBoundingSphere()}
+ document.getElementById('particlecount').textContent=Object.values(counts).reduce((a,b)=>a+b,0).toLocaleString();
+}
+function updateCamera(){let target=new THREE.Vector3(W/2-1,7,D/2-1);camera.position.set(target.x+dist*Math.sin(yaw)*Math.cos(pitch),target.y+dist*Math.sin(pitch),target.z+dist*Math.cos(yaw)*Math.cos(pitch));camera.lookAt(target)}
+function getPointerCell(e){
+ const rect=renderer.domElement.getBoundingClientRect(),mouse=new THREE.Vector2((e.clientX/rect.width)*2-1,-(e.clientY/rect.height)*2+1);raycaster.setFromCamera(mouse,camera);
+ const objs=Object.values(matMeshes),hits=raycaster.intersectObjects(objs,false);
+ if(hits.length){let hit=hits[0],p=hit.point.clone().add(hit.face.normal.clone().multiplyScalar(e.button===2?-.51:.51));return {x:Math.round(p.x),y:Math.round(p.y),z:Math.round(p.z)}}
+ // ray to top of world for painting onto empty area
+ const p=raycaster.ray; if(Math.abs(p.direction.y)<.001)return null;let d=(4-p.origin.y)/p.direction.y;if(d<0)return null;let v=p.origin.clone().add(p.direction.clone().multiplyScalar(d));return {x:Math.round(v.x),y:4,z:Math.round(v.z)}
+}
+function paintAt(e,erase=false){
+ const c=getPointerCell(e);if(!c)return;let r=Math.floor((brush-1)/2);
+ for(let dx=-r;dx<=r;dx++)for(let dz=-r;dz<=r;dz++)for(let dy=0;dy<Math.max(1,Math.ceil(brush/3));dy++){
+  let x=c.x+dx,y=c.y+dy,z=c.z+dz;if(!inside(x,y,z))continue;
+  if(erase||selected===0){put(x,y,z,0);continue}
+  if(get(x,y,z)!==0)continue;
+  let t=selected;if(t===5&&get(x,y-1,z)===0)t=4;
+  put(x,y,z,t);
+ }
+ syncMeshes();
+}
+function toast(s){let el=document.getElementById('toast');el.textContent=s;el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),1800)}
+function makeButtons(){
+ const el=document.getElementById('materials');Object.entries(defs).forEach(([k,d])=>{let b=document.createElement('button');b.className='material';b.dataset.type=d.type;b.innerHTML=`<span class="swatch" style="background:${d.color}${d.type===2?';box-shadow:inset 0 0 8px #fff7':''}"></span><span>${d.name}</span><span class="key">${d.key}</span>`;b.onclick=()=>select(d.type);el.appendChild(b)});select(1)
+}
+function select(t){selected=t;document.querySelectorAll('.material').forEach(b=>b.classList.toggle('active',+b.dataset.type===t));document.getElementById('erase').classList.toggle('primary',t===0)}
+function reset(){buildTerrain();syncMeshes();paused=false;updatePause();toast('Fresh little world generated')}
+function updatePause(){document.getElementById('simstatus').textContent=paused?'Paused':'Running';document.getElementById('pause').textContent=paused?'▶ Resume':'Ⅱ Pause'}
+function save(){try{localStorage.setItem('littleWorldSave',JSON.stringify({grid:Array.from(grid),life:Array.from(life)}));toast('World saved in this browser')}catch(e){toast('Save failed: browser storage is full')}}
+function load(){try{let d=JSON.parse(localStorage.getItem('littleWorldSave'));if(!d||d.grid.length!==N)throw 0;grid.set(d.grid);life.set(d.life||[]);syncMeshes();toast('Saved world loaded')}catch(e){toast('No compatible saved world found')}}
+function loop(now){requestAnimationFrame(loop);let dt=Math.min(.06,(now-last)/1000||0);last=now;if(!paused){acc+=dt*speed;let steps=0;while(acc>.045&&steps<4){stepSim();acc-=.045;steps++}if(steps)syncMeshes()}renderer.render(scene,camera)}
+makeButtons();buildTerrain();init3d();requestAnimationFrame(loop);
+document.getElementById('begin').onclick=()=>{document.getElementById('start').style.display='none';toast('Pick a material and start painting!')};
+document.getElementById('pause').onclick=()=>{paused=!paused;updatePause()};document.getElementById('step').onclick=()=>{stepSim();syncMeshes();toast('Advanced one simulation tick')};document.getElementById('reset').onclick=reset;document.getElementById('clear').onclick=()=>{grid.fill(0);life.fill(0);syncMeshes();toast('World cleared')};document.getElementById('save').onclick=save;document.getElementById('load').onclick=load;document.getElementById('erase').onclick=()=>select(0);
+document.getElementById('brush').oninput=e=>{brush=+e.target.value;document.getElementById('brushlabel').textContent=brush;document.getElementById('brushbottom').textContent=brush};document.getElementById('speed').oninput=e=>{speed=+e.target.value;document.getElementById('speedlabel').textContent=speed+'×'};
+renderer.domElement.addEventListener('contextmenu',e=>e.preventDefault());
+renderer.domElement.addEventListener('pointerdown',e=>{if(e.button===1||e.button===2){drag=true;prev={x:e.clientX,y:e.clientY};renderer.domElement.setPointerCapture(e.pointerId);return}if(e.button===0){if(e.shiftKey){drag=true;prev={x:e.clientX,y:e.clientY};renderer.domElement.setPointerCapture(e.pointerId)}else paintAt(e,false)}});
+renderer.domElement.addEventListener('pointermove',e=>{if(drag){yaw-=(e.clientX-prev.x)*.008;pitch=Math.max(.08,Math.min(1.25,pitch+(e.clientY-prev.y)*.006));prev={x:e.clientX,y:e.clientY};updateCamera()}else if(e.buttons===1)paintAt(e,false);else if(e.buttons===2)paintAt(e,true)});
+renderer.domElement.addEventListener('pointerup',()=>drag=false);renderer.domElement.addEventListener('wheel',e=>{dist=Math.max(12,Math.min(48,dist+e.deltaY*.025));updateCamera()},{passive:true});
+window.addEventListener('keydown',e=>{if(e.key>='1'&&e.key<='9')select(+e.key);if(e.key==='0')select(10);if(e.key.toLowerCase()==='e')select(0);if(e.code==='Space'){e.preventDefault();paused=!paused;updatePause()}});
+window.addEventListener('resize',()=>{camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();renderer.setSize(innerWidth,innerHeight)});
+})();
+</script>
+</body></html>
