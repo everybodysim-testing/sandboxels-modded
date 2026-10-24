@@ -1,58 +1,54 @@
 // nocubes.js — smooth "no cubes" surface rendering for Sandboxels
 //
-// Instead of every pixel rendering as a hard square, surfaces are smoothed
-// into round curves. Each frame the mod builds two fields from the live
-// pixels and re-renders only the boundary cells:
+// Instead of every pixel rendering as a hard square, surfaces are re-rendered
+// as smooth curves. Each frame the mod builds a signed distance field per
+// material (chamfer distance to the nearest opposite phase, then a gaussian
+// smooth) and redraws only the boundary cells on the game's own pixels
+// layer. index.html is not touched.
 //
-// - "fine": exact per-cell solidity, so flat surfaces stay flush with the
-//   cell edge, nothing erodes, and diagonal-only contacts of the SAME
-//   material are joined by a filled, rounded neck (no gaps in sand piles).
-// - "coarse": a gaussian-blurred solidity field (radius 2), which
-//   interprets a larger section of pixels — staircases become smooth
-//   slopes at any angle instead of 0/45/90 degree steps.
-//
-// The rendered silhouette is the union (max) of both fields, so smoothing
-// can only fill in, never eat into existing pixels.
-//
-// - Air corners between DIFFERENT materials are only filled from the
-//   dominant material, so placing sand over dirt doesn't paint mixed
-//   pixels between the two; their colors blend smoothly instead.
+// - Edges form smooth curves that span multiple pixels — staircases and
+//   block corners flow into rounded slopes at any angle, not just
+//   0/45/90 degree steps.
+// - Each material keeps its own field, so where two materials touch the
+//   seam stays fully solid and colors never mix into muddy pixels.
+// - Small features (lone grains, thin lines) fall back to the exact pixel
+//   grid, so nothing dissolves into dots or gaps.
 // - Pixels touching the world edge stay flush with the world edge.
 // - Gases and glow pixels render as soft round cloud particles with a
 //   smooth fade; nearby gases stack into one bigger cloud that wraps the
 //   whole shape.
-// - Semi-transparent pixels keep their original rendering untouched.
-// - Thermal and other special views are left unsmoothed.
+// - Semi-transparent pixels and thermal/other special views keep their
+//   original rendering.
 //
 // Toggle it off in Extras > Mods (remove "nocubes.js"), then reset the canvas.
 
 (function () {
 	"use strict";
 
-	// Half-width of the anti-aliased edge band, in cell units.
-	var EDGE_SOFT = 0.14;
-	// Cells whose blurred solidity reaches this level belong to a larger
-	// structure: their silhouette follows the blurred (smooth) field alone,
-	// so staircase corners recede into a smooth curve. Smaller features
-	// (lone grains, thin lines, small clusters) keep the exact field as a
-	// floor, so nothing erodes away.
-	var BLUR_SOLID = 0.45;
-	// Separable gaussian blur kernel (sigma ~1.8, radius 3), sums to 1.
-	// A symmetric kernel keeps iso-0.5 exactly on flat surfaces, while
-	// staircase steps get averaged into smooth slopes at any angle.
-	var BLUR = [0.058, 0.126, 0.2, 0.233, 0.2, 0.126, 0.058];
+	if (typeof renderPostPixel !== "function" || typeof viewInfo !== "object" || !viewInfo[1]) {
+		console.warn("nocubes.js: game runtime not found — mod not loaded.");
+		return;
+	}
 
-	var sGrid = null;      // padded solidity (0..1, world border ring = 1)
-	var bGrid = null;      // blurred solidity
-	var blurIn = null, blurTmp = null;
-	var clsGrid = null;    // padded class: 0 air, 1 solid, 2 translucent
-	var elemGrid = null;   // padded element index (-1 = none)
-	var colR = null, colG = null, colB = null, hasCol = null;
-	var plusGrid = null;   // padded mask of "plus" glow pixels (normal view)
+	// Tuning (cell units):
+	var EDGE_SOFT = 0.14; // half-width of the exact-grid AA band
+	var EDGE_A = 0.3;     // half-width of the curve-field AA band
+	var T_SOLID = 0.55;   // blurred distance above which a cell follows the curve field only
+	var D_CAP = 12;       // distance cap, in cells
+	// Separable gaussian kernel (sigma 2, radius 4), sums to 1.
+	var KERNEL = [0.0276, 0.0663, 0.1238, 0.1802, 0.2042, 0.1802, 0.1238, 0.0663, 0.0276];
+	var KR = 4;
+
 	var pw = 0, ph = 0, gw = 0, gh = 0;
+	var clsGrid = null;    // padded: -2 border, -1 air, -3 translucent, >=0 material id
+	var plusGrid = null;   // padded mask of gas/glow cells (normal view)
+	var colR = null, colG = null, colB = null, hasCol = null;
+	var bufA = null, bufB = null, bufC = null; // chamfer/blur scratch
 	var edgeCells = [];
-	var cloudPixels = []; // this frame's gas/glow pixels: [x, y, color, alpha]
+	var cloudPixels = [];  // this frame's gas/glow pixels: [x, y, color, alpha]
 	var elemIndex = {}, elemCount = 0;
+	var classBufs = {};    // material id -> { solid, dist }
+	var presentClasses = [];
 
 	function elemId(name) {
 		var id = elemIndex[name];
@@ -61,71 +57,110 @@
 	}
 
 	function ensureGrids(W, H) {
-		if (sGrid && gw === W && gh === H) return;
+		if (clsGrid && gw === W && gh === H) return;
 		gw = W; gh = H;
 		pw = W + 2; ph = H + 2;
-		sGrid = new Float32Array(pw * ph);
-		bGrid = new Float32Array(pw * ph);
-		blurIn = new Float32Array(pw * ph);
-		blurTmp = new Float32Array(pw * ph);
-		clsGrid = new Uint8Array(pw * ph);
-		elemGrid = new Int32Array(pw * ph);
-		colR = new Float32Array(pw * ph);
-		colG = new Float32Array(pw * ph);
-		colB = new Float32Array(pw * ph);
-		hasCol = new Uint8Array(pw * ph);
-		plusGrid = new Uint8Array(pw * ph);
+		var N = pw * ph;
+		clsGrid = new Int16Array(N);
+		plusGrid = new Uint8Array(N);
+		colR = new Float32Array(N);
+		colG = new Float32Array(N);
+		colB = new Float32Array(N);
+		hasCol = new Uint8Array(N);
+		bufA = new Float32Array(N);
+		bufB = new Float32Array(N);
+		bufC = new Float32Array(N);
+		classBufs = {};
 	}
 
-	function drawWorldBorder() {
-		// Treat out-of-bounds as solid, so pixels stay flush with the world
-		// edge instead of rounding away from it.
-		var lastRow = (ph - 1) * pw;
-		for (var x = 0; x < pw; x++) {
-			sGrid[x] = 1; clsGrid[x] = 1;
-			sGrid[lastRow + x] = 1; clsGrid[lastRow + x] = 1;
+	function getClassBufs(id) {
+		var b = classBufs[id];
+		if (!b) {
+			b = { solid: new Uint8Array(pw * ph), dist: new Float32Array(pw * ph) };
+			classBufs[id] = b;
 		}
-		for (var y = 0; y < ph; y++) {
-			var row = y * pw;
-			sGrid[row] = 1; clsGrid[row] = 1;
-			sGrid[row + pw - 1] = 1; clsGrid[row + pw - 1] = 1;
-		}
+		return b;
 	}
 
-	function computeBlur() {
-		// Blur the solidity field (excluding the virtual world border).
-		blurIn.set(sGrid);
-		var lastRow = (ph - 1) * pw;
-		for (var x = 0; x < pw; x++) { blurIn[x] = 0; blurIn[lastRow + x] = 0; }
-		for (var y = 0; y < ph; y++) {
-			var row = y * pw;
-			blurIn[row] = 0; blurIn[row + pw - 1] = 0;
-		}
-		var k, i, R = 3;
-		// horizontal pass
+	// Two-pass chamfer distance transform (3/4 weights), in place.
+	function chamfer(field) {
+		var i, x, y, row, v;
 		for (y = 0; y < ph; y++) {
-			var row = y * pw;
+			row = y * pw;
 			for (x = 0; x < pw; x++) {
-				var acc = 0;
-				for (k = -R; k <= R; k++) {
+				i = row + x;
+				v = field[i];
+				if (x > 0 && field[i - 1] + 3 < v) v = field[i - 1] + 3;
+				if (y > 0) {
+					if (field[i - pw] + 3 < v) v = field[i - pw] + 3;
+					if (x > 0 && field[i - pw - 1] + 4 < v) v = field[i - pw - 1] + 4;
+					if (x < pw - 1 && field[i - pw + 1] + 4 < v) v = field[i - pw + 1] + 4;
+				}
+				field[i] = v;
+			}
+		}
+		for (y = ph - 1; y >= 0; y--) {
+			row = y * pw;
+			for (x = pw - 1; x >= 0; x--) {
+				i = row + x;
+				v = field[i];
+				if (x < pw - 1 && field[i + 1] + 3 < v) v = field[i + 1] + 3;
+				if (y < ph - 1) {
+					if (field[i + pw] + 3 < v) v = field[i + pw] + 3;
+					if (x < pw - 1 && field[i + pw + 1] + 4 < v) v = field[i + pw + 1] + 4;
+					if (x > 0 && field[i + pw - 1] + 4 < v) v = field[i + pw - 1] + 4;
+				}
+				field[i] = v;
+			}
+		}
+	}
+
+	// Separable gaussian blur of src into dst (src may equal dst).
+	function blurField(src, dst) {
+		var x, y, k, i, acc, row, ii;
+		for (y = 0; y < ph; y++) {
+			row = y * pw;
+			for (x = 0; x < pw; x++) {
+				acc = 0;
+				for (k = -KR; k <= KR; k++) {
 					i = x + k; if (i < 0) i = 0; else if (i >= pw) i = pw - 1;
-					acc += blurIn[row + i] * BLUR[k + R];
+					acc += src[row + i] * KERNEL[k + KR];
 				}
-				blurTmp[row + x] = acc;
+				bufC[row + x] = acc;
 			}
 		}
-		// vertical pass
 		for (y = 0; y < ph; y++) {
-			var row = y * pw;
+			row = y * pw;
 			for (x = 0; x < pw; x++) {
-				var acc = 0;
-				for (k = -R; k <= R; k++) {
+				acc = 0;
+				for (k = -KR; k <= KR; k++) {
 					i = y + k; if (i < 0) i = 0; else if (i >= ph) i = ph - 1;
-					acc += blurTmp[i * pw + x] * BLUR[k + R];
+					acc += bufC[i * pw + x] * KERNEL[k + KR];
 				}
-				bGrid[row + x] = acc;
+				dst[row + x] = acc;
 			}
 		}
+	}
+
+	// Signed distance field for one material: positive inside, negative
+	// outside, in cells. The world border counts as solid, so pixels stay
+	// flush with the world edge.
+	function buildClassField(id, b) {
+		var i, N = pw * ph, c, member;
+		for (i = 0; i < N; i++) {
+			c = clsGrid[i];
+			member = (c === id || c === -2) ? 1 : 0;
+			b.solid[i] = member;
+			bufA[i] = member ? 1e9 : 0; // distance to nearest non-member
+			bufB[i] = member ? 0 : 1e9; // distance to nearest member
+		}
+		chamfer(bufA);
+		chamfer(bufB);
+		for (i = 0; i < N; i++) {
+			if (bufA[i] === 0) b.dist[i] = Math.min(bufB[i] === 1e9 ? D_CAP : bufB[i] / 3, D_CAP) * -1;
+			else b.dist[i] = Math.min(bufA[i] / 3, D_CAP);
+		}
+		blurField(b.dist, b.dist);
 	}
 
 	function smoothPost(ctx) {
@@ -138,15 +173,14 @@
 		if (canvas.width < W * PS || canvas.height < H * PS) return; // mid-resize safety
 
 		ensureGrids(W, H);
-		sGrid.fill(0);
-		clsGrid.fill(0);
-		elemGrid.fill(-1);
+		clsGrid.fill(-1);
 		plusGrid.fill(0);
-		drawWorldBorder();
+		cloudPixels.length = 0; // rebuild every frame so old clouds never linger
 
 		var i, d, gi;
 
-		// Pass 1: solidity + classes from the live pixels
+		// Pass 1: classify the live pixels; collect gas/glow cloud particles
+		presentClasses.length = 0;
 		for (i = 0; i < currentPixels.length; i++) {
 			var pixel = currentPixels[i];
 			if (!pixel || pixel.del === true) continue;
@@ -180,32 +214,39 @@
 			}
 
 			gi = (pixel.y + 1) * pw + (pixel.x + 1);
-			sGrid[gi] = s;
-			clsGrid[gi] = (s >= 0.5) ? 1 : 2; // 1 = solid, 2 = translucent (leave as drawn)
-			elemGrid[gi] = elemId(pixel.element);
+			var id = elemId(pixel.element);
+			clsGrid[gi] = (s >= 0.5) ? id : -3; // -3 = translucent, leave as drawn
+			if (presentClasses.indexOf(id) === -1) presentClasses.push(id);
 		}
 
-		computeBlur();
+		// World border ring
+		var lastRow = (ph - 1) * pw;
+		for (var x = 0; x < pw; x++) { clsGrid[x] = -2; clsGrid[lastRow + x] = -2; }
+		for (var y = 0; y < ph; y++) { clsGrid[y * pw] = -2; clsGrid[y * pw + pw - 1] = -2; }
 
-		// Pass 2: find boundary cells (a solid cell touching air, or an air cell
-		// touching solid), skipping anything affected by "plus" glow renders.
+		// Build this frame's distance fields
+		for (i = 0; i < presentClasses.length; i++) {
+			buildClassField(presentClasses[i], getClassBufs(presentClasses[i]));
+		}
+
+		// Pass 2: boundary cells (any cell touching a cell of another phase
+		// or material), skipping anything affected by gas/glow cells.
 		edgeCells.length = 0;
 		var minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
 		var sq = squareCoords;
-		for (var y = 0; y < H; y++) {
+		for (y = 0; y < H; y++) {
 			var rowBase = (y + 1) * pw + 1;
-			for (var x = 0; x < W; x++) {
+			for (x = 0; x < W; x++) {
 				gi = rowBase + x;
 				var cls = clsGrid[gi];
-				if (cls === 2) continue;
-				var solid = cls === 1;
-				var edge = false, prot = false;
-				for (d = 0; d < 8; d++) {
+				if (cls < 0 && cls !== -1) continue; // border/translucent
+				var prot = plusGrid[gi] === 1;
+				var edge = false;
+				for (d = 0; d < 8 && !prot; d++) {
 					var nc = clsGrid[gi + sq[d][1] * pw + sq[d][0]];
-					if (nc === 2) { prot = true; break; }
-					if ((nc === 1) !== solid) edge = true;
+					if (nc === -3) { prot = true; break; }
+					if (nc !== -2 && nc !== cls) edge = true;
 				}
-				if (!prot && plusGrid[gi]) prot = true;
 				if (!prot) {
 					for (d = 0; d < 8; d++) {
 						if (plusGrid[gi + sq[d][1] * pw + sq[d][0]]) { prot = true; break; }
@@ -219,7 +260,11 @@
 				if (y > maxY) maxY = y;
 			}
 		}
-		if (edgeCells.length) {
+		if (!edgeCells.length) {
+			if (view === 1) drawClouds(ctx);
+			return;
+		}
+
 		// Pass 3: read the drawn boundary from the pixels layer, so render
 		// presets (heat glow, textures, ...) are preserved, then re-render the
 		// boundary cells as smooth curves.
@@ -230,13 +275,13 @@
 		var img = ctx.getImageData(bx, by, bw, bh);
 		var data = img.data;
 
-		// Colors for the field: sample each solid cell's drawn color at its
-		// center (falls back to the first drawn subpixel in the cell).
+		// Sample each material cell's drawn color at its center (fallback:
+		// the first drawn subpixel in the cell).
 		for (var cy = minY; cy <= maxY; cy++) {
 			for (var cx = minX; cx <= maxX; cx++) {
 				gi = (cy + 1) * pw + (cx + 1);
 				hasCol[gi] = 0;
-				if (clsGrid[gi] !== 1) continue;
+				if (clsGrid[gi] < 0) continue;
 				var ox = (cx - minX) * PS, oy = (cy - minY) * PS;
 				var ci = ((oy + (PS >> 1)) * bw + ox + (PS >> 1)) * 4;
 				if (data[ci + 3] < 40) { // custom renderer left the center empty
@@ -254,94 +299,93 @@
 			}
 		}
 
-		var soft = EDGE_SOFT;
-		var lo = 0.5 - soft, range = soft * 2;
-		var pw2 = pw * 2;
+		// Per-boundary-cell scratch (small plain arrays, reused).
+		var kList = [], kMode = [], kHasRep = [], kRepR = [], kRepG = [], kRepB = [];
 		for (i = 0; i < edgeCells.length; i++) {
 			gi = edgeCells[i];
 			var cellX = (gi % pw) - 1, cellY = ((gi / pw) | 0) - 1;
-			var isAir = clsGrid[gi] === 0;
 			var ox = (cellX - minX) * PS, oy = (cellY - minY) * PS;
-			var gy = (cellY + 1) * pw + cellX + 1;
 
-			// For air cells, only the dominant neighboring material may fill
-			// this cell — no mixed-material pixels between two elements.
-			// Where two different materials meet, also skip the blurred
-			// field, whose window mixes both materials.
-			var dom = -2, mixed = false;
-			if (isAir) {
-				var best = 0, counts = {};
-				for (d = 0; d < 8; d++) {
-					var n = gi + sq[d][1] * pw + sq[d][0];
-					var es = sGrid[n];
-					if (es <= 0 || elemGrid[n] < 0) continue;
-					if (es > best) { best = es; dom = elemGrid[n]; }
-					if (counts[elemGrid[n]]) mixed = true;
-					else counts[elemGrid[n]] = 1;
+			// Materials present in the 3x3 neighborhood, with per-material
+			// mode (curve-only vs exact floor) and fallback color.
+			kList.length = 0;
+			for (var dy = -1; dy <= 1; dy++) {
+				for (var dx = -1; dx <= 1; dx++) {
+					var nc = clsGrid[gi + dy * pw + dx];
+					if (nc >= 0 && kList.indexOf(nc) === -1) kList.push(nc);
 				}
-				if (dom < 0) continue; // nothing to fill from
+			}
+			kMode.length = kHasRep.length = kRepR.length = kRepG.length = kRepB.length = kList.length;
+			for (var ki = 0; ki < kList.length; ki++) {
+				var kBuf = getClassBufs(kList[ki]);
+				kMode[ki] = kBuf.dist[gi] >= T_SOLID ? 1 : 0;
+				kHasRep[ki] = 0;
+				if (hasCol[gi]) { // the cell itself may already carry this material's color
+					kRepR[ki] = colR[gi]; kRepG[ki] = colG[gi]; kRepB[ki] = colB[gi];
+					kHasRep[ki] = 1;
+				}
+				for (var q = 0; q < 8 && !kHasRep[ki]; q++) {
+					var gj = gi + sq[q][1] * pw + sq[q][0];
+					if (clsGrid[gj] === kList[ki] && hasCol[gj]) {
+						kRepR[ki] = colR[gj]; kRepG[ki] = colG[gj]; kRepB[ki] = colB[gj];
+						kHasRep[ki] = 1;
+					}
+				}
 			}
 
 			for (var py = 0; py < PS; py++) {
 				var v = (py + 0.5) / PS - 0.5;
 				var j = Math.floor(v), fv = v - j;
-				var r0 = gy + j * pw, r1 = r0 + pw;
-				var wT = 1 - fv, wB = fv;
+				var r0 = gi + j * pw, wT = 1 - fv, wB = fv;
 				for (var px = 0; px < PS; px++) {
 					var u = (px + 0.5) / PS - 0.5;
 					var ii = Math.floor(u), fu = u - ii;
-					var c0 = r0 + ii, c1 = c0 + 1;
-					var c2 = c0 + pw, c3 = c1 + pw;
+					var c0 = r0 + ii, c1 = c0 + 1, c2 = c0 + pw, c3 = c1 + pw;
 					var w00 = (1 - fu) * wT, w10 = fu * wT, w01 = (1 - fu) * wB, w11 = fu * wB;
-					var s00, s10, s01, s11, f, colW;
-					if (isAir) {
-						s00 = elemGrid[c0] === dom ? sGrid[c0] : 0;
-						s10 = elemGrid[c1] === dom ? sGrid[c1] : 0;
-						s01 = elemGrid[c2] === dom ? sGrid[c2] : 0;
-						s11 = elemGrid[c3] === dom ? sGrid[c3] : 0;
-						var b00 = elemGrid[c0] === dom ? bGrid[c0] : 0;
-						var b10 = elemGrid[c1] === dom ? bGrid[c1] : 0;
-						var b01 = elemGrid[c2] === dom ? bGrid[c2] : 0;
-						var b11 = elemGrid[c3] === dom ? bGrid[c3] : 0;
-						f = w00 * s00 + w10 * s10 + w01 * s01 + w11 * s11;
-						if (!mixed) { // blur mixes materials, so only use it in pure neighborhoods
-							var fb = w00 * b00 + w10 * b10 + w01 * b01 + w11 * b11;
-							if (fb > f) f = fb;
+					// Pick the material that covers this subpixel most; ties go
+					// to the one whose smoothed surface is closest. Colors are
+					// taken from the winner only, so materials never mix.
+					var best = 0, bestKi = -1, bestD = -1e9;
+					for (ki = 0; ki < kList.length; ki++) {
+						var b = getClassBufs(kList[ki]);
+						var e = w00 * b.solid[c0] + w10 * b.solid[c1] +
+							w01 * b.solid[c2] + w11 * b.solid[c3];
+						var dv = w00 * b.dist[c0] + w10 * b.dist[c1] +
+							w01 * b.dist[c2] + w11 * b.dist[c3];
+						var t2 = (dv + EDGE_A) / (EDGE_A * 2);
+						var a = t2 <= 0 ? 0 : (t2 >= 1 ? 1 : t2 * t2 * (3 - 2 * t2));
+						if (!kMode[ki]) { // small feature: keep the exact grid as a floor
+							var t1 = (e - (0.5 - EDGE_SOFT)) / (EDGE_SOFT * 2);
+							var a1 = t1 <= 0 ? 0 : (t1 >= 1 ? 1 : t1 * t1 * (3 - 2 * t1));
+							if (a1 > a) a = a1;
 						}
-						colW = (w00 * s00 * hasCol[c0]) + (w10 * s10 * hasCol[c1]) +
-							(w01 * s01 * hasCol[c2]) + (w11 * s11 * hasCol[c3]);
-					} else {
-						s00 = sGrid[c0]; s10 = sGrid[c1]; s01 = sGrid[c2]; s11 = sGrid[c3];
-						f = w00 * s00 + w10 * s10 + w01 * s01 + w11 * s11;
-						var fb2 = w00 * bGrid[c0] + w10 * bGrid[c1] + w01 * bGrid[c2] + w11 * bGrid[c3];
-						// Large structures follow the smoothed field alone (staircase
-						// corners recede into a curve); small features keep the
-						// exact field as a floor so nothing erodes away.
-						if (bGrid[gi] >= BLUR_SOLID) f = fb2;
-						else if (fb2 > f) f = fb2;
-						colW = (w00 * s00 * hasCol[c0]) + (w10 * s10 * hasCol[c1]) +
-							(w01 * s01 * hasCol[c2]) + (w11 * s11 * hasCol[c3]);
+						if (a > best || (a === best && dv > bestD)) {
+							best = a; bestKi = ki; bestD = dv;
+						}
 					}
-					var t = (f - lo) / range;
-					var a = t <= 0 ? 0 : (t >= 1 ? 1 : t * t * (3 - 2 * t));
 					var di = ((oy + py) * bw + ox + px) * 4;
-					if (a <= 0 || colW < 1e-6 || (isAir && f > 0 && colW / f < 0.02)) {
+					if (best <= 0 || bestKi < 0) {
 						data[di] = 0; data[di + 1] = 0; data[di + 2] = 0; data[di + 3] = 0;
 						continue;
 					}
-					if (isAir) { a *= colW / f; if (a > 1) a = 1; }
-					data[di] = (w00 * s00 * hasCol[c0] * colR[c0] + w10 * s10 * hasCol[c1] * colR[c1] +
-						w01 * s01 * hasCol[c2] * colR[c2] + w11 * s11 * hasCol[c3] * colR[c3]) / colW;
-					data[di + 1] = (w00 * s00 * hasCol[c0] * colG[c0] + w10 * s10 * hasCol[c1] * colG[c1] +
-						w01 * s01 * hasCol[c2] * colG[c2] + w11 * s11 * hasCol[c3] * colG[c3]) / colW;
-					data[di + 2] = (w00 * s00 * hasCol[c0] * colB[c0] + w10 * s10 * hasCol[c1] * colB[c1] +
-						w01 * s01 * hasCol[c2] * colB[c2] + w11 * s11 * hasCol[c3] * colB[c3]) / colW;
-					data[di + 3] = a * 255;
+					var win = kList[bestKi];
+					var cw = 0, rr = 0, gg = 0, bb = 0;
+					if (clsGrid[c0] === win && hasCol[c0]) { cw += w00; rr += w00 * colR[c0]; gg += w00 * colG[c0]; bb += w00 * colB[c0]; }
+					if (clsGrid[c1] === win && hasCol[c1]) { cw += w10; rr += w10 * colR[c1]; gg += w10 * colG[c1]; bb += w10 * colB[c1]; }
+					if (clsGrid[c2] === win && hasCol[c2]) { cw += w01; rr += w01 * colR[c2]; gg += w01 * colG[c2]; bb += w01 * colB[c2]; }
+					if (clsGrid[c3] === win && hasCol[c3]) { cw += w11; rr += w11 * colR[c3]; gg += w11 * colG[c3]; bb += w11 * colB[c3]; }
+					if (cw > 1e-6) {
+						data[di] = rr / cw; data[di + 1] = gg / cw; data[di + 2] = bb / cw;
+					} else if (kHasRep[bestKi]) {
+						data[di] = kRepR[bestKi]; data[di + 1] = kRepG[bestKi]; data[di + 2] = kRepB[bestKi];
+					} else {
+						continue; // winning material has no color here: leave as drawn
+					}
+					data[di + 3] = best * 255;
 				}
 			}
 		}
 		ctx.putImageData(img, bx, by);
-		}
 		if (view === 1) drawClouds(ctx);
 	}
 
