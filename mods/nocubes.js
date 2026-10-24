@@ -15,8 +15,12 @@
 //   grid, so nothing dissolves into dots or gaps.
 // - Pixels touching the world edge stay flush with the world edge.
 // - Gases and glow pixels render as soft round cloud particles with a
-//   smooth fade; nearby gases stack into one bigger cloud that wraps the
-//   whole shape.
+//   smooth fade (5-cell glow diameter); nearby gases stack into one bigger
+//   cloud that wraps the whole shape.
+// - Every visual-effect element is square-free in the normal view: energy
+//   renderers (fire, plasma...) become clouds, charged pixels get a soft
+//   yellow halo, and heat-glow/magma shimmer gradients are re-blended into
+//   smooth ramps by the field pass.
 // - Semi-transparent pixels and thermal/other special views keep their
 //   original rendering.
 //
@@ -35,26 +39,35 @@
 	var EDGE_A = 0.3;     // half-width of the curve-field AA band
 	var T_SOLID = 0.55;   // blurred distance above which a cell follows the curve field only
 	var D_CAP = 12;       // distance cap, in cells
+	var VAR_T = 6;        // per-channel color step that marks a shimmer/gradient cell
 	// Separable gaussian kernel (sigma 2, radius 4), sums to 1.
 	var KERNEL = [0.0276, 0.0663, 0.1238, 0.1802, 0.2042, 0.1802, 0.1238, 0.0663, 0.0276];
 	var KR = 4;
 
 	var pw = 0, ph = 0, gw = 0, gh = 0;
 	var clsGrid = null;    // padded: -2 border, -1 air, -3 translucent, >=0 material id
-	var plusGrid = null;   // padded mask of gas/glow cells (normal view)
 	var colR = null, colG = null, colB = null, hasCol = null;
 	var bufA = null, bufB = null, bufC = null; // chamfer/blur scratch
 	var smoothImg = null, smoothU32 = null; // cached smoothed cells, kept across frames
 	var hashGrid = null, hashFrame = null, frameId = 0;
 	var edgeCells = [];
+	var effectCells = [];  // interior cells of glow/shimmer materials, screened by color variation
 	var cloudPixels = [];  // this frame's gas/glow pixels: [x, y, color, alpha]
-	var elemIndex = {}, elemCount = 0;
+	var glowClouds = [];   // effect halos pushed by patched renderers, tagged with cloudFrame
+	var cloudFrame = 0;
+	var elemIndex = {}, elemNames = [], elemCount = 0;
 	var classBufs = {};    // material id -> { solid, dist }
+	var classEffect = {};  // material id -> its vanilla renderer is a glow/shimmer overlay
 	var presentClasses = [];
 
 	function elemId(name) {
 		var id = elemIndex[name];
-		if (id === undefined) { id = elemCount++; elemIndex[name] = id; }
+		if (id === undefined) {
+			id = elemCount++;
+			elemIndex[name] = id;
+			elemNames[id] = name;
+			classEffect[id] = isEffectRenderer(elements[name]);
+		}
 		return id;
 	}
 
@@ -64,7 +77,6 @@
 		pw = W + 2; ph = H + 2;
 		var N = pw * ph;
 		clsGrid = new Int16Array(N);
-		plusGrid = new Uint8Array(N);
 		colR = new Float32Array(N);
 		colG = new Float32Array(N);
 		colB = new Float32Array(N);
@@ -169,6 +181,15 @@
 	}
 
 	function smoothPost(ctx) {
+		// Drop glow halos older than the last drawn frame, so pixels that
+		// stopped rendering (burned out, moved away) leave no lingering cloud
+		if (glowClouds.length) {
+			var keepC = [];
+			for (var ci = 0; ci < glowClouds.length; ci++) {
+				if (glowClouds[ci].cf >= cloudFrame) keepC.push(glowClouds[ci]);
+			}
+			glowClouds = keepC;
+		}
 		if (view !== 1 && view !== 3) return;
 		if (typeof width !== "number" || typeof height !== "number" || width < 1 || height < 1) return;
 		var W = width + 1, H = height + 1; // sim coords are 0..width inclusive
@@ -179,7 +200,6 @@
 
 		ensureGrids(W, H);
 		clsGrid.fill(-1);
-		plusGrid.fill(0);
 		cloudPixels.length = 0; // rebuild every frame so old clouds never linger
 
 		var i, d, gi;
@@ -202,8 +222,6 @@
 			// blocky squares, plus shapes or custom renderers (drawn after
 			// the pixel pass).
 			if (isCloudy(pixel, info)) {
-				gi = (pixel.y + 1) * pw + (pixel.x + 1);
-				plusGrid[gi] = 1;
 				cloudPixels.push([pixel.x, pixel.y, pixel.color,
 					pixel.alpha === undefined ? 1 : pixel.alpha]);
 				continue;
@@ -234,9 +252,12 @@
 			buildClassField(presentClasses[i], getClassBufs(presentClasses[i]));
 		}
 
-		// Pass 2: boundary cells (any cell touching a cell of another phase
-		// or material), skipping anything affected by gas/glow cells.
+		// Pass 2: boundary cells (any cell touching a cell of another phase or
+		// material). Gas/glow neighbors no longer shield a cell: their cloud
+		// halos are drawn over the smoothed edge, so surfaces touching fire,
+		// steam etc. are rounded too instead of staying hard squares.
 		edgeCells.length = 0;
+		effectCells.length = 0;
 		var minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
 		var sq = squareCoords;
 		for (y = 0; y < H; y++) {
@@ -245,27 +266,24 @@
 				gi = rowBase + x;
 				var cls = clsGrid[gi];
 				if (cls < 0 && cls !== -1) continue; // border/translucent
-				var prot = plusGrid[gi] === 1;
+				var prot = false;
 				var edge = false;
-				for (d = 0; d < 8 && !prot; d++) {
+				for (d = 0; d < 8; d++) {
 					var nc = clsGrid[gi + sq[d][1] * pw + sq[d][0]];
 					if (nc === -3) { prot = true; break; }
 					if (nc !== -2 && nc !== cls) edge = true;
 				}
-				if (!prot) {
-					for (d = 0; d < 8; d++) {
-						if (plusGrid[gi + sq[d][1] * pw + sq[d][0]]) { prot = true; break; }
-					}
-				}
-				if (prot || !edge) continue;
-				edgeCells.push(gi);
+				if (prot) continue;
+				if (edge) edgeCells.push(gi);
+				else if (cls >= 0 && classEffect[cls]) effectCells.push(gi);
+				else continue;
 				if (x < minX) minX = x;
 				if (y < minY) minY = y;
 				if (x > maxX) maxX = x;
 				if (y > maxY) maxY = y;
 			}
 		}
-		if (!edgeCells.length) {
+		if (!edgeCells.length && !effectCells.length) {
 			if (view === 1) drawClouds(ctx);
 			return;
 		}
@@ -310,6 +328,23 @@
 				colR[gi] = data[ci]; colG[gi] = data[ci + 1]; colB[gi] = data[ci + 2];
 				hasCol[gi] = 1;
 			}
+		}
+
+		// Interior cells of glow/shimmer materials (heat glow, magma): re-render
+		// them too when their 3x3 drawn colors vary, so temp gradients and the
+		// molten shimmer blend into smooth gradients instead of mosaic squares.
+		for (i = 0; i < effectCells.length; i++) {
+			gi = effectCells[i];
+			if (!hasCol[gi]) continue;
+			var vR = colR[gi], vG = colG[gi], vB = colB[gi], vary = false;
+			for (d = 0; d < 8 && !vary; d++) {
+				var gj2 = gi + sq[d][1] * pw + sq[d][0];
+				if (hasCol[gj2] &&
+					(Math.abs(colR[gj2] - vR) > VAR_T ||
+					 Math.abs(colG[gj2] - vG) > VAR_T ||
+					 Math.abs(colB[gj2] - vB) > VAR_T)) vary = true;
+			}
+			if (vary) edgeCells.push(gi);
 		}
 
 		// Per-boundary-cell scratch (small plain arrays, reused).
@@ -433,6 +468,7 @@
 		}
 		ctx.putImageData(img, bx, by);
 		if (view === 1) drawClouds(ctx);
+		cloudFrame++; // halos pushed after this belong to the next frame
 	}
 
 	// --- Gas / glow cloud particles ------------------------------------
@@ -459,9 +495,17 @@
 		return null;
 	}
 
-	var CLOUD_R = 2.3;  // cloud radius, in cells
+	var CLOUD_R = 2.5;  // cloud radius, in cells (5-cell glow diameter)
 	var CLOUD_A = 0.55; // base opacity of a single gas pixel's cloud
 	var cloudCache = {}, cloudCachePS = 0;
+
+	// Renderers that tint whole cells with a temp-driven glow/shimmer overlay:
+	// their per-pixel color variation is re-blended by the field pass, so hot
+	// metal, magma and molten liquids show smooth gradients, not mosaic tiles.
+	function isEffectRenderer(el) {
+		if (!el || !el.renderer || typeof renderPresets !== "object" || !renderPresets) return false;
+		return el.renderer === renderPresets.HEATGLOW || el.renderer === renderPresets.MOLTEN;
+	}
 
 	// Which pixels render as clouds in the normal view: gases and glow pixels,
 	// plus custom-renderer energy elements (fire, smoke...) whose renderers
@@ -499,41 +543,69 @@
 		return sprite;
 	}
 
+	function drawOneCloud(ctx, g, r) {
+		var sprite = cloudSprite(g[2]);
+		if (!sprite) return false;
+		var a = CLOUD_A * g[3];
+		ctx.globalAlpha = a > 1 ? 1 : a; // canvas ignores globalAlpha values above 1
+		// Overlapping soft circles stack up: a group of nearby gas pixels
+		// fades into one bigger cloud that wraps the whole shape.
+		ctx.drawImage(sprite, (g[0] + 0.5) * pixelSize - r, (g[1] + 0.5) * pixelSize - r, r * 2, r * 2);
+		return true;
+	}
+
 	function drawClouds(ctx) {
-		if (!cloudPixels.length) return;
+		if (!cloudPixels.length && !glowClouds.length) return;
 		if (cloudCachePS !== pixelSize) { cloudCache = {}; cloudCachePS = pixelSize; }
 		var r = CLOUD_R * pixelSize;
 		for (var i = 0; i < cloudPixels.length; i++) {
-			var g = cloudPixels[i];
-			var sprite = cloudSprite(g[2]);
-			if (!sprite) continue;
-			ctx.globalAlpha = CLOUD_A * g[3];
-			// Overlapping soft circles stack up: a group of nearby gas pixels
-			// fades into one bigger cloud that wraps the whole shape.
-			ctx.drawImage(sprite, (g[0] + 0.5) * pixelSize - r, (g[1] + 0.5) * pixelSize - r, r * 2, r * 2);
+			drawOneCloud(ctx, cloudPixels[i], r);
+		}
+		// Halos pushed by the patched renderers earlier this frame
+		// (e.g. the yellow glow of charged pixels).
+		for (var j = 0; j < glowClouds.length; j++) {
+			if (glowClouds[j].cf !== cloudFrame) continue;
+			drawOneCloud(ctx, glowClouds[j].p, r);
 		}
 		ctx.globalAlpha = 1;
 	}
 
-	// Some gases (like fire) draw through a custom renderer; bypass those
+	// A halo for a pixel whose vanilla look was a translucent effect square
+	// (e.g. the yellow glow of a charged pixel).
+	function pushGlowCloud(x, y, color, strength) {
+		glowClouds.push({ cf: cloudFrame, p: [x, y, color, strength] });
+	}
+
+	// Some elements (like fire) draw through a custom renderer; bypass those
 	// in the normal view too — the clouds replace their rendering entirely.
+	// `el` must be captured per iteration: sharing one `var el` across the
+	// loop made every wrapper test the LAST iterated element, which is why
+	// fire kept slipping through and drawing its blocky vanilla renderer.
 	for (var elName in elements) {
-		var el = elements[elName];
-		if (!el || !el.renderer) continue;
-		(function (orig) {
+		(function (el) {
+			if (!el || !el.renderer) return;
+			var orig = el.renderer;
 			el.renderer = function (pixel, ctx) {
 				if (isCloudy(pixel, el)) return;
 				orig(pixel, ctx);
 			};
-		})(el.renderer);
+		})(elements[elName]);
 	}
 
-	// The game draws gas/glow pixels as a plus shape in the normal view;
-	// skip that — the clouds above replace it.
+	// The game draws gas/glow pixels as a plus shape and charged pixels with
+	// a yellow square in the normal view; skip both — clouds replace them.
 	var origView1Pixel = viewInfo[1].pixel;
 	viewInfo[1].pixel = function (pixel, ctx) {
-		var info = elements[pixel.element];
-		if (info && isCloudy(pixel, info)) return;
+		if (view === 1) {
+			var info = elements[pixel.element];
+			if (info && isCloudy(pixel, info)) return;
+			if (pixel.charge && !(info && info.colorOn)) {
+				drawSquare(ctx, pixel.color, pixel.x, pixel.y, undefined,
+					(settings.textures !== 0) ? pixel.alpha : undefined);
+				pushGlowCloud(pixel.x, pixel.y, "rgb(255,255,0)", 1.14);
+				return;
+			}
+		}
 		origView1Pixel(pixel, ctx);
 	};
 
