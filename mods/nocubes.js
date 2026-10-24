@@ -281,9 +281,9 @@
 		var img = ctx.getImageData(bx, by, bw, bh);
 		var data = img.data;
 		frameId++;
-		var cw = canvas.width, chh = canvas.height;
-		if (!smoothImg || smoothImg.width !== cw || smoothImg.height !== chh) {
-			smoothImg = ctx.createImageData(cw, chh);
+		var canvasW = canvas.width, canvasH = canvas.height;
+		if (!smoothImg || smoothImg.width !== canvasW || smoothImg.height !== canvasH) {
+			smoothImg = ctx.createImageData(canvasW, canvasH);
 			smoothU32 = new Uint32Array(smoothImg.data.buffer);
 			hashFrame.fill(0); // cached cells no longer have pixels stored
 		}
@@ -337,7 +337,7 @@
 			if (hashFrame[gi] !== 0 && hashGrid[gi] === h) {
 				var sx0 = cellX * PS, sy0 = cellY * PS;
 				for (var cy2 = 0; cy2 < PS; cy2++) {
-					var src = (sy0 + cy2) * cw + sx0;
+					var src = (sy0 + cy2) * canvasW + sx0;
 					var dst = (oy + cy2) * bw + ox;
 					for (var cx2 = 0; cx2 < PS; cx2++) imgU32[dst + cx2] = smoothU32[src + cx2];
 				}
@@ -407,13 +407,13 @@
 						continue;
 					}
 					var win = kList[bestKi];
-					var cw = 0, rr = 0, gg = 0, bb = 0;
-					if (clsGrid[c0] === win && hasCol[c0]) { cw += w00; rr += w00 * colR[c0]; gg += w00 * colG[c0]; bb += w00 * colB[c0]; }
-					if (clsGrid[c1] === win && hasCol[c1]) { cw += w10; rr += w10 * colR[c1]; gg += w10 * colG[c1]; bb += w10 * colB[c1]; }
-					if (clsGrid[c2] === win && hasCol[c2]) { cw += w01; rr += w01 * colR[c2]; gg += w01 * colG[c2]; bb += w01 * colB[c2]; }
-					if (clsGrid[c3] === win && hasCol[c3]) { cw += w11; rr += w11 * colR[c3]; gg += w11 * colG[c3]; bb += w11 * colB[c3]; }
-					if (cw > 1e-6) {
-						data[di] = rr / cw; data[di + 1] = gg / cw; data[di + 2] = bb / cw;
+					var wsum = 0, rr = 0, gg = 0, bb = 0;
+					if (clsGrid[c0] === win && hasCol[c0]) { wsum += w00; rr += w00 * colR[c0]; gg += w00 * colG[c0]; bb += w00 * colB[c0]; }
+					if (clsGrid[c1] === win && hasCol[c1]) { wsum += w10; rr += w10 * colR[c1]; gg += w10 * colG[c1]; bb += w10 * colB[c1]; }
+					if (clsGrid[c2] === win && hasCol[c2]) { wsum += w01; rr += w01 * colR[c2]; gg += w01 * colG[c2]; bb += w01 * colB[c2]; }
+					if (clsGrid[c3] === win && hasCol[c3]) { wsum += w11; rr += w11 * colR[c3]; gg += w11 * colG[c3]; bb += w11 * colB[c3]; }
+					if (wsum > 1e-6) {
+						data[di] = rr / wsum; data[di + 1] = gg / wsum; data[di + 2] = bb / wsum;
 					} else if (kHasRep[bestKi]) {
 						data[di] = kRepR[bestKi]; data[di + 1] = kRepG[bestKi]; data[di + 2] = kRepB[bestKi];
 					} else {
@@ -425,7 +425,7 @@
 			// remember this cell's rendered pixels + what they depend on
 			var sx0 = cellX * PS, sy0 = cellY * PS;
 			for (var cy2 = 0; cy2 < PS; cy2++) {
-				var src = (sy0 + cy2) * cw + sx0;
+				var src = (sy0 + cy2) * canvasW + sx0;
 				var dst = (oy + cy2) * bw + ox;
 				for (var cx2 = 0; cx2 < PS; cx2++) smoothU32[src + cx2] = imgU32[dst + cx2];
 			}
