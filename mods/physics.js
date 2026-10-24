@@ -21,6 +21,10 @@
              physicsalignedsnap (rotate to the grid first, then snap)
    * Vanilla interactions: acid dissolves, CH/DL behaviors convert/carve body cells;
      buoyancy is row-scan based so water on top no longer levitates boats.
+   v5: every solid in the game falls (all categories + other mods' elements),
+       painting onto/into bodies can never leave holes any more, displaced
+       water is never destroyed, grains are real physics particles that fly,
+       bounce and roll, and bodies that sit still skip their whole sync pass.
    ========================================================================== */
 (function () {
 
@@ -36,6 +40,11 @@ var COV = 0.55;                                   // below this coverage a soft 
 
 function chance(p){ return Math.random() < p; }
 function pick(a){ return a[Math.floor(Math.random()*a.length)]; }
+function cellColor(E){
+  if (Array.isArray(E.color)) return pick(E.color);
+  if (typeof E.color === "function"){ try { return E.color({ element: E }); } catch (err){ return "#999999"; } }
+  return E.color || "#999999";
+}
 function sign(v){ return v > 0 ? 1 : v < 0 ? -1 : 0; }
 function K(lx,ly){ return (lx+2048)*4096 + (ly+2048); }
 function GK(x,y){ return x*4096 + y; }
@@ -143,15 +152,15 @@ function rasterC(b, x, y, a){
   var c = Math.cos(a), s = Math.sin(a), r = b.rad + 0.5, cm = b.com;
   var gx0 = Math.floor(x - r), gx1 = Math.ceil(x + r), gy0 = Math.floor(y - r), gy1 = Math.ceil(y + r);
   var out = { gx: [], gy: [], cov: [] };
-  var offs = [[0,0],[0.26,0.26],[-0.26,0.26],[0.26,-0.26],[-0.26,-0.26]];
+  var offs = [[0,0],[0.27,0.27],[-0.27,-0.27]];    // 3 subsamples: same behaviour, ~40% cheaper (lag fix)
   for (var gx = gx0; gx <= gx1; gx++) for (var gy = gy0; gy <= gy1; gy++){
     var ins = 0;
-    for (var i = 0; i < 5; i++){
+    for (var i = 0; i < 3; i++){
       var dx = gx - x + offs[i][0], dy = gy - y + offs[i][1];
       var lx = dx*c + dy*s + cm.x, ly = -dx*s + dy*c + cm.y;
       if (b.cells.has(K(Math.round(lx), Math.round(ly)))) ins++;
     }
-    if (ins > 0){ out.gx.push(gx); out.gy.push(gy); out.cov.push(ins/5); }
+    if (ins > 0){ out.gx.push(gx); out.gy.push(gy); out.cov.push(ins/3); }
   }
   return out;
 }
@@ -226,8 +235,10 @@ function removeCell(b, k, debris){
   }
 }
 function damage(b, c, s){
-  if (s < 1.0) return;
-  var power = s - 1.0, tH = 0.6, i;
+  /* only a genuinely hard hit breaks cells: a normal fall (impulse ~1-2) used to
+     chip the body's edges apart on landing, which looked like random splitting */
+  if (s < 2.2) return;
+  var power = s - 2.2, tH = 0.6, i;
   var mf = Math.max(0.2, Math.min(3, (b.m/b.cells.size)/1500 * (0.4 + Math.min(1.2, b.cells.size/40))));
   for (i = 0; i < c.hits.length && i < 6; i++){
     var p = pxAt(c.hits[i][0], c.hits[i][1]);
@@ -297,16 +308,18 @@ function fluidInfo(b, R){
 /* ------------------------------------------------------------- proxies */
 function relocate(o, gx, gy, want, rr){
   var E0 = elements[o.element], isL = E0 && E0.state === "liquid";
-  for (var r = 1; r <= (isL ? 4 : 12); r++){       // liquids only teleport a little, and never upwards
-    var cand = [];
-    for (var dx = -r; dx <= r; dx++) for (var dy = -r; dy <= r; dy++){
-      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
-      var x = gx + dx, y = gy + dy;
-      if (outOfBounds(x,y) || pixelMap[x][y] !== undefined || want.has(GK(x,y))) continue;
-      if (rr && rr[y] && x > rr[y][0] && x < rr[y][1]) continue;          // never into a hull's dry interior
-      cand.push([x,y]);
-    }
-    if (cand.length){
+  for (var pass = 0; pass < 2; pass++){            // pass 2 also allows upwards (better than destroying the pixel)
+    for (var r = 1; r <= (isL ? 6 : 12); r++){
+      var cand = [];
+      for (var dx = -r; dx <= r; dx++) for (var dy = -r; dy <= r; dy++){
+        if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+        if (pass === 0 && dy < 0) continue;        // first choice: sideways or down, never lifted up
+        var x = gx + dx, y = gy + dy;
+        if (outOfBounds(x,y) || pixelMap[x][y] !== undefined || want.has(GK(x,y))) continue;
+        if (rr && rr[y] && x > rr[y][0] && x < rr[y][1]) continue;          // never into a hull's dry interior
+        cand.push([x,y]);
+      }
+      if (!cand.length) continue;
       if (isL){
         var wetc = cand.filter(function(q){        // displaced liquid goes next to other liquid
           for (var d = 0; d < 4; d++){ var n = pxAt(q[0] + D4[d][0], q[1] + D4[d][1]);
@@ -324,11 +337,12 @@ function relocate(o, gx, gy, want, rr){
       pixelMap[o.x][o.y] = undefined; o.x = t[0]; o.y = t[1]; pixelMap[t[0]][t[1]] = o; return true;
     }
   }
-  /* sealed hull squeezed it out of existence: the pixel is destroyed (never teleported inside) */
-  pixelMap[o.x][o.y] = undefined; o.del = true; mark(gx, gy);
-  return false;
+  return false;   // nowhere to go: the pixel stays where it is and the body just draws over it (no holes)
 }
 function syncProxies(b){
+  /* bodies that have not moved since the last sync skip the whole raster pass (lag fix) */
+  if (b._sx1 !== undefined && b._sx1 === b.x && b._sy1 === b.y && b._sa1 === b.a && !b.dirty) return;
+  b._sx1 = b.x; b._sy1 = b.y; b._sa1 = b.a;
   var R = raster(b, b.x, b.y, b.a), RC = rasterC(b, b.x, b.y, b.a);
   var want = new Map(), cov = {}, i, spd = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
   for (i = 0; i < RC.gx.length; i++) cov[GK(RC.gx[i], RC.gy[i])] = RC.cov[i];
@@ -341,12 +355,19 @@ function syncProxies(b){
   b.proxies.forEach(function(pix, gk){
     var valid = !pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix && pix.sub === b.id;
     if (valid && pix.element !== PROXY){
-      /* something converted the proxy pixel: restore the footprint instead of
-         deleting the body cell (that was making bodies randomly split) */
+      /* the footprint pixel was replaced (a mod, a save edit, a stray effect):
+         a painted solid becomes that cell's element, anything else replaces the
+         cell - the painted pixel is never silently thrown away (that left holes) */
+      var P2 = elements[pix.element], cell = b.cells.get(pix.ck);
+      if (cell && P2 && !P2.tool && P2.canPlace !== false && (P2.state === "solid" || P2.state === undefined)){
+        cell.e = pix.element; cell.c = cellColor(P2);
+        b.pend = true; b.sleep = 0;
+      } else if (cell) cellEject(b, pix, cell, pix.element);
+      if (!cell || !b.cells.get(pix.ck)){ b.proxies.delete(gk); return; }
       pixelMap[pix.x][pix.y] = undefined;
       createPixel(PROXY, pix.x, pix.y);
       var np = pixelMap[pix.x][pix.y];
-      if (np){ np.sub = b.id; np.ck = pix.ck; b.proxies.set(gk, np); }
+      if (np){ np.sub = b.id; np.ck = pix.ck; np.pe = cell.e; b.proxies.set(gk, np); }
       return;
     }
     if (valid && want.has(gk)){ pix.ck = R.ck[want.get(gk)]; want.delete(gk); }
@@ -359,9 +380,9 @@ function syncProxies(b){
     var gx = R.gx[idx], gy = R.gy[idx], o = pixelMap[gx][gy];
     if (o){
       var bt = blocker(b, gx, gy, spd, cov[gk] !== undefined ? cov[gk] : 1);
-      if (bt === 1 || bt === 2) return;
+      if (bt === 1 || bt === 2) return;           // terrain / another body: cell stays untracked
       if (bt === 4) return;                       // barely covered soft pixel: leave it, body draws over it
-      relocate(o, gx, gy, want, rr);
+      if (!relocate(o, gx, gy, want, rr)) return; // nowhere to push it: leave the pixel (no holes)
     }
     var pix = spare.pop();
     if (pix){ pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix; }
@@ -372,14 +393,29 @@ function syncProxies(b){
   });
   for (i = 0; i < spare.length; i++){ spare[i].sub = undefined; spare[i].del = true; }
 }
-function releaseProxies(b){
+function releaseProxies(b, restore){
+  var freed = [];
   b.proxies.forEach(function(pix){
-    if (!pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
+    var live = !pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix;
+    if (live){ pixelMap[pix.x][pix.y] = undefined; freed.push(pix); }
     pix.sub = undefined; pix.del = true; mark(pix.x, pix.y);
   });
   b.proxies.clear();
+  /* a body that dies must never erase the object: its blocks go back on the grid
+     (the old version deleted them, so falling wood vanished into thin air) */
+  if (restore){
+    freed.forEach(function(pix){
+      var cell = b.cells.get(pix.ck); if (!cell) return;
+      b.cells.delete(pix.ck);
+      if (!outOfBounds(pix.x, pix.y) && pixelMap[pix.x][pix.y] === undefined){
+        NOJOIN = true; createPixel(cell.e, pix.x, pix.y); NOJOIN = false;
+        var np = pixelMap[pix.x][pix.y];
+        if (np){ if (cell.c) np.color = cell.c; if (cell.t !== undefined) np.temp = cell.t; }
+      }
+    });
+  }
 }
-function killBody(b){ releaseProxies(b); b.dead = true; delete BODIES[b.id]; }
+function killBody(b, restore){ if (restore === undefined) restore = true; releaseProxies(b, restore); b.dead = true; delete BODIES[b.id]; }
 
 /* ---------------------------------------------------- dirty / splitting */
 /* 8-connected: all 9 pixels around a pixel count as touching, so 1-thick diagonal
@@ -415,7 +451,7 @@ function fixBody(b){
     nb.hold = b.hold; nb.frozen = b.frozen;
     created.push(nb);
   });
-  killBody(b);
+  killBody(b, false);            // the split-off bodies now own these cells: don't restore them as grid blocks
   var cx = 0, cy = 0; created.forEach(function(n){ cx += n.x; cy += n.y; });
   cx /= created.length; cy /= created.length;
   created.forEach(function(n){
@@ -436,7 +472,11 @@ function stepBody(b){
     var gs0 = (b.g*b.gf) >= 0 ? 1 : -1;
     if (contacts(b, b.x, b.y + 0.3*gs0, b.a, 0).n === 0) b.sleep = 0; else return;
   }
-  if (b.stuck){ b.stuck = false; escape(b); }
+  if (b.stuck){
+    b.stuck = false;
+    b.stuckT = (b.stuckT || 0) + 1;
+    if (b.stuckT >= 3){ escape(b); b.stuckT = 0; }   // jitter-free: don't teleport out of every little snag
+  } else b.stuckT = 0;
   var R0 = raster(b, b.x, b.y, b.a);
   var grab = GRAB && GRAB.b === b && GRAB.down && !b.dead;
   var ay = b.g*b.gf*G, tq = 0;
@@ -460,7 +500,7 @@ function stepBody(b){
   if (b.w > MAXW) b.w = MAXW; else if (b.w < -MAXW) b.w = -MAXW;
 
   var rr = Math.sqrt(b.vx*b.vx + b.vy*b.vy) + Math.abs(b.w)*b.rad;
-  var n = Math.min(8, Math.max(1, Math.ceil(rr/0.45))), h = 1/n;
+  var n = Math.min(6, Math.max(1, Math.ceil(rr/0.45))), h = 1/n;
   b.touch = false; b.plow = 0;
   for (var s = 0; s < n; s++){ moveSub(b, h); if (!b.cells.size){ b.dirty = true; break; } }
   if (b.plow > 0){ var d = Math.max(0.5, 1 - 0.05*b.plow/n); b.vx *= d; b.vy *= d; b.w *= d; }
@@ -524,7 +564,7 @@ function carry(b){                                    // loose solids on top + w
 }
 
 /* ------------------------------------------- falling: support detection */
-function isFaller(p){ return p && !p.del && p.sub === undefined && FALL[p.element] === true; }
+function isFaller(p){ return p && !p.del && p.sub === undefined && fallerOf(p.element) === true; }
 function bodyFromPixels(list){
   var ax = list[0].x, ay = list[0].y, cells = new Map();
   list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
@@ -544,12 +584,12 @@ function checkSupport(p, checked){
       var n = pixelMap[nx][ny];
       if (!n || n.del) continue;
       if (n.sub !== undefined){ if (!host && BODIES[n.sub]) host = BODIES[n.sub]; continue; }
-      if (FALL[n.element] === true){ if (!seen.has(n)){ seen.add(n); comp.push(n); q.push(n); } continue; }
+      if (fallerOf(n.element) === true){ if (!seen.has(n)){ seen.add(n); comp.push(n); q.push(n); } continue; }
       var e = elements[n.element];
       if (e && (e.state === "liquid" || e.state === "gas")) continue;
       supported = true; break;
     }
-    if (comp.length > 2500) supported = true;
+    if (comp.length > 6000) supported = true;
   }
   comp.forEach(function(x){ checked.add(x); });
   if (host){                    // drawing that touches an existing body joins it: one object, not many
@@ -562,7 +602,7 @@ function checkSupport(p, checked){
 function processSupport(){
   var checked = new Set(), n = 0, i;
   /* newest first: a busy sim never starves fresh placements out of the queue */
-  while (n < 120 && dirtyA.length){
+  while (n < 48 && dirtyA.length){
     var gk = dirtyA.pop(); dirtyS.delete(gk); n++;
     var x = Math.floor(gk/4096), y = gk % 4096;
     for (var dx = -3; dx <= 3; dx++) for (var dy = -3; dy <= 3; dy++){
@@ -571,7 +611,7 @@ function processSupport(){
     }
   }
   if (typeof currentPixels !== "undefined" && currentPixels.length){      // slow background sweep
-    for (i = 0; i < 12; i++){
+    for (i = 0; i < 8; i++){
       var r = currentPixels[Math.floor(Math.random()*currentPixels.length)];
       if (r && !checked.has(r) && isFaller(r) && pixelMap[r.x] && pixelMap[r.x][r.y] === r) checkSupport(r, checked);
     }
@@ -585,17 +625,26 @@ function joinPixel(b, p, defer){
     /* the drawn pixel lands on a cell the body already owns (rotated overlap):
        tuck it into the nearest free neighbour cell instead of swallowing it -
        swallowing left random holes when you painted onto a body */
-    var bk = null, bd = 9;
-    for (var sx = -1; sx <= 1; sx++) for (var sy = -1; sy <= 1; sy++){
-      if (!sx && !sy) continue;
-      var sk = K(lx + sx, ly + sy), sd = sx*sx + sy*sy;
-      if (!b.cells.has(sk) && sd < bd){ bd = sd; bk = sk; }
+    /* nearest free local cell, spiralling outward: a painted pixel is never
+       thrown away and never lands more than a couple of cells from where you
+       drew it (the old version deleted them - that was the holes) */
+    var bk = null;
+    /* at most one cell away: tucking drawn pixels 2-3 cells out made them look
+       like random extra pixels appearing somewhere else on the body */
+    for (var r2 = 1; r2 <= 1 && bk === null; r2++){
+      for (var sx = -r2; sx <= r2 && bk === null; sx++) for (var sy = -r2; sy <= r2 && bk === null; sy++){
+        if (Math.max(Math.abs(sx), Math.abs(sy)) !== r2) continue;
+        var sk = K(lx + sx, ly + sy);
+        if (!b.cells.has(sk)) bk = sk;
+      }
     }
-    if (bk === null){ pixelMap[p.x][p.y] = undefined; p.del = true; return true; }
+    if (bk === null) return false;                // body is completely full here: pixel stays a normal grid pixel
+    b._sx1 = undefined;
     lx = Math.floor(bk/4096) - 2048; ly = (bk % 4096) - 2048;
   }
   b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
   pixelMap[p.x][p.y] = undefined; p.del = true;
+  b._sx1 = undefined;
   b.sleep = 0; b.vx = 0; b.vy = 0; b.w = 0; b.hold = pixelTicks + HOLD;   // hold still while building
   if (!defer){ calc(b, true); syncProxies(b); }
   return true;
@@ -637,7 +686,7 @@ function snapBody(b, aligned){
     b.x += Math.round(w.x) - w.x; b.y += Math.round(w.y) - w.y;
   }
   var R = raster(b, b.x, b.y, b.a), cells = b.cells;
-  killBody(b);
+  killBody(b, false);            // the cells re-materialise as anchored blocks right below
   NOJOIN = true;
   for (var i = 0; i < R.gx.length; i++){
     var cell = cells.get(R.ck[i]);
@@ -659,14 +708,21 @@ elements.physics_wall = {                        // indestructible, but falls as
   behavior: behaviors.WALL, category: "solids", state: "solid", density: 20000, hardness: 1,
   desc: "Like wall, but it falls as one physics object. Immune to acid, fire and explosions."
 };
-ids = Object.keys(elements);
-ids.forEach(function(id){
-  var e = elements[id];
-  if (!e || e.state !== "solid" || e.tool || e.category !== "solids") return;
-  if (id === "wall" || id === "border" || id === "sublevel_solid" || /^anchored_/.test(id)) return;
-  FALL[id] = true;                               // every solid in the Solids tab can fall
-});
-Object.keys(FALL).forEach(function(id){
+/* EVERY solid in the game can fall - blocks from every category and elements that
+   other mods add too, decided live (one cached verdict per element) */
+function willMove(e){
+  if (e.movable === true) return true;
+  if (e.movable === false) return false;
+  if (typeof e.behavior === "function") return true;      // custom tick element (moves itself)
+  if (e.tick) return true;
+  if (e.behavior && typeof e.behavior[0] === "object"){
+    var bs = JSON.stringify(e.behavior);
+    if (bs.indexOf("M1") !== -1 || bs.indexOf("M2") !== -1) return true;
+  }
+  return false;
+}
+function makeAnchoredVariant(id){
+  if (elements["anchored_" + id]) return;
   var e = elements[id], a = Object.assign({}, e);
   if (Array.isArray(a.color)) a.color = a.color.slice();
   if (Array.isArray(a.behavior)) a.behavior = a.behavior.slice();
@@ -675,9 +731,27 @@ Object.keys(FALL).forEach(function(id){
   a.name = "Static " + (e.name || id.replace(/_/g, " "));
   a.desc = "Looks exactly like " + (e.name || id.replace(/_/g, " ")) + ", but never falls.";
   elements["anchored_" + id] = a;
-  var prev = e.onPlace;
-  e.onPlace = function(p){ if (prev) prev(p); onPlaceFaller(p); };
-});
+}
+function fallerOf(id){
+  var f = FALL[id];
+  if (f !== undefined) return f;
+  f = false;
+  var e = elements[id];
+  if (e && !e.tool && !e.hidden && e.state === "solid" && e.canPlace !== false && !willMove(e)){
+    if (id !== PROXY && !/^anchored_/.test(id) && id !== "wall" && id !== "border" && id !== "physics_grain" &&
+        e.category !== "powders" && e.category !== "tools" && e.category !== "anchored") f = true;
+  }
+  FALL[id] = f;
+  if (f && !e.__slOP){
+    e.__slOP = true;
+    var prev = e.onPlace;
+    e.onPlace = function(p){ if (prev) prev(p); onPlaceFaller(p); };
+    makeAnchoredVariant(id);
+  }
+  return f;
+}
+ids = Object.keys(elements);
+ids.forEach(fallerOf);
 elements[PROXY] = {
   color: "#8a8f98", behavior: behaviors.WALL, category: "anchored", state: "solid", density: 9999,
   hidden: true, hardness: 1, desc: "Invisible grid footprint of a moving physics body.",
@@ -690,7 +764,7 @@ elements[PROXY] = {
     var b = BODIES[p.sub]; if (!b || b.dead) return;
     var cell = b.cells.get(p.ck); if (!cell) return;
     if (E.state === "solid" || E.state === undefined){
-      cell.e = cur; cell.c = Array.isArray(E.color) ? pick(E.color) : E.color;
+      cell.e = cur; cell.c = cellColor(E);
       p.pe = cur; b.pend = true; b.sleep = 0;
       return;
     }
@@ -732,12 +806,59 @@ elements.physicsgrab = { color: "#7ee787", category: "tools", canPlace: false,
     if (!GRAB || GRAB.b !== b || !GRAB.down) GRAB = { b: b, dx: b.x - p.x, dy: b.y - p.y, down: true };
     b.sleep = 0;
   } };
-elements.physics_grain = {                       // loose non-sticking grains left by disintegration
+/* loose non-sticking grains left by disintegration: every grain is its own little
+   physics particle - it flies with real velocity, bounces, rolls down slopes and
+   sinks through water - but it never re-forms a body */
+function grainTick(p){
+  if (p.start === pixelTicks) return;
+  if (typeof doDefaults === "function"){ doDefaults(p); if (p.del) return; }
+  function isLiq(q){ return q && !q.del && q.sub === undefined && elements[q.element] && elements[q.element].state === "liquid"; }
+  var vx = p.gvx || 0, vy = (p.gvy || 0) + G;
+  if (isLiq(pxAt(p.x, p.y - 1)) || isLiq(pxAt(p.x, p.y + 1))){ vx *= 0.9; vy *= 0.9; }   // water drag
+  if (vy > 2.5) vy = 2.5; else if (vy < -2.5) vy = -2.5;
+  var dn0 = pxAt(p.x, p.y + 1);
+  var grounded = dn0 && !isLiq(dn0);
+  if (grounded) vy = 0;
+  p.gvy = vy;
+  var gay = (p.gay || 0) + vy, steps = 0;
+  while (Math.abs(gay) >= 1 && steps < 4 && !p.del){
+    steps++;
+    var d = sign(gay);
+    if (isEmpty(p.x, p.y + d)){ movePixel(p, p.x, p.y + d); gay -= d; continue; }
+    if (d > 0 && isLiq(pxAt(p.x, p.y + 1)) && chance(0.3)){ movePixel(p, p.x, p.y + 1); gay -= d; continue; }  // sinks through liquid
+    if (Math.abs(vy) > 0.7) vy = -vy * 0.3;      // bounces
+    else vy = 0;                                 // rests
+    p.gvy = vy; p.gay = 0; break;
+  }
+  if (p.del) return;
+  p.gay = grounded ? 0 : gay;
+  vx = grounded ? vx * 0.86 : vx * 0.995;        // friction on the ground
+  if (Math.abs(vx) < 0.04) vx = 0;
+  p.gvx = vx;
+  var gax = (p.gax || 0) + vx;
+  while (Math.abs(gax) >= 1 && !p.del){
+    var dx = sign(gax);
+    if (isEmpty(p.x + dx, p.y)){ movePixel(p, p.x + dx, p.y); }
+    else if (grounded && isEmpty(p.x + dx, p.y + 1)){ movePixel(p, p.x + dx, p.y + 1); }   // rolls down slopes
+    else { p.gax = 0; p.gvx = vx = Math.abs(vx) > 0.5 ? -vx * 0.4 : 0; break; }            // wall: bounce or stop
+    gax -= dx;
+  }
+  if (p.del) return;
+  p.gax = gax;
+  if (grounded && p.gvx === 0 && p.gvy === 0){   // settled: trickles like sand so piles settle properly
+    if (isEmpty(p.x, p.y + 1)) p.gvy = 0.01;
+    else {
+      var dl = chance(0.5) ? 1 : -1;
+      if (isEmpty(p.x + dl, p.y + 1) && isEmpty(p.x + dl, p.y)) movePixel(p, p.x + dl, p.y + 1);
+    }
+  }
+}
+elements.physics_grain = {
   name: "Physics Grain",
   color: (elements.gravel && Array.isArray(elements.gravel.color)) ? elements.gravel.color.slice() : "#8a8f98",
-  behavior: behaviors.POWDER, category: "powders", state: "solid",
+  tick: grainTick, category: "powders", state: "solid", movable: true,
   density: 1600, hardness: 0.2,
-  desc: "Loose grains left behind when a physics object disintegrates. Never re-forms a body."
+  desc: "Loose grains left behind when a physics object disintegrates. They fly, bounce, roll and sink. Never re-forms a body."
 };
 elements.physicsdisintegrate = { color: "#ff6ec7", category: "tools", canPlace: false,
   desc: "Disintegrates a physics body into loose physics grains.",
@@ -750,10 +871,15 @@ elements.physicsdisintegrate = { color: "#ff6ec7", category: "tools", canPlace: 
       if (!outOfBounds(gx, gy) && pixelMap[gx][gy] === undefined){
         createPixel("physics_grain", gx, gy);
         var q = pixelMap[gx][gy];
-        if (q){ if (cell.c) q.color = cell.c; if (cell.t !== undefined) q.temp = cell.t; }
+        if (q){
+          if (cell.c) q.color = cell.c; if (cell.t !== undefined) q.temp = cell.t;
+          q.gvx = b.vx * 0.6 + (Math.random() - 0.5) * 1.4;   // grains scatter with the body's velocity
+          q.gvy = b.vy * 0.6 + (Math.random() - 0.5) * 0.8 - 0.25;
+          q.gax = 0; q.gay = 0;
+        }
       }
     });
-    killBody(b);
+    killBody(b, false);          // grains replace the body: nothing to restore
   } };
 elements.physicssnap = { color: "#ffb347", category: "tools", canPlace: false,
   desc: "Snaps a physics body onto the grid as anchored blocks, exactly as its rotated shape rasterises.",
@@ -782,7 +908,7 @@ function cellEject(b, pix, cell, result){
     if (np){
       np.temp = cell.t;
       var T = elements[result];
-      if (T && T.color) np.color = Array.isArray(T.color) ? pick(T.color) : T.color;
+      if (T && T.color) np.color = cellColor(T);
     }
   }
 }
@@ -791,7 +917,7 @@ function cellConvert(b, pix, cell, result){
   var T = elements[result];
   if (T.state === "solid"){
     cell.e = result;
-    cell.c = Array.isArray(T.color) ? pick(T.color) : T.color;
+    cell.c = cellColor(T);
     pix.pe = result;
   } else cellEject(b, pix, cell, result);
 }
@@ -900,7 +1026,7 @@ function cellTick(b){
           if (R2.elem2 !== undefined){
             var T3 = r2 !== null ? elements[r2] : null;
             if (T3 && T3.state === "solid"){
-              cell.e = r2; cell.c = Array.isArray(T3.color) ? pick(T3.color) : T3.color; pix.pe = r2;
+              cell.e = r2; cell.c = cellColor(T3); pix.pe = r2;
             } else if (r2 === null || !T3){ removeCell(b, pix.ck, false); return; }
             else { cellEject(b, pix, cell, r2); return; }
           }
@@ -926,12 +1052,40 @@ function wrap(name, make){
   var o = globalThis[name];
   if (typeof o === "function" && !o.__sl){ var w = make(o); w.__sl = true; globalThis[name] = w; }
 }
-function quiet(p){ var e = p && elements[p.element]; return !p || p.element === PROXY || (e && (e.state === "liquid" || e.state === "gas")); }
-wrap("createPixel", function(o){ return function(el, x, y){ var r = o(el, x, y); if (el !== PROXY) mark(x, y); return r; }; });
+function quiet(p){ var e = p && elements[p.element]; return !p || p.element === PROXY || p.element === "physics_grain" || (e && (e.state === "liquid" || e.state === "gas")); }
+/* Painting straight onto a body: a placeable solid recolours that cell (exactly
+   like clicking it) and liquids/gases/powders carve the cell out and take its
+   place. Nothing gets overwritten into a ghost pixel, so adding to a body no
+   longer leaves holes. */
+wrap("createPixel", function(o){ return function(el, x, y){
+  var prev = pixelMap[x] && pixelMap[x][y];
+  if (prev && prev.sub !== undefined && el !== PROXY){
+    var b = BODIES[prev.sub], E = elements[el];
+    if (b && !b.dead && E && !E.tool && E.canPlace !== false && !E.hidden){
+      var cell = b.cells.get(prev.ck);
+      if (cell){
+        if (E.state === "solid"){
+          cell.e = el; cell.c = cellColor(E);
+          prev.pe = el; b.pend = true; b.sleep = 0; b._sx1 = undefined;
+          return;
+        }
+        if (E.state === "liquid" || E.state === "gas" || E.movable === true){
+          cellEject(b, prev, cell, el); b._sx1 = undefined;
+          return;
+        }
+      }
+    }
+  }
+  var r = o(el, x, y);
+  if (el !== PROXY && fallerOf(el)) mark(x, y);
+  if (prev && prev.sub !== undefined){ var bb = BODIES[prev.sub]; if (bb) bb._sx1 = undefined; }
+  return r; }; });
 wrap("deletePixel", function(o){ return function(x, y){
   var p = pixelMap[x] && pixelMap[x][y], q = quiet(p); o(x, y); if (!q) mark(x, y); }; });
 wrap("changePixel", function(o){ return function(pixel){
-  var q = quiet(pixel); o.apply(this, arguments); if (!q || !quiet(pixel)) mark(pixel.x, pixel.y); }; });
+  var q = quiet(pixel), sub = pixel.sub; o.apply(this, arguments);
+  if (sub !== undefined){ var bb = BODIES[sub]; if (bb) bb._sx1 = undefined; }   // footprint pixel converted: rebuild it
+  if (!q || !quiet(pixel)) mark(pixel.x, pixel.y); }; });
 wrap("movePixel", function(o){ return function(pixel, x, y){
   var q = quiet(pixel), ox = pixel.x, oy = pixel.y; o.apply(this, arguments); if (!q){ mark(ox, oy); mark(x, y); } }; });
 wrap("swapPixels", function(o){ return function(a, b){
@@ -978,7 +1132,7 @@ runEveryTick(function(){
   var cap = Math.min(list.length, 100);           // perf: at most 100 bodies simulated per tick
   for (var i = 0; i < cap; i++){ var b = BODIES[list[i]]; if (b) stepBody(b); }
   /* body cells live like real pixels: conduct heat, melt/burn/freeze, react */
-  var budget = 1500;
+  var budget = 900;
   for (i = 0; i < list.length && budget > 0; i++){
     var b2 = BODIES[list[i]];
     if (!b2 || b2.dead) continue;
@@ -988,8 +1142,18 @@ runEveryTick(function(){
 });
 runPerPixel(function(p){
   if (p.sub === undefined) return;
-  var b = BODIES[p.sub];                       // orphan proxy (e.g. after load): becomes a normal block again
-  if (!b || b.proxies.get(GK(p.x, p.y)) !== p){
+  var b = BODIES[p.sub];
+  if (pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){
+    /* off the map (something overwrote the cell without a proper delete): clean
+       the ghost up and let the body rebuild its footprint - leftover ghosts used
+       to hide painted pixels and punch holes into bodies */
+    var reg = b && b.proxies.get(GK(p.x, p.y)) === p;
+    p.del = true;
+    if (reg && b) b._sx1 = undefined;
+    else if (p.pe && elements[p.pe]){ NOJOIN = true; changePixel(p, p.pe); NOJOIN = false; }
+    return;
+  }
+  if (!b || b.proxies.get(GK(p.x, p.y)) !== p){  // orphan proxy (e.g. after load): becomes a normal block again
     p.sub = undefined;
     if (p.pe && elements[p.pe]){ NOJOIN = true; changePixel(p, p.pe); NOJOIN = false; } else p.del = true;
   }
@@ -1006,13 +1170,18 @@ renderPostPixel(function(ctx){
     b.cells.forEach(function(c){
       ctx.fillStyle = c.c || "#999999";
       ctx.fillRect((c.x - cm.x - 0.5)*ps - 0.35, (c.y - cm.y - 0.5)*ps - 0.35, size, size);
-      if (bord){                                  // BORDER elements (glass etc.): keep their light outline
-        var el = elements[c.e];
-        if (el && el.renderer === bord){
-          var edge = false;
-          for (var d = 0; d < 4; d++) if (!b.cells.has(K(c.x + D4[d][0], c.y + D4[d][1]))){ edge = true; break; }
-          if (edge){ ctx.fillStyle = "rgba(255,255,255,0.25)"; ctx.fillRect((c.x - cm.x - 0.5)*ps - 0.35, (c.y - cm.y - 0.5)*ps - 0.35, size, size); }
+      var el = elements[c.e];
+      /* BORDER elements (glass etc.): vanilla draws the outline only where the
+         neighbour is empty or a different movability - matching that exactly, the
+         old "any non-body neighbour" test outlined cells that vanilla left clean */
+      if (bord && el && el.renderer === bord){
+        var w2 = toWorld(b, c.x, c.y), edge = false;
+        for (var d = 0; d < 4 && !edge; d++){
+          var qx = Math.round(w2.x) + D4[d][0], qy = Math.round(w2.y) + D4[d][1];
+          var qp = pxAt(qx, qy);
+          if (!qp || !qp.del || (qp.sub === undefined && elements[qp.element].movable !== el.movable)) edge = true;
         }
+        if (edge){ ctx.fillStyle = "rgba(255,255,255,0.25)"; ctx.fillRect((c.x - cm.x - 0.5)*ps - 0.35, (c.y - cm.y - 0.5)*ps - 0.35, size, size); }
       }
     });
     if (b.frozen){ ctx.strokeStyle = "rgba(123,220,255,0.9)"; ctx.lineWidth = 1; ctx.strokeRect(-ps*b.rad, -ps*b.rad, ps*2*b.rad, ps*2*b.rad); }
@@ -1025,5 +1194,5 @@ if (typeof globalThis !== "undefined" && globalThis.__SUBLEVEL_TEST__){
     stepBody: stepBody, K: K, snapBody: snapBody, bodyFromPixels: bodyFromPixels, syncProxies: syncProxies,
     cellTick: cellTick, emulateVanilla: emulateVanilla, fluidInfo: fluidInfo, blocker: blocker };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v4 loaded: all Solids-tab solids fall; grab, disintegrate and snap tools; stable buoyancy; acid and vanilla behaviors now dissolve physics bodies.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v5 loaded: every solid in the game falls; painting onto bodies never leaves holes; grains are real bouncing physics particles; smoother water.");
 })();
