@@ -44,6 +44,8 @@
 	var plusGrid = null;   // padded mask of gas/glow cells (normal view)
 	var colR = null, colG = null, colB = null, hasCol = null;
 	var bufA = null, bufB = null, bufC = null; // chamfer/blur scratch
+	var smoothImg = null, smoothU32 = null; // cached smoothed cells, kept across frames
+	var hashGrid = null, hashFrame = null, frameId = 0;
 	var edgeCells = [];
 	var cloudPixels = [];  // this frame's gas/glow pixels: [x, y, color, alpha]
 	var elemIndex = {}, elemCount = 0;
@@ -71,6 +73,9 @@
 		bufB = new Float32Array(N);
 		bufC = new Float32Array(N);
 		classBufs = {};
+		hashGrid = new Int32Array(N);
+		hashFrame = new Int32Array(N);
+		frameId = 0;
 	}
 
 	function getClassBufs(id) {
@@ -275,6 +280,14 @@
 		var bw = (maxX - minX + 1) * PS, bh = (maxY - minY + 1) * PS;
 		var img = ctx.getImageData(bx, by, bw, bh);
 		var data = img.data;
+		frameId++;
+		var cw = canvas.width, chh = canvas.height;
+		if (!smoothImg || smoothImg.width !== cw || smoothImg.height !== chh) {
+			smoothImg = ctx.createImageData(cw, chh);
+			smoothU32 = new Uint32Array(smoothImg.data.buffer);
+			hashFrame.fill(0); // cached cells no longer have pixels stored
+		}
+		var imgU32 = new Uint32Array(img.data.buffer);
 
 		// Sample each material cell's drawn color at its center (fallback:
 		// the first drawn subpixel in the cell).
@@ -306,6 +319,30 @@
 			gi = edgeCells[i];
 			var cellX = (gi % pw) - 1, cellY = ((gi / pw) | 0) - 1;
 			var ox = (cellX - minX) * PS, oy = (cellY - minY) * PS;
+
+			// Cells whose 3x3 neighborhood (materials + drawn colors) is
+			// unchanged since they were last rendered are copied from the
+			// cache instead of recomputed — big scenes stay cheap.
+			var h = 0x9e3779b9;
+			for (var hy = -1; hy <= 1; hy++) {
+				for (var hx = -1; hx <= 1; hx++) {
+					var gj2 = gi + hy * pw + hx;
+					h = (Math.imul(h ^ clsGrid[gj2], 0x85ebca6b) + hasCol[gj2]) | 0;
+					if (hasCol[gj2]) {
+						h = (Math.imul(h ^ (colR[gj2] | 0), 0x27d4eb2f) + ((colG[gj2] | 0) << 2)) | 0;
+						h = Math.imul(h ^ (colB[gj2] | 0), 0x165667b1) | 0;
+					}
+				}
+			}
+			if (hashFrame[gi] !== 0 && hashGrid[gi] === h) {
+				var sx0 = cellX * PS, sy0 = cellY * PS;
+				for (var cy2 = 0; cy2 < PS; cy2++) {
+					var src = (sy0 + cy2) * cw + sx0;
+					var dst = (oy + cy2) * bw + ox;
+					for (var cx2 = 0; cx2 < PS; cx2++) imgU32[dst + cx2] = smoothU32[src + cx2];
+				}
+				continue;
+			}
 
 			// Materials present in the 3x3 neighborhood, with per-material
 			// mode (curve-only vs exact floor) and fallback color.
@@ -385,6 +422,15 @@
 					data[di + 3] = best * 255;
 				}
 			}
+			// remember this cell's rendered pixels + what they depend on
+			var sx0 = cellX * PS, sy0 = cellY * PS;
+			for (var cy2 = 0; cy2 < PS; cy2++) {
+				var src = (sy0 + cy2) * cw + sx0;
+				var dst = (oy + cy2) * bw + ox;
+				for (var cx2 = 0; cx2 < PS; cx2++) smoothU32[src + cx2] = imgU32[dst + cx2];
+			}
+			hashGrid[gi] = h;
+			hashFrame[gi] = frameId;
 		}
 		ctx.putImageData(img, bx, by);
 		if (view === 1) drawClouds(ctx);
@@ -414,8 +460,8 @@
 		return null;
 	}
 
-	var CLOUD_R = 3;  // halo radius, in cells
-	var CLOUD_A = 0.4; // base opacity of a single gas pixel's cloud
+	var CLOUD_R = 2.3;  // cloud radius, in cells
+	var CLOUD_A = 0.55; // base opacity of a single gas pixel's cloud
 	var cloudCache = {}, cloudCachePS = 0;
 
 	function cloudSprite(color) {
@@ -434,12 +480,9 @@
 		sprite.width = sprite.height = r * 2;
 		var sctx = sprite.getContext("2d");
 		var grad = sctx.createRadialGradient(r, r, 0, r, r, r);
-		// soft point in the middle, wide foggy halo fading out from it
 		grad.addColorStop(0, rgbaStr([qr, qg, qb], 0.8));
-		grad.addColorStop(0.08, rgbaStr([qr, qg, qb], 0.7));
-		grad.addColorStop(0.2, rgbaStr([qr, qg, qb], 0.3));
-		grad.addColorStop(0.45, rgbaStr([qr, qg, qb], 0.12));
-		grad.addColorStop(0.75, rgbaStr([qr, qg, qb], 0.03));
+		grad.addColorStop(0.35, rgbaStr([qr, qg, qb], 0.4));
+		grad.addColorStop(0.7, rgbaStr([qr, qg, qb], 0.12));
 		grad.addColorStop(1, rgbaStr([qr, qg, qb], 0));
 		sctx.fillStyle = grad;
 		sctx.fillRect(0, 0, r * 2, r * 2);
