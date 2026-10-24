@@ -75,7 +75,6 @@
 		classBufs = {};
 		hashGrid = new Int32Array(N);
 		hashFrame = new Int32Array(N);
-		cloudDensity = new Float32Array(N);
 		frameId = 0;
 	}
 
@@ -181,7 +180,6 @@
 		ensureGrids(W, H);
 		clsGrid.fill(-1);
 		plusGrid.fill(0);
-		if (cloudDensity) cloudDensity.fill(0);
 		cloudPixels.length = 0; // rebuild every frame so old clouds never linger
 
 		var i, d, gi;
@@ -203,11 +201,9 @@
 			// Gases and glow pixels become soft cloud particles instead of
 			// blocky squares, plus shapes or custom renderers (drawn after
 			// the pixel pass).
-			if (view === 1 && pixel.glow !== false &&
-				(info.isGas || info.glow || pixel.glow)) {
+			if (isCloudy(pixel, info)) {
 				gi = (pixel.y + 1) * pw + (pixel.x + 1);
 				plusGrid[gi] = 1;
-				cloudDensity[gi] = 1;
 				cloudPixels.push([pixel.x, pixel.y, pixel.color,
 					pixel.alpha === undefined ? 1 : pixel.alpha]);
 				continue;
@@ -466,12 +462,15 @@
 	var CLOUD_R = 2.3;  // cloud radius, in cells
 	var CLOUD_A = 0.55; // base opacity of a single gas pixel's cloud
 	var cloudCache = {}, cloudCachePS = 0;
-	// Secondary encapsulating cloud: when many gas particles cluster, one big
-	// soft cloud fades in over the whole shape.
-	var BLOB_T0 = 0.35; // blur level where the big cloud starts appearing
-	var BLOB_A = 0.45;  // its peak opacity
-	var cloudDensity = null; // padded per-cell gas mask
-	var cloudCanvas = null, cloudCtx = null, cloudImg = null, cloudU32 = null;
+
+	// Which pixels render as clouds in the normal view: gases and glow pixels,
+	// plus custom-renderer energy elements (fire, smoke...) whose renderers
+	// would otherwise draw them as blocky squares.
+	function isCloudy(pixel, info) {
+		if (view !== 1 || pixel.glow === false || !info) return false;
+		if (info.isGas || info.glow || pixel.glow) return true;
+		return !!(info.renderer && info.category === "energy");
+	}
 
 	function cloudSprite(color) {
 		if (Array.isArray(color)) color = color[0]; // some elements list several colors
@@ -495,90 +494,18 @@
 		grad.addColorStop(1, rgbaStr([qr, qg, qb], 0));
 		sctx.fillStyle = grad;
 		sctx.fillRect(0, 0, r * 2, r * 2);
-		sprite.qrgb = [qr, qg, qb]; // for the encapsulating cloud's average color
 		if (Object.keys(cloudCache).length > 512) cloudCache = {};
 		cloudCache[key] = sprite;
 		return sprite;
 	}
 
-	// One separable blur pass over the padded gas mask (KERNEL/KR reused).
-	function blurCloudPass(src, dst, horizontal) {
-		var k, t, i, x, y, row, acc, R = KR, kern = KERNEL;
-		if (horizontal) {
-			for (y = 0; y < ph; y++) {
-				row = y * pw;
-				for (x = 0; x < pw; x++) {
-					acc = 0;
-					for (k = -R; k <= R; k++) {
-						i = x + k; if (i < 0) i = 0; else if (i >= pw) i = pw - 1;
-						acc += src[row + i] * kern[k + R];
-					}
-					dst[row + x] = acc;
-				}
-			}
-		} else {
-			for (x = 0; x < pw; x++) {
-				for (y = 0; y < ph; y++) {
-					acc = 0;
-					for (k = -R; k <= R; k++) {
-						i = y + k; if (i < 0) i = 0; else if (i >= ph) i = ph - 1;
-						acc += src[i * pw + x] * kern[k + R];
-					}
-					dst[y * pw + x] = acc;
-				}
-			}
-		}
-	}
-
-	function drawCloudBlob(ctx, avgR, avgG, avgB) {
-		var PS = pixelSize;
-		if (!cloudCanvas || cloudCanvas.width !== gw || cloudCanvas.height !== gh) {
-			cloudCanvas = document.createElement("canvas");
-			cloudCanvas.width = gw; cloudCanvas.height = gh;
-			cloudCtx = cloudCanvas.getContext("2d");
-			cloudImg = cloudCtx.createImageData(gw, gh);
-			cloudU32 = new Uint32Array(cloudImg.data.buffer);
-		}
-		// Blur the gas mask twice (separable, sigma-2 kernel each) so the big
-		// cloud reads as one wide, soft shape around the whole group.
-		blurCloudPass(cloudDensity, bufA, true); blurCloudPass(bufA, cloudDensity, false);
-		blurCloudPass(cloudDensity, bufA, true); blurCloudPass(bufA, cloudDensity, false);
-		var packed = (avgB << 16) | (avgG << 8) | avgR;
-		var u32 = cloudU32, range = 1 / (0.9 - BLOB_T0);
-		for (var y = 0; y < gh; y++) {
-			var rowIn = (y + 1) * pw, rowOut = y * gw;
-			for (var x = 0; x < gw; x++) {
-				var d = cloudDensity[rowIn + (x + 1)];
-				if (d <= BLOB_T0) { u32[rowOut + x] = 0; continue; }
-				var t = (d - BLOB_T0) * range; if (t > 1) t = 1;
-				var a = ((t * t * (3 - 2 * t)) * BLOB_A * 255) | 0;
-				u32[rowOut + x] = (a << 24) | packed;
-			}
-		}
-		cloudCtx.putImageData(cloudImg, 0, 0);
-		// Upscale with smoothing: one big encapsulating cloud, fading at edges.
-		var prevSmooth = ctx.imageSmoothingEnabled;
-		ctx.imageSmoothingEnabled = true;
-		ctx.drawImage(cloudCanvas, 0, 0, gw, gh, 0, 0, gw * PS, gh * PS);
-		ctx.imageSmoothingEnabled = prevSmooth;
-	}
-
 	function drawClouds(ctx) {
 		if (!cloudPixels.length) return;
 		if (cloudCachePS !== pixelSize) { cloudCache = {}; cloudCachePS = pixelSize; }
-		// Average color of this frame's gas particles (via the sprite cache).
-		var i, g, sprite, n = cloudPixels.length, sumR = 0, sumG = 0, sumB = 0;
-		for (i = 0; i < n; i++) {
-			sprite = cloudSprite(cloudPixels[i][2]);
-			var q = sprite && sprite.qrgb ? sprite.qrgb : [200, 200, 200];
-			sumR += q[0]; sumG += q[1]; sumB += q[2];
-		}
-		// The secondary encapsulating cloud sits under the per-particle ones.
-		drawCloudBlob(ctx, (sumR / n) | 0, (sumG / n) | 0, (sumB / n) | 0);
 		var r = CLOUD_R * pixelSize;
-		for (i = 0; i < n; i++) {
-			g = cloudPixels[i];
-			sprite = cloudSprite(g[2]);
+		for (var i = 0; i < cloudPixels.length; i++) {
+			var g = cloudPixels[i];
+			var sprite = cloudSprite(g[2]);
 			if (!sprite) continue;
 			ctx.globalAlpha = CLOUD_A * g[3];
 			// Overlapping soft circles stack up: a group of nearby gas pixels
@@ -595,8 +522,7 @@
 		if (!el || !el.renderer) continue;
 		(function (orig) {
 			el.renderer = function (pixel, ctx) {
-				if (view === 1 && pixel.glow !== false &&
-					(el.isGas || el.glow || pixel.glow)) return;
+				if (isCloudy(pixel, el)) return;
 				orig(pixel, ctx);
 			};
 		})(el.renderer);
@@ -607,8 +533,7 @@
 	var origView1Pixel = viewInfo[1].pixel;
 	viewInfo[1].pixel = function (pixel, ctx) {
 		var info = elements[pixel.element];
-		if (view === 1 && info && !info.renderer && pixel.glow !== false &&
-			(info.isGas || info.glow || pixel.glow)) return;
+		if (info && isCloudy(pixel, info)) return;
 		origView1Pixel(pixel, ctx);
 	};
 
