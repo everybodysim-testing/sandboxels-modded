@@ -23,7 +23,7 @@ var G = 0.09, MAXV = 3.0, MAXW = 0.22, HOLD = 25;
 var BODIES = {}, FALL = {}, PC = {};
 var PROXY = "sublevel_solid";
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
-var NOJOIN = false, dirty = new Set();
+var NOJOIN = false, dirtyA = [], dirtyS = new Set();
 var D4 = [[1,0],[-1,0],[0,1],[0,-1]];
 var COV = 0.55;                                   // below this coverage a soft pixel stays put
 
@@ -41,7 +41,7 @@ function liq(x,y){
   var p = pixelMap[x][y]; if (!p || p.sub !== undefined) return null;
   var e = elements[p.element]; return (e && e.state === "liquid") ? p : null;
 }
-function mark(x,y){ dirty.add(GK(x,y)); }
+function mark(x,y){ var gk = GK(x,y); if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
 
 /* ------------------------------------- per-element physics characteristics */
 function hash(s){ var h = 2166136261; for (var i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; }
@@ -394,7 +394,7 @@ function fixBody(b){
     var nb = makeBody(cells, b.a, b.vx, b.vy, b.w, b.gf);
     var w = toWorld(b, nb.com.x, nb.com.y), rx = w.x - b.x, ry = w.y - b.y;
     nb.x = w.x; nb.y = w.y; nb.vx = b.vx - b.w*ry; nb.vy = b.vy + b.w*rx;
-    nb.hold = b.hold;
+    nb.hold = b.hold; nb.frozen = b.frozen;
     created.push(nb);
   });
   killBody(b);
@@ -500,7 +500,7 @@ function carry(b){                                    // loose solids on top + w
 function isFaller(p){ return p && !p.del && p.sub === undefined && FALL[p.element] === true; }
 function bodyFromPixels(list){
   var ax = list[0].x, ay = list[0].y, cells = new Map();
-  list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color }); });
+  list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
   list.forEach(function(q){ if (pixelMap[q.x][q.y] === q) pixelMap[q.x][q.y] = undefined; q.del = true; });
   var b = makeBody(cells, 0, 0, 0, 0, 1);
   b.x = ax + b.com.x; b.y = ay + b.com.y;
@@ -508,14 +508,15 @@ function bodyFromPixels(list){
   return b;
 }
 function checkSupport(p, checked){
-  var comp = [p], seen = new Set([p]), q = [p], supported = false;
+  var comp = [p], seen = new Set([p]), q = [p], supported = false, host = null;
   while (q.length && !supported){
     var c = q.pop();
     for (var d = 0; d < 4; d++){
       var nx = c.x + D4[d][0], ny = c.y + D4[d][1];
       if (outOfBounds(nx, ny)){ supported = true; break; }
       var n = pixelMap[nx][ny];
-      if (!n || n.sub !== undefined || n.del) continue;
+      if (!n || n.del) continue;
+      if (n.sub !== undefined){ if (!host && BODIES[n.sub]) host = BODIES[n.sub]; continue; }
       if (FALL[n.element] === true){ if (!seen.has(n)){ seen.add(n); comp.push(n); q.push(n); } continue; }
       var e = elements[n.element];
       if (e && (e.state === "liquid" || e.state === "gas")) continue;
@@ -524,14 +525,18 @@ function checkSupport(p, checked){
     if (comp.length > 2500) supported = true;
   }
   comp.forEach(function(x){ checked.add(x); });
+  if (host){                    // drawing that touches an existing body joins it: one object, not many
+    comp.forEach(function(px){ if (!px.del && px.sub === undefined) joinPixel(host, px, true); });
+    calc(host, true); syncProxies(host);
+    return;
+  }
   if (!supported) bodyFromPixels(comp);
 }
 function processSupport(){
   var checked = new Set(), n = 0, i;
-  var it = dirty.values();
-  while (n < 40){
-    var nx = it.next(); if (nx.done) break;
-    var gk = nx.value; dirty.delete(gk); n++;
+  /* newest first: a busy sim never starves fresh placements out of the queue */
+  while (n < 120 && dirtyA.length){
+    var gk = dirtyA.pop(); dirtyS.delete(gk); n++;
     var x = Math.floor(gk/4096), y = gk % 4096;
     for (var dx = -3; dx <= 3; dx++) for (var dy = -3; dy <= 3; dy++){
       var p = pxAt(x + dx, y + dy);
@@ -547,17 +552,17 @@ function processSupport(){
 }
 
 /* -------------------------------------------- joining / erasing / snapping */
-function joinPixel(b, p){
+function joinPixel(b, p, defer){
   var l = toLocal(b, p.x, p.y), lx = Math.round(l.x), ly = Math.round(l.y);
   if (b.cells.has(K(lx, ly))){
     /* the drawn pixel lands on a cell the body already owns (rotated overlap):
        just swallow it - never graft it onto a random neighbour */
     pixelMap[p.x][p.y] = undefined; p.del = true; return true;
   }
-  b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color });
+  b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
   pixelMap[p.x][p.y] = undefined; p.del = true;
   b.sleep = 0; b.vx = 0; b.vy = 0; b.w = 0; b.hold = pixelTicks + HOLD;   // hold still while building
-  syncProxies(b);
+  if (!defer){ calc(b, true); syncProxies(b); }
   return true;
 }
 function onPlaceFaller(p){
@@ -603,7 +608,8 @@ function snapBody(b, aligned){
     if (cell && isEmpty(R.gx[i], R.gy[i])){
       var id = elements["anchored_" + cell.e] ? "anchored_" + cell.e : cell.e;
       createPixel(id, R.gx[i], R.gy[i]);
-      var p = pixelMap[R.gx[i]][R.gy[i]]; if (p && cell.c) p.color = cell.c;
+      var p = pixelMap[R.gx[i]][R.gy[i]];
+      if (p){ if (cell.c) p.color = cell.c; if (cell.t !== undefined) p.temp = cell.t; }
     }
   }
   NOJOIN = false;
@@ -643,12 +649,18 @@ elements.physkick = { color: "#ffd24d", category: "tools", canPlace: false,
     var dvx = (Math.random()*2 - 1)*0.9, dvy = -1.5*sign(b.gf), rx = p.x - b.x, ry = p.y - b.y;
     b.vx += dvx; b.vy += dvy; b.w += b.m*(rx*dvy - ry*dvx)/b.I; b.sleep = 0;
   } };
-elements.physspin = { color: "#7bdcff", category: "tools", canPlace: false,
+elements.physicsspin = { color: "#7bdcff", category: "tools", canPlace: false,
   desc: "Gives a physics body a burst of spin.",
   tool: function(p){
     var b = bodyOf(p); if (!b || (b.st !== undefined && pixelTicks - b.st < 10)) return;
     b.st = pixelTicks; b.w += (chance(0.5) ? 1 : -1)*0.08; b.sleep = 0;
   } };
+elements.physicsfreeze = { color: "#7bdcff", category: "tools", canPlace: false,
+  desc: "Freezes a physics body in place (still rotated, still off-grid).",
+  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = true; b.vx = 0; b.vy = 0; b.w = 0; b.sleep = 0; } } };
+elements.physicsunfreeze = { color: "#ff9d7b", category: "tools", canPlace: false,
+  desc: "Unfreezes a frozen physics body so it moves again.",
+  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = false; b.sleep = 0; } } };
 elements.physicsflip = { color: "#c792ff", category: "tools", canPlace: false,
   desc: "Flips the gravity direction of a physics body.",
   tool: function(p){
@@ -661,6 +673,123 @@ elements.physicssnap = { color: "#ffb347", category: "tools", canPlace: false,
 elements.physicsalignedsnap = { color: "#6be08a", category: "tools", canPlace: false,
   desc: "Rotates a physics body to the grid perfectly, then snaps it as anchored blocks without deforming it.",
   tool: function(p){ var b = bodyOf(p); if (b && !b.dead) snapBody(b, true); } };
+
+/* -------------------------------------- body cells behave like real pixels */
+/* Each cell keeps its temperature: it conducts heat with adjacent grid pixels
+   (through its footprint proxy, which game mechanisms can heat or cool), melts,
+   burns or freezes at its element's limits, and reacts with adjacent pixels
+   exactly like the normal grid version would. */
+function tempOk(t, R){
+  if (R.tempMin !== undefined && t < R.tempMin) return false;
+  if (R.tempMax !== undefined && t > R.tempMax) return false;
+  return true;
+}
+function cellEject(b, pix, cell, result){
+  removeCell(b, pix.ck, false);
+  var p = b.proxies.get(GK(pix.x, pix.y));
+  if (p === pix){ pixelMap[pix.x][pix.y] = undefined; pix.del = true; b.proxies.delete(GK(pix.x, pix.y)); }
+  if (isEmpty(pix.x, pix.y)){
+    createPixel(result, pix.x, pix.y);
+    var np = pixelMap[pix.x][pix.y];
+    if (np){
+      np.temp = cell.t;
+      var T = elements[result];
+      if (T && T.color) np.color = Array.isArray(T.color) ? pick(T.color) : T.color;
+    }
+  }
+}
+function cellConvert(b, pix, cell, result){
+  if (result === null || result === undefined || !elements[result]){ removeCell(b, pix.ck, false); return; }
+  var T = elements[result];
+  if (T.state === "solid"){
+    cell.e = result;
+    cell.c = Array.isArray(T.color) ? pick(T.color) : T.color;
+    pix.pe = result;
+  } else cellEject(b, pix, cell, result);
+}
+function applyCellReaction(b, pix, cell, R, other){
+  if (R.elem1 !== undefined){
+    var r1 = Array.isArray(R.elem1) ? pick(R.elem1) : R.elem1;
+    cellConvert(b, pix, cell, r1);
+    if (!b.cells.get(pix.ck)) return;
+  }
+  if (R.elem2 !== undefined && other && !other.del){
+    var r2 = Array.isArray(R.elem2) ? pick(R.elem2) : R.elem2;
+    if (r2 === null) deletePixel(other.x, other.y);
+    else if (elements[r2]) changePixel(other, r2);
+  }
+}
+function cellTick(b){
+  if (b.dead) return 0;
+  var n = 0;
+  b.proxies.forEach(function(pix){
+    if (b.dead) return;
+    var cell = b.cells.get(pix.ck); if (!cell) return;
+    var E = elements[cell.e]; if (!E){ removeCell(b, pix.ck, false); return; }
+    var d, i;
+    /* conduction: exchange heat with ordinary neighbouring pixels */
+    for (d = 0; d < 4; d++){
+      var q = pxAt(pix.x + D4[d][0], pix.y + D4[d][1]);
+      if (!q || q.sub !== undefined) continue;
+      var rate = 0.3 * (E.conduct === undefined ? 0.4 : E.conduct);
+      var delta = (q.temp - cell.t) * rate;
+      if (delta > 0.01 || delta < -0.01){ cell.t += delta; q.temp -= delta*0.5; pixelTempCheck(q); }
+    }
+    /* heat spreads within the body itself */
+    for (d = 0; d < 4; d++){
+      var nc = b.cells.get(K(cell.x + D4[d][0], cell.y + D4[d][1]));
+      if (!nc || nc.e === cell.e && Math.abs(nc.t - cell.t) < 1) continue;
+      var dr = 0.25 * 0.3 * ((elements[nc.e] ? elements[nc.e].conduct : undefined) === undefined ? 0.4 : elements[nc.e].conduct);
+      var dl = (nc.t - cell.t) * dr;
+      if (dl > 0.01 || dl < -0.01){ cell.t += dl; nc.t -= dl*0.5; }
+    }
+    cell.t += (airTemp - cell.t) * 0.003;
+    if (cell.t < absoluteZero) cell.t = absoluteZero;
+    var done = false;
+    if (E.tempHigh !== undefined && cell.t >= E.tempHigh){
+      var result = E.stateHigh;
+      if (E.extraTempHigh) for (var et in E.extraTempHigh) if (cell.t >= +et) result = E.extraTempHigh[et];
+      if (Array.isArray(result)) result = pick(result);
+      cellConvert(b, pix, cell, result); done = true;
+    } else if (E.tempLow !== undefined && cell.t <= E.tempLow){
+      var result2 = E.stateLow;
+      if (E.extraTempLow) for (var el in E.extraTempLow) if (cell.t <= +el) result2 = E.extraTempLow[el];
+      if (Array.isArray(result2)) result2 = pick(result2);
+      cellConvert(b, pix, cell, result2); done = true;
+    }
+    if (!done && E.reactions){
+      for (d = 0; d < 4; d++){
+        var q2 = pxAt(pix.x + D4[d][0], pix.y + D4[d][1]);
+        if (!q2 || q2.sub !== undefined || q2.del) continue;
+        var R = E.reactions[q2.element];
+        if (R && tempOk(cell.t, R) && Math.random() < (R.chance !== undefined ? R.chance : 1)){
+          applyCellReaction(b, pix, cell, R, q2);
+          if (b.dead || !b.cells.get(pix.ck)) return;
+        }
+        var E2 = elements[q2.element], R2 = E2 && E2.reactions && E2.reactions[cell.e];
+        if (R2 && tempOk(q2.temp, R2) && Math.random() < (R2.chance !== undefined ? R2.chance : 1)){
+          var r2 = Array.isArray(R2.elem2) ? pick(R2.elem2) : R2.elem2;
+          if (R2.elem2 !== undefined){
+            var T3 = r2 !== null ? elements[r2] : null;
+            if (T3 && T3.state === "solid"){
+              cell.e = r2; cell.c = Array.isArray(T3.color) ? pick(T3.color) : T3.color; pix.pe = r2;
+            } else if (r2 === null || !T3){ removeCell(b, pix.ck, false); return; }
+            else { cellEject(b, pix, cell, r2); return; }
+          }
+          if (R2.elem1 !== undefined && q2 && !q2.del){
+            var r3 = Array.isArray(R2.elem1) ? pick(R2.elem1) : R2.elem1;
+            if (r3 === null) deletePixel(q2.x, q2.y);
+            else if (elements[r3]) changePixel(q2, r3);
+          }
+          if (b.dead || !b.cells.get(pix.ck)) return;
+        }
+      }
+    }
+    pix.temp = cell.t;                    // the world sees the cell through its footprint
+    n++;
+  });
+  return n;
+}
 
 /* --------------------------------------------------- change notifications */
 function wrap(name, make){
@@ -677,13 +806,42 @@ wrap("movePixel", function(o){ return function(pixel, x, y){
   var q = quiet(pixel), ox = pixel.x, oy = pixel.y; o.apply(this, arguments); if (!q){ mark(ox, oy); mark(x, y); } }; });
 wrap("swapPixels", function(o){ return function(a, b){
   var q = quiet(a) && quiet(b), ax = a.x, ay = a.y, bx = b.x, by = b.y; o(a, b); if (!q){ mark(ax, ay); mark(bx, by); } }; });
+/* explosions knock physics bodies around and blow cells off them */
+wrap("explodeAt", function(o){ return function(x, y, radius, fire){
+  o.apply(this, arguments);
+  var keys = Object.keys(BODIES);
+  for (var i = 0; i < keys.length; i++){
+    var b = BODIES[keys[i]]; if (!b || b.dead) continue;
+    var dx = b.x - x, dy = b.y - y, dist = Math.sqrt(dx*dx + dy*dy) || 1;
+    if (dist > radius + b.rad) continue;
+    var f = Math.max(0, 1 - dist/(radius + b.rad));
+    var accel = radius * 0.09 * f * Math.min(4, 1500/(b.m/b.cells.size));
+    b.vx += dx/dist*accel; b.vy += dy/dist*accel - accel*0.3;
+    b.w += (Math.random() - 0.5) * 0.08 * f;
+    b.sleep = 0;
+    b.cells.forEach(function(cell, k){
+      var w = toWorld(b, cell.x, cell.y);
+      var dd = Math.sqrt((w.x-x)*(w.x-x) + (w.y-y)*(w.y-y));
+      if (dd < radius && chance(0.55*(1 - dd/radius))) removeCell(b, k, true);
+    });
+    b.dirty = true;
+  }
+}; });
 
 /* --------------------------------------------------------------- hooks */
 runEveryTick(function(){
   processSupport();
   var list = Object.keys(BODIES);
-  var cap = Math.min(list.length, 60);            // perf: at most 60 bodies simulated per tick
+  var cap = Math.min(list.length, 100);           // perf: at most 100 bodies simulated per tick
   for (var i = 0; i < cap; i++){ var b = BODIES[list[i]]; if (b) stepBody(b); }
+  /* body cells live like real pixels: conduct heat, melt/burn/freeze, react */
+  var budget = 1500;
+  for (i = 0; i < list.length && budget > 0; i++){
+    var b2 = BODIES[list[i]];
+    if (!b2 || b2.dead) continue;
+    if (pixelTicks % 2 === (b2.id % 2)) continue;  // each body's cells update every other tick
+    budget -= cellTick(b2);
+  }
 });
 runPerPixel(function(p){
   if (p.sub === undefined) return;
@@ -693,7 +851,7 @@ runPerPixel(function(p){
     if (p.pe && elements[p.pe]){ NOJOIN = true; changePixel(p, p.pe); NOJOIN = false; } else p.del = true;
   }
 });
-runAfterReset(function(){ BODIES = {}; dirty.clear(); });
+runAfterReset(function(){ BODIES = {}; dirtyA.length = 0; dirtyS.clear(); });
 renderPostPixel(function(ctx){
   var ps = pixelSize, keys = Object.keys(BODIES);
   var bord = (typeof renderPresets !== "undefined") ? renderPresets.BORDER : null;
@@ -723,5 +881,5 @@ if (typeof globalThis !== "undefined" && globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, FALL: FALL, physOf: physOf, processSupport: processSupport,
     stepBody: stepBody, K: K, snapBody: snapBody, bodyFromPixels: bodyFromPixels, syncProxies: syncProxies };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v3 loaded: every Solids-tab solid falls when unsupported. Anchored tab + physkick / physspin / physicsflip / physicssnap / physicsalignedsnap tools.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v3 loaded: every Solids-tab solid falls when unsupported. Anchored tab + physkick / physicsspin / physicsflip / physicsfreeze / physicsunfreeze / physicssnap / physicsalignedsnap tools.");
 })();
