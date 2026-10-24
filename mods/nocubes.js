@@ -194,8 +194,9 @@
 			if (pixel.x < 0 || pixel.y < 0 || pixel.x >= W || pixel.y >= H) continue;
 
 			// Gases and glow pixels become soft cloud particles instead of
-			// blocky squares or plus shapes (drawn after the pixel pass).
-			if (view === 1 && !info.renderer && pixel.glow !== false &&
+			// blocky squares, plus shapes or custom renderers (drawn after
+			// the pixel pass).
+			if (view === 1 && pixel.glow !== false &&
 				(info.isGas || info.glow || pixel.glow)) {
 				gi = (pixel.y + 1) * pw + (pixel.x + 1);
 				plusGrid[gi] = 1;
@@ -413,29 +414,37 @@
 		return null;
 	}
 
-	var CLOUD_R = 2.3;  // cloud radius, in cells
-	var CLOUD_A = 0.55; // base opacity of a single gas pixel's cloud
+	var CLOUD_R = 3;  // halo radius, in cells
+	var CLOUD_A = 0.4; // base opacity of a single gas pixel's cloud
 	var cloudCache = {}, cloudCachePS = 0;
 
 	function cloudSprite(color) {
 		if (Array.isArray(color)) color = color[0]; // some elements list several colors
-		var sprite = cloudCache[color];
-		if (sprite) return sprite;
 		var rgb = parseColorRGB(color);
 		if (!rgb) rgb = [255, 255, 255]; // unparsable color: draw a neutral puff, never a hole
+		// Quantize colors to 16-level buckets: fire's continuously shifting
+		// rgb(...) colors would otherwise overflow the cache every frame and
+		// force dozens of sprite rebuilds — that made fire scenes lag badly.
+		var qr = rgb[0] & ~15, qg = rgb[1] & ~15, qb = rgb[2] & ~15;
+		var key = qr + "," + qg + "," + qb;
+		var sprite = cloudCache[key];
+		if (sprite) return sprite;
 		var r = Math.ceil(CLOUD_R * pixelSize);
 		sprite = document.createElement("canvas");
 		sprite.width = sprite.height = r * 2;
 		var sctx = sprite.getContext("2d");
 		var grad = sctx.createRadialGradient(r, r, 0, r, r, r);
-		grad.addColorStop(0, rgbaStr(rgb, 0.8));
-		grad.addColorStop(0.35, rgbaStr(rgb, 0.4));
-		grad.addColorStop(0.7, rgbaStr(rgb, 0.12));
-		grad.addColorStop(1, rgbaStr(rgb, 0));
+		// soft point in the middle, wide foggy halo fading out from it
+		grad.addColorStop(0, rgbaStr([qr, qg, qb], 0.8));
+		grad.addColorStop(0.08, rgbaStr([qr, qg, qb], 0.7));
+		grad.addColorStop(0.2, rgbaStr([qr, qg, qb], 0.3));
+		grad.addColorStop(0.45, rgbaStr([qr, qg, qb], 0.12));
+		grad.addColorStop(0.75, rgbaStr([qr, qg, qb], 0.03));
+		grad.addColorStop(1, rgbaStr([qr, qg, qb], 0));
 		sctx.fillStyle = grad;
 		sctx.fillRect(0, 0, r * 2, r * 2);
-		if (Object.keys(cloudCache).length > 96) cloudCache = {};
-		cloudCache[color] = sprite;
+		if (Object.keys(cloudCache).length > 512) cloudCache = {};
+		cloudCache[key] = sprite;
 		return sprite;
 	}
 
@@ -453,6 +462,20 @@
 			ctx.drawImage(sprite, (g[0] + 0.5) * pixelSize - r, (g[1] + 0.5) * pixelSize - r, r * 2, r * 2);
 		}
 		ctx.globalAlpha = 1;
+	}
+
+	// Some gases (like fire) draw through a custom renderer; bypass those
+	// in the normal view too — the clouds replace their rendering entirely.
+	for (var elName in elements) {
+		var el = elements[elName];
+		if (!el || !el.renderer) continue;
+		(function (orig) {
+			el.renderer = function (pixel, ctx) {
+				if (view === 1 && pixel.glow !== false &&
+					(el.isGas || el.glow || pixel.glow)) return;
+				orig(pixel, ctx);
+			};
+		})(el.renderer);
 	}
 
 	// The game draws gas/glow pixels as a plus shape in the normal view;
