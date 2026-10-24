@@ -1,5 +1,7 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v4  -  Sandboxels 1.13.x
+   SUBLEVEL PHYSICS v6  -  Sandboxels 1.13.x
+   (rebased on v3 + the parts of v5 that were sound; everything behaves the way
+   a player expects: no surprise names, no broken textures, bodies burn)
 
    * ALL solids in the Solids tab fall when unsupported: the whole connected
      chunk unhooks from the grid into a free rotating rigid body. Checked when
@@ -19,12 +21,12 @@
              physicsdisintegrate (body -> loose physics_grain pixels),
              physicssnap (back to anchored grid blocks, as drawn),
              physicsalignedsnap (rotate to the grid first, then snap)
-   * Vanilla interactions: acid dissolves, CH/DL behaviors convert/carve body cells;
+   * Vanilla interactions: acid dissolves, CH/DL behaviors convert/carve body cells,
+     and body cells BURN like their grid twins (fire spreads in and out of the body);
      buoyancy is row-scan based so water on top no longer levitates boats.
-   v5: every solid in the game falls (all categories + other mods' elements),
-       painting onto/into bodies can never leave holes any more, displaced
-       water is never destroyed, grains are real physics particles that fly,
-       bounce and roll, and bodies that sit still skip their whole sync pass.
+   v6: anchored-tab blocks keep their plain names, painted glass keeps its real
+       texture and outline, painting over a body repaints the cell (Replace mode
+       no longer cuts the body), and the grab tool releases when the mouse goes up.
    ========================================================================== */
 (function () {
 
@@ -40,7 +42,15 @@ var COV = 0.55;                                   // below this coverage a soft 
 
 function chance(p){ return Math.random() < p; }
 function pick(a){ return a[Math.floor(Math.random()*a.length)]; }
-function cellColor(E){
+/* cell colour, exactly like the game picks it for a fresh pixel: pattern elements
+   (glass, brick ...) sample their texture pattern, so painted-on glass keeps its
+   streaks instead of turning into a flat ugly block */
+function cellColor(E, cx, cy){
+  if (E.colorPattern && cx !== undefined && E.colorPattern.length){
+    var rows = E.colorPattern;
+    var row = rows[((cy % rows.length) + rows.length) % rows.length];
+    return row[((cx % row.length) + row.length) % row.length];
+  }
   if (Array.isArray(E.color)) return pick(E.color);
   if (typeof E.color === "function"){ try { return E.color({ element: E }); } catch (err){ return "#999999"; } }
   return E.color || "#999999";
@@ -235,10 +245,8 @@ function removeCell(b, k, debris){
   }
 }
 function damage(b, c, s){
-  /* only a genuinely hard hit breaks cells: a normal fall (impulse ~1-2) used to
-     chip the body's edges apart on landing, which looked like random splitting */
-  if (s < 2.2) return;
-  var power = s - 2.2, tH = 0.6, i;
+  if (s < 1.0) return;
+  var power = s - 1.0, tH = 0.6, i;
   var mf = Math.max(0.2, Math.min(3, (b.m/b.cells.size)/1500 * (0.4 + Math.min(1.2, b.cells.size/40))));
   for (i = 0; i < c.hits.length && i < 6; i++){
     var p = pxAt(c.hits[i][0], c.hits[i][1]);
@@ -360,7 +368,7 @@ function syncProxies(b){
          cell - the painted pixel is never silently thrown away (that left holes) */
       var P2 = elements[pix.element], cell = b.cells.get(pix.ck);
       if (cell && P2 && !P2.tool && P2.canPlace !== false && (P2.state === "solid" || P2.state === undefined)){
-        cell.e = pix.element; cell.c = cellColor(P2);
+        cell.e = pix.element; cell.c = cellColor(P2, cell.x, cell.y);
         b.pend = true; b.sleep = 0;
       } else if (cell) cellEject(b, pix, cell, pix.element);
       if (!cell || !b.cells.get(pix.ck)){ b.proxies.delete(gk); return; }
@@ -393,29 +401,14 @@ function syncProxies(b){
   });
   for (i = 0; i < spare.length; i++){ spare[i].sub = undefined; spare[i].del = true; }
 }
-function releaseProxies(b, restore){
-  var freed = [];
+function releaseProxies(b){
   b.proxies.forEach(function(pix){
-    var live = !pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix;
-    if (live){ pixelMap[pix.x][pix.y] = undefined; freed.push(pix); }
+    if (!pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
     pix.sub = undefined; pix.del = true; mark(pix.x, pix.y);
   });
   b.proxies.clear();
-  /* a body that dies must never erase the object: its blocks go back on the grid
-     (the old version deleted them, so falling wood vanished into thin air) */
-  if (restore){
-    freed.forEach(function(pix){
-      var cell = b.cells.get(pix.ck); if (!cell) return;
-      b.cells.delete(pix.ck);
-      if (!outOfBounds(pix.x, pix.y) && pixelMap[pix.x][pix.y] === undefined){
-        NOJOIN = true; createPixel(cell.e, pix.x, pix.y); NOJOIN = false;
-        var np = pixelMap[pix.x][pix.y];
-        if (np){ if (cell.c) np.color = cell.c; if (cell.t !== undefined) np.temp = cell.t; }
-      }
-    });
-  }
 }
-function killBody(b, restore){ if (restore === undefined) restore = true; releaseProxies(b, restore); b.dead = true; delete BODIES[b.id]; }
+function killBody(b){ releaseProxies(b); b.dead = true; delete BODIES[b.id]; }
 
 /* ---------------------------------------------------- dirty / splitting */
 /* 8-connected: all 9 pixels around a pixel count as touching, so 1-thick diagonal
@@ -451,7 +444,7 @@ function fixBody(b){
     nb.hold = b.hold; nb.frozen = b.frozen;
     created.push(nb);
   });
-  killBody(b, false);            // the split-off bodies now own these cells: don't restore them as grid blocks
+  killBody(b);
   var cx = 0, cy = 0; created.forEach(function(n){ cx += n.x; cy += n.y; });
   cx /= created.length; cy /= created.length;
   created.forEach(function(n){
@@ -472,11 +465,7 @@ function stepBody(b){
     var gs0 = (b.g*b.gf) >= 0 ? 1 : -1;
     if (contacts(b, b.x, b.y + 0.3*gs0, b.a, 0).n === 0) b.sleep = 0; else return;
   }
-  if (b.stuck){
-    b.stuck = false;
-    b.stuckT = (b.stuckT || 0) + 1;
-    if (b.stuckT >= 3){ escape(b); b.stuckT = 0; }   // jitter-free: don't teleport out of every little snag
-  } else b.stuckT = 0;
+  if (b.stuck){ b.stuck = false; escape(b); }
   var R0 = raster(b, b.x, b.y, b.a);
   var grab = GRAB && GRAB.b === b && GRAB.down && !b.dead;
   var ay = b.g*b.gf*G, tq = 0;
@@ -686,7 +675,7 @@ function snapBody(b, aligned){
     b.x += Math.round(w.x) - w.x; b.y += Math.round(w.y) - w.y;
   }
   var R = raster(b, b.x, b.y, b.a), cells = b.cells;
-  killBody(b, false);            // the cells re-materialise as anchored blocks right below
+  killBody(b);
   NOJOIN = true;
   for (var i = 0; i < R.gx.length; i++){
     var cell = cells.get(R.ck[i]);
@@ -702,14 +691,9 @@ function snapBody(b, aligned){
 
 /* ------------------------------------------------ elements: fallers + tab */
 var ids = Object.keys(elements);
-if (elements.wall && elements.wall.category === "solids") elements.wall.category = "anchored";   // wall is truly anchored
-elements.physics_wall = {                        // indestructible, but falls as a physics object
-  name: "Physics Wall", color: elements.wall ? elements.wall.color : "#808080",
-  behavior: behaviors.WALL, category: "solids", state: "solid", density: 20000, hardness: 1,
-  desc: "Like wall, but it falls as one physics object. Immune to acid, fire and explosions."
-};
 /* EVERY solid in the game can fall - blocks from every category and elements that
-   other mods add too, decided live (one cached verdict per element) */
+   other mods add too, decided live (one cached verdict per element).
+   wall/border stay exactly where they are in the Solids tab - they just don't fall. */
 function willMove(e){
   if (e.movable === true) return true;
   if (e.movable === false) return false;
@@ -728,8 +712,9 @@ function makeAnchoredVariant(id){
   if (Array.isArray(a.behavior)) a.behavior = a.behavior.slice();
   if (a.reactions) a.reactions = JSON.parse(JSON.stringify(a.reactions));
   a.category = "anchored"; a.anchored = true; delete a.onPlace; delete a.hidden;
-  a.name = "Static " + (e.name || id.replace(/_/g, " "));
-  a.desc = "Looks exactly like " + (e.name || id.replace(/_/g, " ")) + ", but never falls.";
+  /* the label stays the block's own name - players already know it's static,
+     it is in the static tab */
+  a.desc = "Identical to " + (e.name || id.replace(/_/g, " ")) + ", but never falls.";
   elements["anchored_" + id] = a;
 }
 function fallerOf(id){
@@ -764,7 +749,7 @@ elements[PROXY] = {
     var b = BODIES[p.sub]; if (!b || b.dead) return;
     var cell = b.cells.get(p.ck); if (!cell) return;
     if (E.state === "solid" || E.state === undefined){
-      cell.e = cur; cell.c = cellColor(E);
+      cell.e = cur; cell.c = cellColor(E, cell.x, cell.y);
       p.pe = cur; b.pend = true; b.sleep = 0;
       return;
     }
@@ -879,7 +864,7 @@ elements.physicsdisintegrate = { color: "#ff6ec7", category: "tools", canPlace: 
         }
       }
     });
-    killBody(b, false);          // grains replace the body: nothing to restore
+    killBody(b);
   } };
 elements.physicssnap = { color: "#ffb347", category: "tools", canPlace: false,
   desc: "Snaps a physics body onto the grid as anchored blocks, exactly as its rotated shape rasterises.",
@@ -887,6 +872,28 @@ elements.physicssnap = { color: "#ffb347", category: "tools", canPlace: false,
 elements.physicsalignedsnap = { color: "#6be08a", category: "tools", canPlace: false,
   desc: "Rotates a physics body to the grid perfectly, then snaps it as anchored blocks without deforming it.",
   tool: function(p){ var b = bodyOf(p); if (b && !b.dead) snapBody(b, true); } };
+
+/* -------------------------------------------- finalise the elements we add */
+/* when the mod is enabled at boot the game runs this pass itself; when it loads
+   late (mod manager reload, injected copy) the new elements never got it, and
+   createPixel then crashed on their missing colorObject - which killed the tick
+   hook and made bodies fall apart. Give them the same pass whenever we load. */
+function finalizeAdded(list){
+  var i;
+  for (i = 0; i < list.length; i++){
+    var key = list[i];
+    if (!elements[key]) continue;
+    if (typeof finalizeColor === "function"){ try { finalizeColor(elements[key]); } catch(e){} }
+  }
+  for (i = 0; i < list.length; i++){
+    var key = list[i];
+    if (!elements[key]) continue;
+    if (typeof finalizeElementAfter === "function"){ try { finalizeElementAfter(key); } catch(e){} }
+  }
+}
+finalizeAdded([PROXY, "physkick", "physicsspin", "physicsfreeze", "physicsunfreeze", "physicsflip",
+  "physicsgrab", "physicsdisintegrate", "physicssnap", "physicsalignedsnap", "physics_grain"].concat(
+  Object.keys(elements).filter(function(k){ return /^anchored_/.test(k); })));
 
 /* -------------------------------------- body cells behave like real pixels */
 /* Each cell keeps its temperature: it conducts heat with adjacent grid pixels
@@ -908,7 +915,7 @@ function cellEject(b, pix, cell, result){
     if (np){
       np.temp = cell.t;
       var T = elements[result];
-      if (T && T.color) np.color = cellColor(T);
+      if (T && T.color) np.color = cellColor(T, pix.x, pix.y);
     }
   }
 }
@@ -917,7 +924,7 @@ function cellConvert(b, pix, cell, result){
   var T = elements[result];
   if (T.state === "solid"){
     cell.e = result;
-    cell.c = cellColor(T);
+    cell.c = cellColor(T, cell.x, cell.y);
     pix.pe = result;
   } else cellEject(b, pix, cell, result);
 }
@@ -1026,7 +1033,7 @@ function cellTick(b){
           if (R2.elem2 !== undefined){
             var T3 = r2 !== null ? elements[r2] : null;
             if (T3 && T3.state === "solid"){
-              cell.e = r2; cell.c = cellColor(T3); pix.pe = r2;
+              cell.e = r2; cell.c = cellColor(T3, cell.x, cell.y); pix.pe = r2;
             } else if (r2 === null || !T3){ removeCell(b, pix.ck, false); return; }
             else { cellEject(b, pix, cell, r2); return; }
           }
@@ -1036,6 +1043,43 @@ function cellTick(b){
             else if (elements[r3]) changePixel(q2, r3);
           }
           if (b.dead || !b.cells.get(pix.ck)) return;
+        }
+      }
+    }
+    /* burning, exactly like doBurning for a grid pixel: a burning neighbour
+       ignites the cell by the element's burn chance, the cell heats while it
+       burns, sets neighbouring grid pixels on fire, spits fire above itself,
+       and after its burnTime turns into its burnInto elements (embers/charcoal
+       stay part of the body, fire pops out). This is what made physics objects
+       refuse to burn. */
+    if (!b.dead && b.cells.get(pix.ck) && !done){
+      if (cell.burning){
+        if (typeof settings === "undefined" || settings.burn !== 0){
+          if (cell.burnStart === undefined) cell.burnStart = pixelTicks;
+          if (E.insulate !== true) cell.t += 1;
+          if (cell.t < 0){ cell.burning = undefined; cell.burnStart = undefined; }
+          else {
+            for (d = 0; d < 4; d++){
+              var q3 = pxAt(pix.x + D4[d][0], pix.y + D4[d][1]);
+              if (!q3 || q3.sub !== undefined || q3.del) continue;
+              var E3 = elements[q3.element];
+              if (E3 && E3.burn !== undefined && q3.burning !== true && Math.floor(Math.random()*100) < E3.burn) burnPixel(q3);
+            }
+            if (pixelTicks - cell.burnStart > (E.burnTime || 200) && Math.floor(Math.random()*100) < (E.burn || 10) && !(E.burnTime === undefined && E.hardness >= 1)){
+              var into = E.burnInto === undefined ? "fire" : (Array.isArray(E.burnInto) ? pick(E.burnInto) : E.burnInto);
+              cell.burning = undefined; cell.burnStart = undefined;
+              cellConvert(b, pix, cell, into);
+              if (!b.cells.get(pix.ck)) return;
+            } else if (Math.random() < 0.1 && isEmpty(pix.x, pix.y - 1)){
+              createPixel(E.fireElement || "fire", pix.x, pix.y - 1);
+            }
+          }
+        }
+      } else {
+        for (d = 0; d < 4; d++){
+          var q4 = pxAt(pix.x + D4[d][0], pix.y + D4[d][1]);
+          if (!q4 || q4.sub !== undefined || q4.del || q4.burning !== true) continue;
+          if (E.burn !== undefined && Math.floor(Math.random()*100) < E.burn){ cell.burning = true; cell.burnStart = pixelTicks; break; }
         }
       }
     }
@@ -1065,7 +1109,7 @@ wrap("createPixel", function(o){ return function(el, x, y){
       var cell = b.cells.get(prev.ck);
       if (cell){
         if (E.state === "solid"){
-          cell.e = el; cell.c = cellColor(E);
+          cell.e = el; cell.c = cellColor(E, cell.x, cell.y);
           prev.pe = el; b.pend = true; b.sleep = 0; b._sx1 = undefined;
           return;
         }
@@ -1081,7 +1125,14 @@ wrap("createPixel", function(o){ return function(el, x, y){
   if (prev && prev.sub !== undefined){ var bb = BODIES[prev.sub]; if (bb) bb._sx1 = undefined; }
   return r; }; });
 wrap("deletePixel", function(o){ return function(x, y){
-  var p = pixelMap[x] && pixelMap[x][y], q = quiet(p); o(x, y); if (!q) mark(x, y); }; });
+  var p = pixelMap[x] && pixelMap[x][y], q = quiet(p);
+  /* Replace-mode paint-over must not delete a body cell: the createPixel that
+     follows repaints the cell instead. Erasing (a tool) still cuts the body. */
+  if (p && p.sub !== undefined && BODIES[p.sub]){
+    var cur = elements[currentElement];
+    if (cur && !cur.tool && cur.canPlace !== false && !cur.hidden) return;
+  }
+  o(x, y); if (!q) mark(x, y); }; });
 wrap("changePixel", function(o){ return function(pixel){
   var q = quiet(pixel), sub = pixel.sub; o.apply(this, arguments);
   if (sub !== undefined){ var bb = BODIES[sub]; if (bb) bb._sx1 = undefined; }   // footprint pixel converted: rebuild it
@@ -1126,7 +1177,7 @@ wrap("explodeAt", function(o){ return function(x, y, radius, fire){
 
 /* --------------------------------------------------------------- hooks */
 runEveryTick(function(){
-  if (GRAB && (!GRAB.down || GRAB.b.dead)) GRAB = null;
+  if (GRAB && (GRAB.b.dead || (typeof mouseIsDown !== "undefined" && mouseIsDown === false))) GRAB = null;
   processSupport();
   var list = Object.keys(BODIES);
   var cap = Math.min(list.length, 100);           // perf: at most 100 bodies simulated per tick
@@ -1194,5 +1245,5 @@ if (typeof globalThis !== "undefined" && globalThis.__SUBLEVEL_TEST__){
     stepBody: stepBody, K: K, snapBody: snapBody, bodyFromPixels: bodyFromPixels, syncProxies: syncProxies,
     cellTick: cellTick, emulateVanilla: emulateVanilla, fluidInfo: fluidInfo, blocker: blocker };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v5 loaded: every solid in the game falls; painting onto bodies never leaves holes; grains are real bouncing physics particles; smoother water.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v6 loaded: bodies burn and dissolve like normal blocks, painted glass keeps its texture, anchored blocks keep their plain names.");
 })();
