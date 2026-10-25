@@ -36,18 +36,15 @@
 	// ---- Tuning (cell units unless noted) ---------------------------------
 	var CFG = {
 		sigmaFine: 0.6,      // blur for tiny features (dots, 1-wide lines)
-		sigmaSmooth: 1.6,    // blur for normal shapes — raise for rounder, lower for tighter
-		sigmaBulk: 3.2,      // blur used to decide "is this a thin feature or a big body"
+		sigmaSmooth: 1.5,    // blur for normal shapes — raise for rounder, lower for tighter
+		sigmaBulk: 1.5,      // (spare channel, unused by the outline now)
 		thinBoost: 0.15,     // keeps lone grains visible
 		colorSigma: 0.35,    // color averaging between neighbors (keep low: textures stay crisp)
 		grain: 0.3,          // extra sub-cell sparkle on smooth materials
 		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
 		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
-		secondaryRadius: 0.30, // corner roundness of the secondary 'rounded pixel' look (cells)
-		secondaryGrow: 0.06,   // how much bigger than its cell each secondary pixel is
-		messStart: 0.2,        // how messy a group must get before it switches to the secondary look
-		messEnd: 0.55,         // ...and where the switch is complete
-		looseMax: 2,         // a movable pixel with <= this many neighbors renders as a free grain
+		circleRadius: 0.5,   // invisible protected circle around every pixel (cells); the outline can never cut into it
+		looseGrow: 0.03,     // free-falling grains are drawn this much bigger than the circle
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -68,6 +65,8 @@
 		console.warn("nocubes.js: WebGL2 not available — mod not loaded.");
 		return;
 	}
+	var FLOAT_OK = !!gl.getExtension("EXT_color_buffer_float");
+	if (!FLOAT_OK) console.warn("nocubes.js: float render targets unavailable — outlines will be lower quality.");
 	var ready = false;
 	var P = {}, T = {}, FB = {};
 	var gameTex = null;
@@ -118,30 +117,6 @@
 		"    acc += v*w; ws += w;",
 		"  }",
 		"  o = acc / ws;",
-		"}"
-	].join("\n");
-
-	// Pass 2b: "messiness" of shape boundaries, averaged over a neighborhood so a whole
-	// group switches look together instead of patchwork. High where boundaries are thin,
-	// jagged or inconsistent between blur scales.
-	var FS_MESS = HEAD + [
-		"uniform sampler2D uField; uniform ivec2 uN; out vec4 o;",
-		"void main(){",
-		"  ivec2 c = ivec2(gl_FragCoord.xy);",
-		"  float s = 0.0, ws = 0.0;",
-		"  for (int dy = -5; dy <= 5; dy++) {",
-		"    for (int dx = -5; dx <= 5; dx++) {",
-		"      ivec2 q = c + ivec2(dx, dy);",
-		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
-		"      vec4 f = texelFetch(uField, q, 0);",
-		"      if (f.x < 0.05 || f.x > 0.95) continue;",   // boundary band only
-		"      float thin = 1.0 - smoothstep(0.2, 0.4, f.z);",
-		"      float rough = smoothstep(0.10, 0.22, abs(f.x - f.y));",
-		"      float w = exp(-float(dx*dx + dy*dy) / 8.0);",
-		"      s += w * max(thin, rough); ws += w;",
-		"    }",
-		"  }",
-		"  o = vec4(ws > 0.0 ? s / ws : 0.0, 0.0, 0.0, 1.0);",
 		"}"
 	].join("\n");
 
@@ -226,35 +201,8 @@
 		"}"
 	].join("\n");
 
-	// Final pass: full-resolution composite
-	var FS_FINAL = HEAD + [
-		"uniform usampler2D uId;",
-		"uniform sampler2D uField, uCol, uCD, uCC, uGame, uMess;",
-		"uniform ivec2 uN;",
-		"uniform float uPS, uCanvasH, uTime;",
-		"uniform int uCloudOn;",
-		"out vec4 outColor;",
-		"const float THIN = " + F(CFG.thinBoost) + ";",
-		"const float SS = " + F(CFG.seamSigma) + ";",
-		"const float NOISE = " + F(CFG.cloudNoise) + ";",
-		"const float NSCALE = " + F(CFG.cloudScale) + ";",
-		"const float DSC = " + F(DSCALE) + ";",
-		"const float GRAIN = " + F(CFG.grain) + ";",
-		"const float SECR = " + F(CFG.secondaryRadius) + ";",
-		"const float SECG = " + F(CFG.secondaryGrow) + ";",
-		"const float MS0 = " + F(CFG.messStart) + ";",
-		"const float MS1 = " + F(CFG.messEnd) + ";",
-		"float gContrast = 0.0;",
-		"uint idAt(ivec2 q){ uint r = texelFetch(uId, q, 0).r; return r >= 32768u ? 0u : r; }",
-		"",
-		"float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }",
-		"float vnoise(vec2 p){",
-		"  vec2 i = floor(p), f = fract(p); f = f*f*(3.0 - 2.0*f);",
-		"  float a = hash(i), b = hash(i + vec2(1.0,0.0)), c = hash(i + vec2(0.0,1.0)), d = hash(i + vec2(1.0,1.0));",
-		"  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);",
-		"}",
-		"float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = p*2.03 + vec2(17.1, 9.7); a *= 0.5; } return s / 0.875; }",
-		"",
+	// Shared: bicubic B-spline sampling (4 bilinear taps) => C2-smooth contours, no cell-grid kinks
+	var GLSL_CUBIC = [
 		// bicubic B-spline via 4 bilinear taps: C2-smooth contours, no cell-grid kinks
 		"vec4 cubicSample(sampler2D t, vec2 p, vec2 N){",
 		"  vec2 c = p - 0.5; vec2 i = floor(c); vec2 f = c - i;",
@@ -269,6 +217,84 @@
 		"  return g0.y * (g0.x * textureLod(t, vec2(t0.x, t0.y), 0.0) + g1.x * textureLod(t, vec2(t1.x, t0.y), 0.0))",
 		"       + g1.y * (g0.x * textureLod(t, vec2(t0.x, t1.y), 0.0) + g1.x * textureLod(t, vec2(t1.x, t1.y), 0.0));",
 		"}",
+		""
+	].join("\n");
+
+	// Pass 2b: for every pixel, how low must the outline threshold go so the contour
+	// passes outside that pixel's protected circle? (smallest change that works)
+	var FS_TAU_A = HEAD + [
+		"uniform usampler2D uId; uniform sampler2D uField, uProf; uniform ivec2 uN; out vec4 o;",
+		"const float RHO = " + F(CFG.circleRadius) + ";",
+		GLSL_CUBIC,
+		"float shapeG(vec2 p, vec2 N){",
+		"  vec4 Fd = cubicSample(uField, p, N);",
+		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
+		"  return mix(Fd.x + 0.06, Fd.y, lvl);",
+		"}",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  uint id = texelFetch(uId, c, 0).r;",
+		"  if (id == 0u || id >= 32768u) { o = vec4(0.5, 0.0, 0.0, 1.0); return; }",
+		"  if (texelFetch(uField, c, 0).y > 0.98) { o = vec4(0.5, 0.0, 0.0, 1.0); return; }", // deep interior
+		"  float lv = texelFetch(uProf, c, 0).r;",
+		"  vec2 N = vec2(uN); vec2 ctr = vec2(c) + 0.5;",
+		"  float g = 0.5;",
+		"  for (int i = 0; i < 12; i++) {",
+		"    float a = 6.2831853 * float(i) / 12.0;",
+		"    vec2 d = vec2(cos(a), sin(a));",
+		"    vec2 bx = d / max(abs(d.x), abs(d.y)) * 0.5;",   // rigid: protect the square
+		"    vec2 pt = ctr + mix(bx, d * RHO, lv);",           // soft: protect the circle
+		"    g = min(g, shapeG(clamp(pt, vec2(0.0), N - 0.001), N));",
+		"  }",
+		"  o = vec4(mix(0.5, g, lv), 0.0, 0.0, 1.0);",
+		"}"
+	].join("\n");
+
+	// Pass 2c: dilate by one cell so any fragment inside a pixel's circle sees at least that pixel's threshold
+	var FS_TAU_B = HEAD + [
+		"uniform sampler2D uTauA; uniform ivec2 uN; out vec4 o;",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  float m = 0.5;",
+		"  for (int dy = -1; dy <= 1; dy++) {",
+		"    for (int dx = -1; dx <= 1; dx++) {",
+		"      ivec2 q = c + ivec2(dx, dy);",
+		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"      m = min(m, texelFetch(uTauA, q, 0).r);",
+		"    }",
+		"  }",
+		"  o = vec4(m, 0.0, 0.0, 1.0);",
+		"}"
+	].join("\n");
+
+	// Final pass: full-resolution composite
+	var FS_FINAL = HEAD + [
+		"uniform usampler2D uId;",
+		"uniform sampler2D uField, uCol, uCD, uCC, uGame, uTau;",
+		"uniform ivec2 uN;",
+		"uniform float uPS, uCanvasH, uTime;",
+		"uniform int uCloudOn;",
+		"out vec4 outColor;",
+		"const float THIN = " + F(CFG.thinBoost) + ";",
+		"const float SS = " + F(CFG.seamSigma) + ";",
+		"const float NOISE = " + F(CFG.cloudNoise) + ";",
+		"const float NSCALE = " + F(CFG.cloudScale) + ";",
+		"const float DSC = " + F(DSCALE) + ";",
+		"const float GRAIN = " + F(CFG.grain) + ";",
+		"const float RHO = " + F(CFG.circleRadius) + ";",
+		"const float LG = " + F(CFG.looseGrow) + ";",
+		"float gContrast = 0.0;",
+		"uint idAt(ivec2 q){ uint r = texelFetch(uId, q, 0).r; return r >= 32768u ? 0u : r; }",
+		"",
+		"float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }",
+		"float vnoise(vec2 p){",
+		"  vec2 i = floor(p), f = fract(p); f = f*f*(3.0 - 2.0*f);",
+		"  float a = hash(i), b = hash(i + vec2(1.0,0.0)), c = hash(i + vec2(0.0,1.0)), d = hash(i + vec2(1.0,1.0));",
+		"  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);",
+		"}",
+		"float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = p*2.03 + vec2(17.1, 9.7); a *= 0.5; } return s / 0.875; }",
+		"",
+		GLSL_CUBIC,
 		"",
 		// smoothed color of material `id` at p, bilinear over the 4 nearest cells of that material
 		"vec4 colFor(uint id, vec2 p, float soft){",
@@ -304,16 +330,14 @@
 		"  vec2 p = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) / uPS;",
 		"  float inside = (p.x < N.x && p.y < N.y) ? 1.0 : 0.0;",
 		"  vec2 pc = clamp(p, vec2(0.0), N - 0.001);",
-		// silhouette: rigid materials hug the pixel grid, soft materials (sand, water) get smooth curves
+		// silhouette: the smooth-field contour, with its threshold lowered locally (tau) just enough
+		// that it always passes outside every pixel's protected circle. Rigid materials hug the grid.
 		"  vec4 Fd = cubicSample(uField, pc, N);",
 		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
-		"  float mess = smoothstep(MS0, MS1, textureLod(uMess, pc / N, 0.0).r);",
-		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
-		"  float Gs = mix(Fd.x + THIN, Fd.y, bulk);",
-		"  float Gt = Fd.x + 0.06;",
-		"  float G = mix(Gt, Gs, lvl);",
-		"  float fw = max(fwidth(G), 1e-4);",
-		"  float t = clamp((G - 0.5) / fw + 0.5, 0.0, 1.0);",
+		"  float G = mix(Fd.x + 0.06, Fd.y, lvl);",
+		"  float tau = textureLod(uTau, pc / N, 0.0).r;",
+		"  float fw = max(fwidth(G), 1e-5);",
+		"  float t = clamp((G - tau) / fw + 0.5, 0.0, 1.0);",
 		"  t = t*t*(3.0 - 2.0*t);",
 		"  ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
 		"  uint nb[9] = uint[9](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);",
@@ -325,29 +349,21 @@
 		"      nb[k] = idAt(clamp(c + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), uN - ivec2(1)));",
 		"      if (nb[k] != c0) uni = false;",
 		"    }",
-		// min/max reshaping: the curve may never cut deeper than `inset` into a pixel,
-		// nor spill further than `growth` outside the pixel grid (tighter for rigid materials)
-		"    float inset = mix(0.03, 0.30, lvl), growth = mix(0.05, 0.55, lvl);",
+		// hard limits: never spill more than `growth` from the pixel grid,
+		// and a pixel's protected circle (square for rigid materials) is always solid
+		"    float growth = mix(0.05, 0.28, lvl);",
 		"    float onePx = 1.0 / uPS;",
-		"    float dmin = 9.0, core = 0.0, dsec = 9.0;",
-		"    float rr = mix(0.08, SECR, lvl), hh = 0.5 + mix(0.0, SECG, lvl);",
+		"    float dmin = 9.0, dprot = 9.0;",
 		"    for (int k = 0; k < 9; k++) {",
 		"      if (nb[k] == 0u) continue;",
 		"      vec2 u = abs(pc - (vec2(c + ivec2(k % 3 - 1, k / 3 - 1)) + 0.5));",
 		"      dmin = min(dmin, length(max(u - 0.5, 0.0)));",
-		"      dsec = min(dsec, length(max(u - (hh - rr), 0.0)) - rr);",
-		"      if (k == 4) {",
-		"        float h = 0.5 - inset; float r = h * 0.5;",
-		"        float sd = length(max(u - (h - r), 0.0)) - r;",
-		"        core = clamp(0.5 - sd / onePx, 0.0, 1.0);",
-		"      }",
+		"      float sdB = length(max(u - 0.46, 0.0)) - 0.04;",
+		"      float sdC = length(u) - RHO;",
+		"      dprot = min(dprot, mix(sdB, sdC, lvl));",
 		"    }",
 		"    t = min(t, clamp((growth - dmin) / onePx + 0.5, 0.0, 1.0));",
-		"    t = max(t, core);",
-		// secondary look for messy groups: every pixel a slightly bigger rounded square;
-		// neighbors fuse into flat 90/45-degree shapes that can never be distorted
-		"    float tSec = clamp(0.5 - dsec / onePx, 0.0, 1.0);",
-		"    t = mix(t, tSec, mess);",
+		"    t = max(t, clamp(0.5 - dprot / onePx, 0.0, 1.0));",
 		"  }",
 		"  vec4 res = vec4(0.0);",
 		"  if (t > 0.0) {",
@@ -402,8 +418,7 @@
 		"        ivec2 q = lc + ivec2(dx, dy);",
 		"        if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
 		"        if (texelFetch(uId, q, 0).r < 32768u) continue;",
-		"        vec2 lu = abs(pc - (vec2(q) + 0.5));",
-		"        float sdl = length(max(lu - (0.5 + SECG - SECR), 0.0)) - SECR;",
+		"        float sdl = length(pc - (vec2(q) + 0.5)) - (RHO + LG);",
 		"        float cov = clamp(0.5 - sdl / onePx, 0.0, 1.0);",
 		"        if (cov <= 0.0) continue;",
 		"        cov = cov*cov*(3.0 - 2.0*cov);",
@@ -479,6 +494,10 @@
 		if (w > 0) gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
 		return t;
 	}
+	function mkFTex(w, h, filter) {
+		return FLOAT_OK ? mkTex(w, h, gl.RGBA16F, gl.RGBA, gl.HALF_FLOAT, filter)
+		                : mkTex(w, h, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, filter);
+	}
 	function mkFbo(tex) {
 		var f = gl.createFramebuffer();
 		gl.bindFramebuffer(gl.FRAMEBUFFER, f);
@@ -496,14 +515,15 @@
 		T.id = mkTex(W, H, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT, gl.NEAREST);
 		T.prof = mkTex(W, H, gl.R8, gl.RED, gl.UNSIGNED_BYTE, gl.NEAREST);
 		T.cloud = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
-		T.tmp = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
-		T.field = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+		T.tmp = mkFTex(W, H, gl.NEAREST);
+		T.field = mkFTex(W, H, gl.LINEAR);
 		T.col = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
-		T.mess = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+		T.tauA = mkFTex(W, H, gl.NEAREST);
+		T.tau = mkFTex(W, H, gl.LINEAR);
 		T.cd = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		T.cc = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		FB.tmp = mkFbo(T.tmp); FB.field = mkFbo(T.field); FB.col = mkFbo(T.col);
-		FB.mess = mkFbo(T.mess); FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
+		FB.tauA = mkFbo(T.tauA); FB.tau = mkFbo(T.tau); FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
 		ids = new Uint16Array(W * H);
 		cand = new Int32Array(W * H);
 		prof = new Uint8Array(W * H);
@@ -514,7 +534,8 @@
 		P.occH = program(FS_OCC_H);
 		P.occV = program(FS_OCC_V);
 		P.col = program(FS_COL);
-		P.mess = program(FS_MESS);
+		P.tauA = program(FS_TAU_A);
+		P.tauB = program(FS_TAU_B);
 		P.cloudD = program(FS_CLOUD_D);
 		P.cloudC = program(FS_CLOUD_C);
 		P.final = program(FS_FINAL);
@@ -707,7 +728,8 @@
 			gl.disable(gl.BLEND);
 			pass(P.occH, FB.tmp, W, H, [["uId", T.id], ["uProf", T.prof]]);
 			pass(P.occV, FB.field, W, H, [["uTmp", T.tmp]]);
-			pass(P.mess, FB.mess, W, H, [["uField", T.field]]);
+			pass(P.tauA, FB.tauA, W, H, [["uId", T.id], ["uField", T.field], ["uProf", T.prof]]);
+			pass(P.tauB, FB.tau, W, H, [["uTauA", T.tauA]]);
 			pass(P.col, FB.col, W, H, [["uId", T.id], ["uGame", gameTex]], function (p) {
 				gl.uniform1f(U(p, "uPS"), PS);
 			});
@@ -722,7 +744,7 @@
 			gl.viewport(0, 0, cw, ch);
 			gl.clear(gl.COLOR_BUFFER_BIT);
 			pass(P.final, null, cw, ch,
-				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc], ["uGame", gameTex], ["uMess", T.mess]],
+				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc], ["uGame", gameTex], ["uTau", T.tau]],
 				function (p) {
 					gl.uniform1f(U(p, "uPS"), PS);
 					gl.uniform1f(U(p, "uCanvasH"), ch);
