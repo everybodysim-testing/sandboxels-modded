@@ -43,8 +43,10 @@
 		grain: 0.3,          // extra sub-cell sparkle on smooth materials
 		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
 		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
-		circleRadius: 0.42,  // invisible minimum circle around every pixel (cells): how small the outline may ever get around a pixel
-		looseGrow: 0.06,     // free-falling grains are drawn this much bigger than the circle
+		circleRadius: 0.18,  // invisible circle around every pixel (cells): the smooth line always stays outside it
+		softness: 0.5,       // how far the smooth line stretches between circles for the softest materials (higher = smoother, fatter)
+		rigidSoftness: 0.12, // same, for rigid materials (wood, metal...) which use pixel squares instead of circles
+		loneBoost: 0.3,      // makes a single isolated pixel a decent round size instead of just its tiny circle
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -70,7 +72,7 @@
 	var ready = false;
 	var P = {}, T = {}, FB = {};
 	var gameTex = null;
-	var prof = null, idLevel = new Uint8Array(32768), cand = null, cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
+	var prof = null, idLevel = new Uint8Array(32768), cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
 
 	function F(x) { var s = String(x); return /[.e]/.test(s) ? s : s + ".0"; }
 
@@ -78,7 +80,6 @@
 	var VS = "#version 300 es\nvoid main(){ vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }";
 
 	var RB = Math.ceil(3 * CFG.sigmaBulk);
-	var LOOSE = 32768; // id flag: pixel is a free-falling grain, drawn as its own round dot
 	var SIGV = "vec4(" + F(CFG.sigmaFine) + "," + F(CFG.sigmaSmooth) + "," + F(CFG.sigmaBulk) + "," + F(CFG.sigmaSmooth) + ")";
 
 	// Pass 1: horizontal blur of "is there matter here" at three scales, plus the
@@ -235,7 +236,9 @@
 		"const float DSC = " + F(DSCALE) + ";",
 		"const float GRAIN = " + F(CFG.grain) + ";",
 		"const float RHO = " + F(CFG.circleRadius) + ";",
-		"const float LG = " + F(CFG.looseGrow) + ";",
+		"const float KS = " + F(CFG.softness) + ";",
+		"const float KR = " + F(CFG.rigidSoftness) + ";",
+		"const float LB = " + F(CFG.loneBoost) + ";",
 		"float gContrast = 0.0;",
 		"uint idAt(ivec2 q){ uint r = texelFetch(uId, q, 0).r; return r >= 32768u ? 0u : r; }",
 		"",
@@ -295,17 +298,16 @@
 		"  vec2 p = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) / uPS;",
 		"  float inside = (p.x < N.x && p.y < N.y) ? 1.0 : 0.0;",
 		"  vec2 pc = clamp(p, vec2(0.0), N - 0.001);",
-		// silhouette = ONE smooth contour (blurred occupancy -> distance-like field) for everything.
-		// The per-pixel circle is only a floor: it is smooth-unioned in so the line can never
-		// shrink below it, but it is never the shape itself.
-		"  vec4 Fd = cubicSample(uField, pc, N);",
+		// silhouette: every pixel has an invisible circle (a square for rigid materials); the outline is
+		// ONE completely smooth line stretched over all of them (exponential smooth-union of their
+		// distance fields: it always encloses every circle, has no creases, and bridges gaps smoothly)
+		"  vec4 Fd = textureLod(uField, pc / N, 0.0);",
 		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
-		"  float G = levelField(Fd);",
 		"  float onePx = 1.0 / uPS;",
 		"  float t = 0.0;",
 		"  ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
 		"  uint nb[9] = uint[9](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);",
-		"  bool nearM = (Fd.x > 0.004) || (Fd.y > 0.02);",
+		"  bool nearM = (Fd.y > 0.003);",
 		"  uint c0 = 0u; bool uni = false;",
 		"  if (nearM) {",
 		"    c0 = idAt(c); uni = (c0 != 0u);",
@@ -313,22 +315,22 @@
 		"      nb[k] = idAt(clamp(c + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), uN - ivec2(1)));",
 		"      if (nb[k] != c0) uni = false;",
 		"    }",
-		// signed distance (cells, + outside) of the smooth contour, from the field gradient
-		"    float e = 0.35;",
-		"    float gx = shapeG(pc + vec2(e, 0.0)) - shapeG(pc - vec2(e, 0.0));",
-		"    float gy = shapeG(pc + vec2(0.0, e)) - shapeG(pc - vec2(0.0, e));",
-		"    float gl = length(vec2(gx, gy)) / (2.0 * e);",
-		"    float dS = clamp((0.5 - G) / max(gl, 0.03), -2.0, 2.0);",
-		// minimum size: nearest pixel circle (rigid materials: the pixel square)
-		"    float dprot = 9.0;",
-		"    for (int k = 0; k < 9; k++) {",
-		"      if (nb[k] == 0u) continue;",
-		"      vec2 u = abs(pc - (vec2(c + ivec2(k % 3 - 1, k / 3 - 1)) + 0.5));",
-		"      float sdB = length(max(u - 0.46, 0.0)) - 0.04;",
-		"      float sdC = length(u) - RHO;",
-		"      dprot = min(dprot, mix(sdB, sdC, lvl));",
+		"    float kk = mix(KR, KS, lvl);",
+		"    float S = 0.0, dmin = 9.0;",
+		"    for (int dy = -2; dy <= 2; dy++) {",
+		"      for (int dx = -2; dx <= 2; dx++) {",
+		"        ivec2 q = c + ivec2(dx, dy);",
+		"        if (idAt(clamp(q, ivec2(0), uN - ivec2(1))) == 0u) continue;",   // clamp = flush with world edge
+		"        vec2 u = abs(pc - (vec2(q) + 0.5));",
+		"        float di = mix(length(max(u - 0.46, 0.0)) - 0.04, length(u) - RHO, lvl);",
+		"        S += exp(-di / kk); dmin = min(dmin, di);",
+		"      }",
 		"    }",
-		"    float d = smin(dS, dprot, mix(0.06, 0.3, lvl));",
+		"    float d = 9.0;",
+		"    if (S > 0.0) {",
+		"      float neff = S * exp(dmin / kk);",                                  // 1 for a lone pixel, more when crowded
+		"      d = -kk * log(S) - LB * lvl * exp(-(neff - 1.0) / 0.2);",
+		"    }",
 		"    t = clamp(0.5 - d / onePx, 0.0, 1.0);",
 		"    t = t*t*(3.0 - 2.0*t);",
 		"  }",
@@ -375,27 +377,6 @@
 		"    float gn = vnoise(p * 2.2) * 0.6 + vnoise(p * 5.1 + 3.7) * 0.4;",
 		"    col.rgb = clamp(col.rgb + (gn - 0.5) * 2.0 * gContrast * GRAIN * lvl, 0.0, 1.0);",
 		"    res = vec4(col.rgb * col.a, col.a) * t;",
-		"  }",
-		// free-falling grains / droplets: stable round dots in their own raw color
-		"  {",
-		"    ivec2 lc = ivec2(floor(pc));",
-		"    float onePx = 1.0 / uPS;",
-		"    for (int dy = -1; dy <= 1; dy++) {",
-		"      for (int dx = -1; dx <= 1; dx++) {",
-		"        ivec2 q = lc + ivec2(dx, dy);",
-		"        if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
-		"        if (texelFetch(uId, q, 0).r < 32768u) continue;",
-		"        float sdl = length(pc - (vec2(q) + 0.5)) - (RHO + LG);",
-		"        float cov = clamp(0.5 - sdl / onePx, 0.0, 1.0);",
-		"        if (cov <= 0.0) continue;",
-		"        cov = cov*cov*(3.0 - 2.0*cov);",
-		"        vec4 g = texelFetch(uGame, ivec2((vec2(q) + 0.5) * uPS), 0);",
-		"        vec3 gc = g.a < 0.04 ? vec3(0.7) : g.rgb;",
-		"        float ga = g.a < 0.04 ? 1.0 : g.a;",
-		"        vec4 pm = vec4(gc * ga, ga) * cov;",
-		"        res = pm + res * (1.0 - pm.a);",
-		"      }",
-		"    }",
 		"  }",
 		// clouds: gas / fire / plasma / glow / charge
 		"  if (uCloudOn == 1) {",
@@ -490,7 +471,6 @@
 		FB.tmp = mkFbo(T.tmp); FB.field = mkFbo(T.field); FB.col = mkFbo(T.col);
 		FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
 		ids = new Uint16Array(W * H);
-		cand = new Int32Array(W * H);
 		prof = new Uint8Array(W * H);
 		cloudArr = new Uint8Array(W * H * 4);
 		cloudDirty = false;
@@ -618,7 +598,6 @@
 			ids.fill(0);
 			if (cloudDirty) { cloudArr.fill(0); cloudDirty = false; }
 			cloudCount = 0;
-			var nCand = 0;
 			var normalView = (view === 1);
 			var texturesOn = (settings.textures !== 0);
 			for (var i = 0; i < currentPixels.length; i++) {
@@ -644,30 +623,10 @@
 				ids[gi] = idn;
 				var lvb = idLevel[idn];
 				prof[gi] = lvb;
-				if (lvb >= 128) { // only soft materials can become free-falling grains
-					cand[nCand++] = gi * 2 + ((info.movable === true || info.state === "liquid") ? 1 : 0);
-				}
 				if (normalView) { // soft halos replace the game's blocky charge / glow squares
 					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
 					else if (info.glow || pixel.glow) { putCloud(gi, pixel.color, 0.6, true); cloudDirty = true; }
 				}
-			}
-
-			// 1b) free-falling grains/droplets (few neighbors) become stable round dots
-			//     instead of merging into blobs that pop in and out as they move
-			for (var ci = 0; ci < nCand; ci++) {
-				var cg = cand[ci] >> 1, cm = cand[ci] & 1;
-				var cx = cg % W, cy = (cg / W) | 0, cnt = 0;
-				for (var oy = -1; oy <= 1; oy++) {
-					var ny = cy + oy;
-					if (ny < 0 || ny >= H) continue;
-					for (var ox = -1; ox <= 1; ox++) {
-						if (ox === 0 && oy === 0) continue;
-						var nx = cx + ox;
-						if (nx >= 0 && nx < W && ids[ny * W + nx] !== 0) cnt++;
-					}
-				}
-				if (cnt <= (cm ? CFG.looseMax : 1)) ids[cg] |= LOOSE;
 			}
 
 			// 2) upload
