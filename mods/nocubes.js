@@ -39,7 +39,10 @@
 		sigmaSmooth: 1.6,    // blur for normal shapes — raise for rounder, lower for tighter
 		sigmaBulk: 3.2,      // blur used to decide "is this a thin feature or a big body"
 		thinBoost: 0.15,     // keeps lone grains visible
-		colorSigma: 1.2,     // per-material color smoothing (higher = softer textures)
+		colorSigma: 0.55,    // per-material color smoothing (low = keeps grain/texture, high = flat)
+		grain: 0.85,         // sub-cell texture sparkle, scaled by how much the material's colors vary
+		looseRadius: 0.55,   // radius of free-falling grains/droplets (cells)
+		looseMax: 2,         // a movable pixel with <= this many neighbors renders as a free grain
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -63,7 +66,7 @@
 	var ready = false;
 	var P = {}, T = {}, FB = {};
 	var gameTex = null;
-	var cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
+	var cand = null, cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
 
 	function F(x) { var s = String(x); return /[.e]/.test(s) ? s : s + ".0"; }
 
@@ -71,6 +74,7 @@
 	var VS = "#version 300 es\nvoid main(){ vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }";
 
 	var RB = Math.ceil(3 * CFG.sigmaBulk);
+	var LOOSE = 32768; // id flag: pixel is a free-falling grain, drawn as its own round dot
 	var SIGV = "vec3(" + F(CFG.sigmaFine) + "," + F(CFG.sigmaSmooth) + "," + F(CFG.sigmaBulk) + ")";
 
 	// Pass 1: horizontal blur of "is there matter here" at three scales (cell resolution)
@@ -83,7 +87,8 @@
 		"  vec3 acc = vec3(0.0), ws = vec3(0.0);",
 		"  for (int k = -R; k <= R; k++) {",
 		"    int x = clamp(c.x + k, 0, uN.x - 1);",   // clamp = edge replicate => flush with world edge
-		"    float v = texelFetch(uId, ivec2(x, c.y), 0).r > 0u ? 1.0 : 0.0;",
+		"    uint r = texelFetch(uId, ivec2(x, c.y), 0).r;",
+		"    float v = (r > 0u && r < 32768u) ? 1.0 : 0.0;",
 		"    vec3 w = exp(-float(k*k) / (2.0*SIG*SIG));",
 		"    acc += v*w; ws += w;",
 		"  }",
@@ -118,14 +123,14 @@
 		"void main(){",
 		"  ivec2 c = ivec2(gl_FragCoord.xy);",
 		"  uint id = texelFetch(uId, c, 0).r;",
-		"  if (id == 0u) { o = vec4(0.0); return; }",
+		"  if (id == 0u || id >= 32768u) { o = vec4(0.0); return; }",
 		"  vec4 sA = vec4(0.0); float wA = 0.0; vec4 sB = vec4(0.0);",
 		"  for (int dy = -CR; dy <= CR; dy++) {",
 		"    for (int dx = -CR; dx <= CR; dx++) {",
 		"      ivec2 q = c + ivec2(dx, dy);",
 		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
 		"      uint qi = texelFetch(uId, q, 0).r;",
-		"      if (qi == 0u) continue;",
+		"      if (qi == 0u || qi >= 32768u) continue;",
 		"      vec4 g = texelFetch(uGame, ivec2((vec2(q) + 0.5) * uPS), 0);",
 		"      if (g.a < 0.04) continue;",
 		"      float w = exp(-float(dx*dx + dy*dy) / (2.0*SC*SC));",
@@ -193,7 +198,7 @@
 	// Final pass: full-resolution composite
 	var FS_FINAL = HEAD + [
 		"uniform usampler2D uId;",
-		"uniform sampler2D uField, uCol, uCD, uCC;",
+		"uniform sampler2D uField, uCol, uCD, uCC, uGame;",
 		"uniform ivec2 uN;",
 		"uniform float uPS, uCanvasH, uTime;",
 		"uniform int uCloudOn;",
@@ -203,6 +208,10 @@
 		"const float NOISE = " + F(CFG.cloudNoise) + ";",
 		"const float NSCALE = " + F(CFG.cloudScale) + ";",
 		"const float DSC = " + F(DSCALE) + ";",
+		"const float GRAIN = " + F(CFG.grain) + ";",
+		"const float LR = " + F(CFG.looseRadius) + ";",
+		"float gContrast = 0.0;",
+		"uint idAt(ivec2 q){ uint r = texelFetch(uId, q, 0).r; return r >= 32768u ? 0u : r; }",
 		"",
 		"float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }",
 		"float vnoise(vec2 p){",
@@ -229,21 +238,25 @@
 		"",
 		// smoothed color of material `id` at p, bilinear over the 4 nearest cells of that material
 		"vec4 colFor(uint id, vec2 p){",
+		"  gContrast = 0.0;",
 		"  vec2 q = p - 0.5; ivec2 b = ivec2(floor(q)); vec2 f = q - floor(q);",
-		"  vec4 acc = vec4(0.0); float ws = 0.0;",
+		"  vec4 acc = vec4(0.0); float ws = 0.0; float lmin = 1.0, lmax = 0.0;",
 		"  for (int k = 0; k < 4; k++) {",
 		"    int dx = k & 1, dy = k >> 1;",
 		"    ivec2 cc = clamp(b + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
-		"    if (texelFetch(uId, cc, 0).r != id) continue;",
+		"    if (idAt(cc) != id) continue;",
 		"    float w = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);",
-		"    acc += w * texelFetch(uCol, cc, 0); ws += w;",
+		"    vec4 cv = texelFetch(uCol, cc, 0);",
+		"    float l = dot(cv.rgb, vec3(0.299, 0.587, 0.114));",
+		"    lmin = min(lmin, l); lmax = max(lmax, l);",
+		"    acc += w * cv; ws += w;",
 		"  }",
-		"  if (ws > 1e-3) return acc / ws;",
+		"  if (ws > 1e-3) { gContrast = max(lmax - lmin, 0.0); return acc / ws; }",
 		"  ivec2 c0 = ivec2(floor(p)); float bd = 1e9; vec4 r = vec4(0.5, 0.5, 0.5, 1.0);",
 		"  for (int dy = -2; dy <= 2; dy++) {",
 		"    for (int dx = -2; dx <= 2; dx++) {",
 		"      ivec2 cc = clamp(c0 + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
-		"      if (texelFetch(uId, cc, 0).r != id) continue;",
+		"      if (idAt(cc) != id) continue;",
 		"      float d = distance(vec2(cc) + 0.5, p);",
 		"      if (d < bd) { bd = d; r = texelFetch(uCol, cc, 0); }",
 		"    }",
@@ -266,11 +279,11 @@
 		"  vec4 res = vec4(0.0);",
 		"  if (t > 0.0) {",
 		"    ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
-		"    uint c0 = texelFetch(uId, c, 0).r;",
+		"    uint c0 = idAt(c);",
 		"    bool uni = (c0 != 0u);",
 		"    for (int dy = -1; dy <= 1; dy++) {",
 		"      for (int dx = -1; dx <= 1; dx++) {",
-		"        if (texelFetch(uId, clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1)), 0).r != c0) uni = false;",
+		"        if (idAt(clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1))) != c0) uni = false;",
 		"      }",
 		"    }",
 		"    vec4 col = vec4(0.0);",
@@ -283,7 +296,7 @@
 		"      for (int dy = -2; dy <= 2; dy++) {",
 		"        for (int dx = -2; dx <= 2; dx++) {",
 		"          ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
-		"          uint qi = texelFetch(uId, q, 0).r;",
+		"          uint qi = idAt(q);",
 		"          if (qi == 0u) continue;",
 		"          vec2 d = vec2(q) + 0.5 - pc;",
 		"          float w = exp(-dot(d, d) / (2.0*SS*SS));",
@@ -306,7 +319,30 @@
 		"        }",
 		"      }",
 		"    }",
+		"    float gn = vnoise(p * 2.2) * 0.6 + vnoise(p * 5.1 + 3.7) * 0.4;",
+		"    col.rgb = clamp(col.rgb + (gn - 0.5) * 2.0 * gContrast * GRAIN, 0.0, 1.0);",
 		"    res = vec4(col.rgb * col.a, col.a) * t;",
+		"  }",
+		// free-falling grains / droplets: stable round dots in their own raw color
+		"  {",
+		"    ivec2 lc = ivec2(floor(pc));",
+		"    float onePx = 1.0 / uPS;",
+		"    for (int dy = -1; dy <= 1; dy++) {",
+		"      for (int dx = -1; dx <= 1; dx++) {",
+		"        ivec2 q = lc + ivec2(dx, dy);",
+		"        if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"        if (texelFetch(uId, q, 0).r < 32768u) continue;",
+		"        float dist = length(pc - (vec2(q) + 0.5));",
+		"        float cov = clamp((LR - dist) / onePx + 0.5, 0.0, 1.0);",
+		"        if (cov <= 0.0) continue;",
+		"        cov = cov*cov*(3.0 - 2.0*cov);",
+		"        vec4 g = texelFetch(uGame, ivec2((vec2(q) + 0.5) * uPS), 0);",
+		"        vec3 gc = g.a < 0.04 ? vec3(0.7) : g.rgb;",
+		"        float ga = g.a < 0.04 ? 1.0 : g.a;",
+		"        vec4 pm = vec4(gc * ga, ga) * cov;",
+		"        res = pm + res * (1.0 - pm.a);",
+		"      }",
+		"    }",
 		"  }",
 		// clouds: gas / fire / plasma / glow / charge
 		"  if (uCloudOn == 1) {",
@@ -396,6 +432,7 @@
 		FB.tmp = mkFbo(T.tmp); FB.field = mkFbo(T.field); FB.col = mkFbo(T.col);
 		FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
 		ids = new Uint16Array(W * H);
+		cand = new Int32Array(W * H);
 		cloudArr = new Uint8Array(W * H * 4);
 		cloudDirty = false;
 	}
@@ -471,7 +508,7 @@
 	var idMap = Object.create(null), nextId = 1;
 	function idFor(name) {
 		var v = idMap[name];
-		if (v === undefined) { v = nextId < 65535 ? nextId++ : 65535; idMap[name] = v; }
+		if (v === undefined) { v = nextId < 32767 ? nextId++ : 32767; idMap[name] = v; }
 		return v;
 	}
 
@@ -502,6 +539,7 @@
 			ids.fill(0);
 			if (cloudDirty) { cloudArr.fill(0); cloudDirty = false; }
 			cloudCount = 0;
+			var nCand = 0;
 			var normalView = (view === 1);
 			var texturesOn = (settings.textures !== 0);
 			for (var i = 0; i < currentPixels.length; i++) {
@@ -524,10 +562,31 @@
 					continue;
 				}
 				ids[gi] = idFor(pixel.element);
+				if (info.movable !== false) {
+					var mov = (info.movable === true || info.state === "liquid") ? 1 : 0;
+					cand[nCand++] = gi * 2 + mov;
+				}
 				if (normalView) { // soft halos replace the game's blocky charge / glow squares
 					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
 					else if (info.glow || pixel.glow) { putCloud(gi, pixel.color, 0.6, true); cloudDirty = true; }
 				}
+			}
+
+			// 1b) free-falling grains/droplets (few neighbors) become stable round dots
+			//     instead of merging into blobs that pop in and out as they move
+			for (var ci = 0; ci < nCand; ci++) {
+				var cg = cand[ci] >> 1, cm = cand[ci] & 1;
+				var cx = cg % W, cy = (cg / W) | 0, cnt = 0;
+				for (var oy = -1; oy <= 1; oy++) {
+					var ny = cy + oy;
+					if (ny < 0 || ny >= H) continue;
+					for (var ox = -1; ox <= 1; ox++) {
+						if (ox === 0 && oy === 0) continue;
+						var nx = cx + ox;
+						if (nx >= 0 && nx < W && ids[ny * W + nx] !== 0) cnt++;
+					}
+				}
+				if (cnt <= (cm ? CFG.looseMax : 1)) ids[cg] |= LOOSE;
 			}
 
 			// 2) upload
@@ -562,7 +621,7 @@
 			gl.viewport(0, 0, cw, ch);
 			gl.clear(gl.COLOR_BUFFER_BIT);
 			pass(P.final, null, cw, ch,
-				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc]],
+				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc], ["uGame", gameTex]],
 				function (p) {
 					gl.uniform1f(U(p, "uPS"), PS);
 					gl.uniform1f(U(p, "uCanvasH"), ch);
