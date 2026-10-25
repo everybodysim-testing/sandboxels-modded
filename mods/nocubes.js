@@ -43,9 +43,11 @@
 		grain: 0.3,          // extra sub-cell sparkle on smooth materials
 		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
 		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
-		looseRadius: 0.55,   // radius of free-falling grains/droplets (cells)
-		looseSupport: 0.5,   // a pixel renders as a lone grain dot ONLY when nothing touches it
-		                     // (solid/gas contact weight: orth = 1, diagonal = 0.5, through-gas = 0.25)
+		secondaryRadius: 0.30, // corner roundness of the secondary 'rounded pixel' look (cells)
+		secondaryGrow: 0.06,   // how much bigger than its cell each secondary pixel is
+		messStart: 0.2,        // how messy a group must get before it switches to the secondary look
+		messEnd: 0.55,         // ...and where the switch is complete
+		looseMax: 2,         // a movable pixel with <= this many neighbors renders as a free grain
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -116,6 +118,30 @@
 		"    acc += v*w; ws += w;",
 		"  }",
 		"  o = acc / ws;",
+		"}"
+	].join("\n");
+
+	// Pass 2b: "messiness" of shape boundaries, averaged over a neighborhood so a whole
+	// group switches look together instead of patchwork. High where boundaries are thin,
+	// jagged or inconsistent between blur scales.
+	var FS_MESS = HEAD + [
+		"uniform sampler2D uField; uniform ivec2 uN; out vec4 o;",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  float s = 0.0, ws = 0.0;",
+		"  for (int dy = -5; dy <= 5; dy++) {",
+		"    for (int dx = -5; dx <= 5; dx++) {",
+		"      ivec2 q = c + ivec2(dx, dy);",
+		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"      vec4 f = texelFetch(uField, q, 0);",
+		"      if (f.x < 0.05 || f.x > 0.95) continue;",   // boundary band only
+		"      float thin = 1.0 - smoothstep(0.2, 0.4, f.z);",
+		"      float rough = smoothstep(0.10, 0.22, abs(f.x - f.y));",
+		"      float w = exp(-float(dx*dx + dy*dy) / 8.0);",
+		"      s += w * max(thin, rough); ws += w;",
+		"    }",
+		"  }",
+		"  o = vec4(ws > 0.0 ? s / ws : 0.0, 0.0, 0.0, 1.0);",
 		"}"
 	].join("\n");
 
@@ -203,7 +229,7 @@
 	// Final pass: full-resolution composite
 	var FS_FINAL = HEAD + [
 		"uniform usampler2D uId;",
-		"uniform sampler2D uField, uCol, uCD, uCC, uGame;",
+		"uniform sampler2D uField, uCol, uCD, uCC, uGame, uMess;",
 		"uniform ivec2 uN;",
 		"uniform float uPS, uCanvasH, uTime;",
 		"uniform int uCloudOn;",
@@ -214,7 +240,10 @@
 		"const float NSCALE = " + F(CFG.cloudScale) + ";",
 		"const float DSC = " + F(DSCALE) + ";",
 		"const float GRAIN = " + F(CFG.grain) + ";",
-		"const float LR = " + F(CFG.looseRadius) + ";",
+		"const float SECR = " + F(CFG.secondaryRadius) + ";",
+		"const float SECG = " + F(CFG.secondaryGrow) + ";",
+		"const float MS0 = " + F(CFG.messStart) + ";",
+		"const float MS1 = " + F(CFG.messEnd) + ";",
 		"float gContrast = 0.0;",
 		"uint idAt(ivec2 q){ uint r = texelFetch(uId, q, 0).r; return r >= 32768u ? 0u : r; }",
 		"",
@@ -278,6 +307,7 @@
 		// silhouette: rigid materials hug the pixel grid, soft materials (sand, water) get smooth curves
 		"  vec4 Fd = cubicSample(uField, pc, N);",
 		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
+		"  float mess = smoothstep(MS0, MS1, textureLod(uMess, pc / N, 0.0).r);",
 		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
 		"  float Gs = mix(Fd.x + THIN, Fd.y, bulk);",
 		"  float Gt = Fd.x + 0.06;",
@@ -297,13 +327,15 @@
 		"    }",
 		// min/max reshaping: the curve may never cut deeper than `inset` into a pixel,
 		// nor spill further than `growth` outside the pixel grid (tighter for rigid materials)
-		"    float inset = mix(0.03, 0.22, lvl), growth = mix(0.05, 0.78, lvl);",
+		"    float inset = mix(0.03, 0.30, lvl), growth = mix(0.05, 0.55, lvl);",
 		"    float onePx = 1.0 / uPS;",
-		"    float dmin = 9.0, core = 0.0;",
+		"    float dmin = 9.0, core = 0.0, dsec = 9.0;",
+		"    float rr = mix(0.08, SECR, lvl), hh = 0.5 + mix(0.0, SECG, lvl);",
 		"    for (int k = 0; k < 9; k++) {",
 		"      if (nb[k] == 0u) continue;",
 		"      vec2 u = abs(pc - (vec2(c + ivec2(k % 3 - 1, k / 3 - 1)) + 0.5));",
 		"      dmin = min(dmin, length(max(u - 0.5, 0.0)));",
+		"      dsec = min(dsec, length(max(u - (hh - rr), 0.0)) - rr);",
 		"      if (k == 4) {",
 		"        float h = 0.5 - inset; float r = h * 0.5;",
 		"        float sd = length(max(u - (h - r), 0.0)) - r;",
@@ -312,6 +344,10 @@
 		"    }",
 		"    t = min(t, clamp((growth - dmin) / onePx + 0.5, 0.0, 1.0));",
 		"    t = max(t, core);",
+		// secondary look for messy groups: every pixel a slightly bigger rounded square;
+		// neighbors fuse into flat 90/45-degree shapes that can never be distorted
+		"    float tSec = clamp(0.5 - dsec / onePx, 0.0, 1.0);",
+		"    t = mix(t, tSec, mess);",
 		"  }",
 		"  vec4 res = vec4(0.0);",
 		"  if (t > 0.0) {",
@@ -366,8 +402,9 @@
 		"        ivec2 q = lc + ivec2(dx, dy);",
 		"        if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
 		"        if (texelFetch(uId, q, 0).r < 32768u) continue;",
-		"        float dist = length(pc - (vec2(q) + 0.5));",
-		"        float cov = clamp((LR - dist) / onePx + 0.5, 0.0, 1.0);",
+		"        vec2 lu = abs(pc - (vec2(q) + 0.5));",
+		"        float sdl = length(max(lu - (0.5 + SECG - SECR), 0.0)) - SECR;",
+		"        float cov = clamp(0.5 - sdl / onePx, 0.0, 1.0);",
 		"        if (cov <= 0.0) continue;",
 		"        cov = cov*cov*(3.0 - 2.0*cov);",
 		"        vec4 g = texelFetch(uGame, ivec2((vec2(q) + 0.5) * uPS), 0);",
@@ -462,10 +499,11 @@
 		T.tmp = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
 		T.field = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		T.col = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+		T.mess = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		T.cd = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		T.cc = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
 		FB.tmp = mkFbo(T.tmp); FB.field = mkFbo(T.field); FB.col = mkFbo(T.col);
-		FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
+		FB.mess = mkFbo(T.mess); FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
 		ids = new Uint16Array(W * H);
 		cand = new Int32Array(W * H);
 		prof = new Uint8Array(W * H);
@@ -476,6 +514,7 @@
 		P.occH = program(FS_OCC_H);
 		P.occV = program(FS_OCC_V);
 		P.col = program(FS_COL);
+		P.mess = program(FS_MESS);
 		P.cloudD = program(FS_CLOUD_D);
 		P.cloudC = program(FS_CLOUD_C);
 		P.final = program(FS_FINAL);
@@ -622,7 +661,7 @@
 				var lvb = idLevel[idn];
 				prof[gi] = lvb;
 				if (lvb >= 128) { // only soft materials can become free-falling grains
-					cand[nCand++] = gi;
+					cand[nCand++] = gi * 2 + ((info.movable === true || info.state === "liquid") ? 1 : 0);
 				}
 				if (normalView) { // soft halos replace the game's blocky charge / glow squares
 					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
@@ -630,28 +669,21 @@
 				}
 			}
 
-			// 1b) a soft pixel only becomes an isolated grain dot when the smoothed shape
-			//     does NOT pass over its center — i.e. NOTHING touches it: no solid,
-			//     no diagonal contact, not even a gas pixel in between. Any contact keeps
-			//     it inside the smoothed silhouette, so grains resting on a pile (even on
-			//     a slope, even with just 1-2 contacts) never show up as lone outlier
-			//     dots, and pixels stop flickering in/out as their neighbor count wobbles.
+			// 1b) free-falling grains/droplets (few neighbors) become stable round dots
+			//     instead of merging into blobs that pop in and out as they move
 			for (var ci = 0; ci < nCand; ci++) {
-				var cg = cand[ci];
-				var cx = cg % W, cy = (cg / W) | 0, sup = 0;
+				var cg = cand[ci] >> 1, cm = cand[ci] & 1;
+				var cx = cg % W, cy = (cg / W) | 0, cnt = 0;
 				for (var oy = -1; oy <= 1; oy++) {
 					var ny = cy + oy;
 					if (ny < 0 || ny >= H) continue;
 					for (var ox = -1; ox <= 1; ox++) {
 						if (ox === 0 && oy === 0) continue;
 						var nx = cx + ox;
-						if (nx < 0 || nx >= W) continue;
-						var ngi = ny * W + nx;
-						if (ids[ngi] !== 0) sup += (ox === 0 || oy === 0) ? 1 : 0.5;
-						else if (cloudArr[ngi * 4 + 3] !== 0) sup += 0.25; // gas pixel bridging the gap
+						if (nx >= 0 && nx < W && ids[ny * W + nx] !== 0) cnt++;
 					}
 				}
-				if (sup < CFG.looseSupport) ids[cg] |= LOOSE;
+				if (cnt <= (cm ? CFG.looseMax : 1)) ids[cg] |= LOOSE;
 			}
 
 			// 2) upload
@@ -675,6 +707,7 @@
 			gl.disable(gl.BLEND);
 			pass(P.occH, FB.tmp, W, H, [["uId", T.id], ["uProf", T.prof]]);
 			pass(P.occV, FB.field, W, H, [["uTmp", T.tmp]]);
+			pass(P.mess, FB.mess, W, H, [["uField", T.field]]);
 			pass(P.col, FB.col, W, H, [["uId", T.id], ["uGame", gameTex]], function (p) {
 				gl.uniform1f(U(p, "uPS"), PS);
 			});
@@ -689,7 +722,7 @@
 			gl.viewport(0, 0, cw, ch);
 			gl.clear(gl.COLOR_BUFFER_BIT);
 			pass(P.final, null, cw, ch,
-				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc], ["uGame", gameTex]],
+				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc], ["uGame", gameTex], ["uMess", T.mess]],
 				function (p) {
 					gl.uniform1f(U(p, "uPS"), PS);
 					gl.uniform1f(U(p, "uCanvasH"), ch);
