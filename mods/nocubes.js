@@ -35,16 +35,16 @@
 
 	// ---- Tuning (cell units unless noted) ---------------------------------
 	var CFG = {
-		sigmaFine: 0.6,      // blur for tiny features (dots, 1-wide lines)
-		sigmaSmooth: 1.5,    // blur for normal shapes — raise for rounder, lower for tighter
-		sigmaBulk: 3.2,      // blur used to tell thin features from big bodies
+		sigmaFine: 0.8,      // outline smoothing for the most rigid materials
+		sigmaSmooth: 1.6,    // outline smoothing for medium materials
+		sigmaBulk: 2.6,      // outline smoothing for the softest materials (sand, water...)
 		thinBoost: 0.15,     // keeps lone grains visible
 		colorSigma: 0.35,    // color averaging between neighbors (keep low: textures stay crisp)
 		grain: 0.3,          // extra sub-cell sparkle on smooth materials
 		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
 		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
-		circleRadius: 0.5,   // invisible protected circle around every pixel (cells); the outline can never cut into it
-		looseGrow: 0.03,     // free-falling grains are drawn this much bigger than the circle
+		circleRadius: 0.42,  // invisible minimum circle around every pixel (cells): how small the outline may ever get around a pixel
+		looseGrow: 0.06,     // free-falling grains are drawn this much bigger than the circle
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -278,13 +278,15 @@
 		"  return r;",
 		"}",
 		"",
-		// outline field: tight blur for rigid things, smooth blur for soft things, thin features kept tight
+		// outline field: every material gets a smooth blur; rigid ones a light one, soft ones a heavy one
+		"float levelField(vec4 Fd){",
+		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
+		"  float a = clamp(lvl * 2.0, 0.0, 1.0), b = clamp(lvl * 2.0 - 1.0, 0.0, 1.0);",
+		"  return mix(mix(Fd.x, Fd.y, a), Fd.z, b);",
+		"}",
 		"float shapeG(vec2 p){",
 		"  vec2 N = vec2(uN);",
-		"  vec4 Fd = cubicSample(uField, clamp(p, vec2(0.0), N - 0.001), N);",
-		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
-		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
-		"  return mix(Fd.x + 0.06, mix(Fd.x + THIN, Fd.y, bulk), lvl);",
+		"  return levelField(cubicSample(uField, clamp(p, vec2(0.0), N - 0.001), N));",
 		"}",
 		"float smin(float a, float b, float k){ float h = max(k - abs(a - b), 0.0) / k; return min(a, b) - h*h*k*0.25; }",
 		"",
@@ -293,18 +295,17 @@
 		"  vec2 p = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) / uPS;",
 		"  float inside = (p.x < N.x && p.y < N.y) ? 1.0 : 0.0;",
 		"  vec2 pc = clamp(p, vec2(0.0), N - 0.001);",
-		// silhouette = smooth-union of (a) the blurred-field contour, which smooths everything
-		// (more for soft materials, less for rigid ones) and (b) every pixel's protected circle,
-		// so the curve is smooth AND can never cut into a pixel. No thresholds are bent.
+		// silhouette = ONE smooth contour (blurred occupancy -> distance-like field) for everything.
+		// The per-pixel circle is only a floor: it is smooth-unioned in so the line can never
+		// shrink below it, but it is never the shape itself.
 		"  vec4 Fd = cubicSample(uField, pc, N);",
 		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
-		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
-		"  float G = mix(Fd.x + 0.06, mix(Fd.x + THIN, Fd.y, bulk), lvl);",
+		"  float G = levelField(Fd);",
 		"  float onePx = 1.0 / uPS;",
 		"  float t = 0.0;",
 		"  ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
 		"  uint nb[9] = uint[9](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);",
-		"  bool nearM = (Fd.x > 0.004);",
+		"  bool nearM = (Fd.x > 0.004) || (Fd.y > 0.02);",
 		"  uint c0 = 0u; bool uni = false;",
 		"  if (nearM) {",
 		"    c0 = idAt(c); uni = (c0 != 0u);",
@@ -312,26 +313,23 @@
 		"      nb[k] = idAt(clamp(c + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), uN - ivec2(1)));",
 		"      if (nb[k] != c0) uni = false;",
 		"    }",
-		// approximate signed distance (cells, + outside) of the smooth contour, from the field gradient
+		// signed distance (cells, + outside) of the smooth contour, from the field gradient
 		"    float e = 0.35;",
 		"    float gx = shapeG(pc + vec2(e, 0.0)) - shapeG(pc - vec2(e, 0.0));",
 		"    float gy = shapeG(pc + vec2(0.0, e)) - shapeG(pc - vec2(0.0, e));",
 		"    float gl = length(vec2(gx, gy)) / (2.0 * e);",
 		"    float dS = clamp((0.5 - G) / max(gl, 0.03), -2.0, 2.0);",
-		"    float growth = mix(0.05, 0.28, lvl);",
-		"    float dmin = 9.0, dprot = 9.0;",
+		// minimum size: nearest pixel circle (rigid materials: the pixel square)
+		"    float dprot = 9.0;",
 		"    for (int k = 0; k < 9; k++) {",
 		"      if (nb[k] == 0u) continue;",
 		"      vec2 u = abs(pc - (vec2(c + ivec2(k % 3 - 1, k / 3 - 1)) + 0.5));",
-		"      dmin = min(dmin, length(max(u - 0.5, 0.0)));",
 		"      float sdB = length(max(u - 0.46, 0.0)) - 0.04;",
 		"      float sdC = length(u) - RHO;",
 		"      dprot = min(dprot, mix(sdB, sdC, lvl));",
 		"    }",
-		"    float d = smin(dS, dprot, mix(0.08, 0.25, lvl));",
+		"    float d = smin(dS, dprot, mix(0.06, 0.3, lvl));",
 		"    t = clamp(0.5 - d / onePx, 0.0, 1.0);",
-		"    t = min(t, clamp((growth - dmin) / onePx + 0.5, 0.0, 1.0));",  // max reshaping
-		"    t = max(t, clamp(0.5 - dprot / onePx, 0.0, 1.0));",             // min: pixel circle always solid
 		"    t = t*t*(3.0 - 2.0*t);",
 		"  }",
 		"  vec4 res = vec4(0.0);",
