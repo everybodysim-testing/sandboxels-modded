@@ -1,613 +1,590 @@
-// nocubes.js — smooth "no cubes" surface rendering for Sandboxels
+// nocubes.js v2 — "no pixels ever" renderer for Sandboxels (WebGL2)
 //
-// Instead of every pixel rendering as a hard square, surfaces are re-rendered
-// as smooth curves. Each frame the mod builds a signed distance field per
-// material (chamfer distance to the nearest opposite phase, then a gaussian
-// smooth) and redraws only the boundary cells on the game's own pixels
-// layer. index.html is not touched.
+// Every frame the game draws its normal pixels, then this mod:
+//   1. copies that canvas to the GPU (so heat glow / textures / presets keep their colors),
+//   2. rebuilds the whole picture with shaders and paints it back over the canvas.
 //
-// - Edges form smooth curves that span multiple pixels — staircases and
-//   block corners flow into rounded slopes at any angle, not just
-//   0/45/90 degree steps.
-// - Each material keeps its own field, so where two materials touch the
-//   seam stays fully solid and colors never mix into muddy pixels.
-// - Small features (lone grains, thin lines) fall back to the exact pixel
-//   grid, so nothing dissolves into dots or gaps.
-// - Pixels touching the world edge stay flush with the world edge.
-// - Gases and glow pixels render as soft round cloud particles with a
-//   smooth fade (5-cell glow diameter); nearby gases stack into one bigger
-//   cloud that wraps the whole shape.
-// - Every visual-effect element is square-free in the normal view: energy
-//   renderers (fire, plasma...) become clouds, charged pixels get a soft
-//   yellow halo, and heat-glow/magma shimmer gradients are re-blended into
-//   smooth ramps by the field pass.
-// - Semi-transparent pixels and thermal/other special views keep their
-//   original rendering.
+// SOLIDS / LIQUIDS / POWDERS
+//   - Silhouette = a gaussian-blurred occupancy field thresholded at 0.5, sampled with a
+//     bicubic B-spline. That gives true smooth curves at ANY angle (not 0/45/90 steps).
+//     Three blur scales are blended: thin features (1-2 cells) stay small and round,
+//     big bodies get long smooth curves.
+//   - Material seams use a local per-material weight vote, so two materials never mix
+//     colors into mud, and the seam itself is anti-aliased.
+//   - Colors are smoothed per material (same-material neighbors only), so grainy/noisy
+//     textures become soft gradients — no visible cells inside shapes either.
+//   - Pixels touching the world edge stay flush with it.
+// GASES / FIRE / PLASMA / GLOW / CHARGE
+//   - Rendered as a density field with animated fractal noise, soft top-left lighting,
+//     and an emissive path for fire/plasma/charge. Nearby gas pixels merge into one cloud.
 //
-// Toggle it off in Extras > Mods (remove "nocubes.js"), then reset the canvas.
+// This mod is VISUAL ONLY: it never changes elements, renderers, pixels or behaviors.
+// It only reads currentPixels and draws on the pixel layer. Load it LAST in your mod list
+// (it repaints the whole pixel layer, so anything another post-pixel mod drew there is replaced).
+//
+// Console: noCubes.enabled = false   -> back to vanilla squares instantly.
+// Needs WebGL2. Thermal/other special views are left untouched.
 
 (function () {
 	"use strict";
 
-	if (typeof renderPostPixel !== "function" || typeof viewInfo !== "object" || !viewInfo[1]) {
+	if (typeof renderPostPixel !== "function" || typeof currentPixels === "undefined" || typeof elements !== "object") {
 		console.warn("nocubes.js: game runtime not found — mod not loaded.");
 		return;
 	}
 
-	// Tuning (cell units):
-	var EDGE_SOFT = 0.14; // half-width of the exact-grid AA band
-	var EDGE_A = 0.3;     // half-width of the curve-field AA band
-	var T_SOLID = 0.55;   // blurred distance above which a cell follows the curve field only
-	var D_CAP = 12;       // distance cap, in cells
-	var VAR_T = 6;        // per-channel color step that marks a shimmer/gradient cell
-	// Separable gaussian kernel (sigma 2, radius 4), sums to 1.
-	var KERNEL = [0.0276, 0.0663, 0.1238, 0.1802, 0.2042, 0.1802, 0.1238, 0.0663, 0.0276];
-	var KR = 4;
+	// ---- Tuning (cell units unless noted) ---------------------------------
+	var CFG = {
+		sigmaFine: 0.6,      // blur for tiny features (dots, 1-wide lines)
+		sigmaSmooth: 1.6,    // blur for normal shapes — raise for rounder, lower for tighter
+		sigmaBulk: 3.2,      // blur used to decide "is this a thin feature or a big body"
+		thinBoost: 0.15,     // keeps lone grains visible
+		colorSigma: 1.2,     // per-material color smoothing (higher = softer textures)
+		seamSigma: 1.0,      // smoothness of boundaries between two materials
+		cloudSigma: 1.3,     // size of one gas pixel's puff
+		cloudOpacity: 0.55,  // base opacity of one gas pixel
+		cloudNoise: 0.5,     // 0 = smooth blobs, 1 = very wispy
+		cloudScale: 0.62     // noise feature size (higher = finer detail)
+	};
+	var DSCALE = 6.0;        // cloud density is stored /6 in 8 bits
 
-	var pw = 0, ph = 0, gw = 0, gh = 0;
-	var clsGrid = null;    // padded: -2 border, -1 air, -3 translucent, >=0 material id
-	var colR = null, colG = null, colB = null, hasCol = null;
-	var bufA = null, bufB = null, bufC = null; // chamfer/blur scratch
-	var smoothImg = null, smoothU32 = null; // cached smoothed cells, kept across frames
-	var hashGrid = null, hashFrame = null, frameId = 0;
-	var edgeCells = [];
-	var effectCells = [];  // interior cells of glow/shimmer materials, screened by color variation
-	var cloudPixels = [];  // this frame's gas/glow pixels: [x, y, color, alpha]
-	var glowClouds = [];   // effect halos pushed by patched renderers, tagged with cloudFrame
-	var cloudFrame = 0;
-	var elemIndex = {}, elemNames = [], elemCount = 0;
-	var classBufs = {};    // material id -> { solid, dist }
-	var classEffect = {};  // material id -> its vanilla renderer is a glow/shimmer overlay
-	var presentClasses = [];
+	var API = window.noCubes = { enabled: true };
 
-	function elemId(name) {
-		var id = elemIndex[name];
-		if (id === undefined) {
-			id = elemCount++;
-			elemIndex[name] = id;
-			elemNames[id] = name;
-			classEffect[id] = isEffectRenderer(elements[name]);
+	// ---- GL setup ---------------------------------------------------------
+	var glc = document.createElement("canvas");
+	var gl = glc.getContext("webgl2", {
+		alpha: true, premultipliedAlpha: true, antialias: false, depth: false,
+		stencil: false, preserveDrawingBuffer: false, powerPreference: "high-performance"
+	});
+	if (!gl) {
+		console.warn("nocubes.js: WebGL2 not available — mod not loaded.");
+		return;
+	}
+	var ready = false;
+	var P = {}, T = {}, FB = {};
+	var gameTex = null;
+	var cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
+
+	function F(x) { var s = String(x); return /[.e]/.test(s) ? s : s + ".0"; }
+
+	var HEAD = "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp usampler2D;\n";
+	var VS = "#version 300 es\nvoid main(){ vec2 p = vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); gl_Position = vec4(p*2.0-1.0, 0.0, 1.0); }";
+
+	var RB = Math.ceil(3 * CFG.sigmaBulk);
+	var SIGV = "vec3(" + F(CFG.sigmaFine) + "," + F(CFG.sigmaSmooth) + "," + F(CFG.sigmaBulk) + ")";
+
+	// Pass 1: horizontal blur of "is there matter here" at three scales (cell resolution)
+	var FS_OCC_H = HEAD + [
+		"uniform usampler2D uId; uniform ivec2 uN; out vec4 o;",
+		"const vec3 SIG = " + SIGV + ";",
+		"const int R = " + RB + ";",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  vec3 acc = vec3(0.0), ws = vec3(0.0);",
+		"  for (int k = -R; k <= R; k++) {",
+		"    int x = clamp(c.x + k, 0, uN.x - 1);",   // clamp = edge replicate => flush with world edge
+		"    float v = texelFetch(uId, ivec2(x, c.y), 0).r > 0u ? 1.0 : 0.0;",
+		"    vec3 w = exp(-float(k*k) / (2.0*SIG*SIG));",
+		"    acc += v*w; ws += w;",
+		"  }",
+		"  o = vec4(acc/ws, 1.0);",
+		"}"
+	].join("\n");
+
+	// Pass 2: vertical blur
+	var FS_OCC_V = HEAD + [
+		"uniform sampler2D uTmp; uniform ivec2 uN; out vec4 o;",
+		"const vec3 SIG = " + SIGV + ";",
+		"const int R = " + RB + ";",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  vec3 acc = vec3(0.0), ws = vec3(0.0);",
+		"  for (int k = -R; k <= R; k++) {",
+		"    int y = clamp(c.y + k, 0, uN.y - 1);",
+		"    vec3 v = texelFetch(uTmp, ivec2(c.x, y), 0).rgb;",
+		"    vec3 w = exp(-float(k*k) / (2.0*SIG*SIG));",
+		"    acc += v*w; ws += w;",
+		"  }",
+		"  o = vec4(acc/ws, 1.0);",
+		"}"
+	].join("\n");
+
+	// Pass 3: per-cell color, averaged over same-material neighbors only (cell resolution)
+	var CR = Math.ceil(2 * CFG.colorSigma);
+	var FS_COL = HEAD + [
+		"uniform usampler2D uId; uniform sampler2D uGame; uniform ivec2 uN; uniform float uPS; out vec4 o;",
+		"const float SC = " + F(CFG.colorSigma) + ";",
+		"const int CR = " + CR + ";",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  uint id = texelFetch(uId, c, 0).r;",
+		"  if (id == 0u) { o = vec4(0.0); return; }",
+		"  vec4 sA = vec4(0.0); float wA = 0.0; vec4 sB = vec4(0.0);",
+		"  for (int dy = -CR; dy <= CR; dy++) {",
+		"    for (int dx = -CR; dx <= CR; dx++) {",
+		"      ivec2 q = c + ivec2(dx, dy);",
+		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"      uint qi = texelFetch(uId, q, 0).r;",
+		"      if (qi == 0u) continue;",
+		"      vec4 g = texelFetch(uGame, ivec2((vec2(q) + 0.5) * uPS), 0);",
+		"      if (g.a < 0.04) continue;",
+		"      float w = exp(-float(dx*dx + dy*dy) / (2.0*SC*SC));",
+		"      vec4 pm = vec4(g.rgb * g.a, g.a) * w;",
+		"      sB += pm;",
+		"      if (qi == id) { sA += pm; wA += w; }",
+		"    }",
+		"  }",
+		"  if (sA.a > 1e-4) o = vec4(sA.rgb / sA.a, clamp(sA.a / wA, 0.0, 1.0));",
+		"  else if (sB.a > 1e-4) o = vec4(sB.rgb / sB.a, 1.0);",
+		"  else o = vec4(0.5, 0.5, 0.5, 1.0);",
+		"}"
+	].join("\n");
+
+	// Cloud passes (cell resolution)
+	var CLR = Math.ceil(2.4 * CFG.cloudSigma);
+	var CLOUD_DEC = [
+		"float a = floor(t.a * 255.0 + 0.5);",
+		"float em = a >= 128.0 ? 1.0 : 0.0;",
+		"float amp = (a - 128.0 * em) / 127.0;"
+	].join("\n");
+	var FS_CLOUD_D = HEAD + [
+		"uniform sampler2D uCloud; uniform ivec2 uN; out vec4 o;",
+		"const float SG = " + F(CFG.cloudSigma) + ";",
+		"const int CL = " + CLR + ";",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  float d = 0.0, e = 0.0;",
+		"  for (int dy = -CL; dy <= CL; dy++) {",
+		"    for (int dx = -CL; dx <= CL; dx++) {",
+		"      ivec2 q = c + ivec2(dx, dy);",
+		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"      vec4 t = texelFetch(uCloud, q, 0);",
+		CLOUD_DEC,
+		"      if (amp <= 0.0) continue;",
+		"      float w = exp(-float(dx*dx + dy*dy) / (2.0*SG*SG)) * amp;",
+		"      d += w; e += w * em;",
+		"    }",
+		"  }",
+		"  o = vec4(d / " + F(DSCALE) + ", e / " + F(DSCALE) + ", 0.0, 1.0);",
+		"}"
+	].join("\n");
+	var FS_CLOUD_C = HEAD + [
+		"uniform sampler2D uCloud; uniform ivec2 uN; out vec4 o;",
+		"const float SG = " + F(CFG.cloudSigma) + ";",
+		"const int CL = " + CLR + ";",
+		"void main(){",
+		"  ivec2 c = ivec2(gl_FragCoord.xy);",
+		"  vec3 s = vec3(0.0); float w0 = 0.0;",
+		"  for (int dy = -CL; dy <= CL; dy++) {",
+		"    for (int dx = -CL; dx <= CL; dx++) {",
+		"      ivec2 q = c + ivec2(dx, dy);",
+		"      if (q.x < 0 || q.y < 0 || q.x >= uN.x || q.y >= uN.y) continue;",
+		"      vec4 t = texelFetch(uCloud, q, 0);",
+		CLOUD_DEC,
+		"      if (amp <= 0.0) continue;",
+		"      float w = exp(-float(dx*dx + dy*dy) / (2.0*SG*SG)) * amp;",
+		"      s += w * t.rgb; w0 += w;",
+		"    }",
+		"  }",
+		"  o = vec4(w0 > 0.0 ? s / w0 : vec3(0.0), 1.0);",
+		"}"
+	].join("\n");
+
+	// Final pass: full-resolution composite
+	var FS_FINAL = HEAD + [
+		"uniform usampler2D uId;",
+		"uniform sampler2D uField, uCol, uCD, uCC;",
+		"uniform ivec2 uN;",
+		"uniform float uPS, uCanvasH, uTime;",
+		"uniform int uCloudOn;",
+		"out vec4 outColor;",
+		"const float THIN = " + F(CFG.thinBoost) + ";",
+		"const float SS = " + F(CFG.seamSigma) + ";",
+		"const float NOISE = " + F(CFG.cloudNoise) + ";",
+		"const float NSCALE = " + F(CFG.cloudScale) + ";",
+		"const float DSC = " + F(DSCALE) + ";",
+		"",
+		"float hash(vec2 p){ p = fract(p * vec2(123.34, 456.21)); p += dot(p, p + 45.32); return fract(p.x * p.y); }",
+		"float vnoise(vec2 p){",
+		"  vec2 i = floor(p), f = fract(p); f = f*f*(3.0 - 2.0*f);",
+		"  float a = hash(i), b = hash(i + vec2(1.0,0.0)), c = hash(i + vec2(0.0,1.0)), d = hash(i + vec2(1.0,1.0));",
+		"  return mix(mix(a,b,f.x), mix(c,d,f.x), f.y);",
+		"}",
+		"float fbm(vec2 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 3; i++) { s += a * vnoise(p); p = p*2.03 + vec2(17.1, 9.7); a *= 0.5; } return s / 0.875; }",
+		"",
+		// bicubic B-spline via 4 bilinear taps: C2-smooth contours, no cell-grid kinks
+		"vec4 cubicSample(sampler2D t, vec2 p, vec2 N){",
+		"  vec2 c = p - 0.5; vec2 i = floor(c); vec2 f = c - i;",
+		"  vec2 f2 = f*f, f3 = f2*f;",
+		"  vec2 w0 = (1.0-f)*(1.0-f)*(1.0-f)/6.0;",
+		"  vec2 w1 = (3.0*f3 - 6.0*f2 + 4.0)/6.0;",
+		"  vec2 w2 = (-3.0*f3 + 3.0*f2 + 3.0*f + 1.0)/6.0;",
+		"  vec2 w3 = f3/6.0;",
+		"  vec2 g0 = w0 + w1, g1 = w2 + w3;",
+		"  vec2 h0 = w1/g0 - 1.0, h1 = w3/g1 + 1.0;",
+		"  vec2 t0 = (i + h0 + 0.5)/N, t1 = (i + h1 + 0.5)/N;",
+		"  return g0.y * (g0.x * textureLod(t, vec2(t0.x, t0.y), 0.0) + g1.x * textureLod(t, vec2(t1.x, t0.y), 0.0))",
+		"       + g1.y * (g0.x * textureLod(t, vec2(t0.x, t1.y), 0.0) + g1.x * textureLod(t, vec2(t1.x, t1.y), 0.0));",
+		"}",
+		"",
+		// smoothed color of material `id` at p, bilinear over the 4 nearest cells of that material
+		"vec4 colFor(uint id, vec2 p){",
+		"  vec2 q = p - 0.5; ivec2 b = ivec2(floor(q)); vec2 f = q - floor(q);",
+		"  vec4 acc = vec4(0.0); float ws = 0.0;",
+		"  for (int k = 0; k < 4; k++) {",
+		"    int dx = k & 1, dy = k >> 1;",
+		"    ivec2 cc = clamp(b + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
+		"    if (texelFetch(uId, cc, 0).r != id) continue;",
+		"    float w = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);",
+		"    acc += w * texelFetch(uCol, cc, 0); ws += w;",
+		"  }",
+		"  if (ws > 1e-3) return acc / ws;",
+		"  ivec2 c0 = ivec2(floor(p)); float bd = 1e9; vec4 r = vec4(0.5, 0.5, 0.5, 1.0);",
+		"  for (int dy = -2; dy <= 2; dy++) {",
+		"    for (int dx = -2; dx <= 2; dx++) {",
+		"      ivec2 cc = clamp(c0 + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
+		"      if (texelFetch(uId, cc, 0).r != id) continue;",
+		"      float d = distance(vec2(cc) + 0.5, p);",
+		"      if (d < bd) { bd = d; r = texelFetch(uCol, cc, 0); }",
+		"    }",
+		"  }",
+		"  return r;",
+		"}",
+		"",
+		"void main(){",
+		"  vec2 N = vec2(uN);",
+		"  vec2 p = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) / uPS;",
+		"  float inside = (p.x < N.x && p.y < N.y) ? 1.0 : 0.0;",
+		"  vec2 pc = clamp(p, vec2(0.0), N - 0.001);",
+		// silhouette: thin features use the tight field, big bodies the smooth one
+		"  vec4 Fd = cubicSample(uField, pc, N);",
+		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
+		"  float G = mix(Fd.x + THIN, Fd.y, bulk);",
+		"  float fw = max(fwidth(G), 1e-4);",
+		"  float t = clamp((G - 0.5) / fw + 0.5, 0.0, 1.0);",
+		"  t = t*t*(3.0 - 2.0*t);",
+		"  vec4 res = vec4(0.0);",
+		"  if (t > 0.0) {",
+		"    ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
+		"    uint c0 = texelFetch(uId, c, 0).r;",
+		"    bool uni = (c0 != 0u);",
+		"    for (int dy = -1; dy <= 1; dy++) {",
+		"      for (int dx = -1; dx <= 1; dx++) {",
+		"        if (texelFetch(uId, clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1)), 0).r != c0) uni = false;",
+		"      }",
+		"    }",
+		"    vec4 col = vec4(0.0);",
+		"    if (uni) {",
+		"      col = colFor(c0, pc);",
+		"    } else {",
+		"      uint mids[4] = uint[4](0u, 0u, 0u, 0u);",
+		"      float ws[4] = float[4](0.0, 0.0, 0.0, 0.0);",
+		"      int n = 0;",
+		"      for (int dy = -2; dy <= 2; dy++) {",
+		"        for (int dx = -2; dx <= 2; dx++) {",
+		"          ivec2 q = clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
+		"          uint qi = texelFetch(uId, q, 0).r;",
+		"          if (qi == 0u) continue;",
+		"          vec2 d = vec2(q) + 0.5 - pc;",
+		"          float w = exp(-dot(d, d) / (2.0*SS*SS));",
+		"          bool placed = false;",
+		"          for (int k = 0; k < 4; k++) { if (k < n && mids[k] == qi) { ws[k] += w; placed = true; } }",
+		"          if (!placed && n < 4) { mids[n] = qi; ws[n] = w; n++; }",
+		"        }",
+		"      }",
+		"      if (n > 0) {",
+		"        int i1 = 0;",
+		"        for (int k = 1; k < 4; k++) { if (k < n && ws[k] > ws[i1]) i1 = k; }",
+		"        int i2 = -1; float w2 = 0.0;",
+		"        for (int k = 0; k < 4; k++) { if (k < n && k != i1 && ws[k] > w2) { w2 = ws[k]; i2 = k; } }",
+		"        col = colFor(mids[i1], pc);",
+		"        if (i2 >= 0) {",
+		"          vec4 cb = colFor(mids[i2], pc);",
+		"          float mn = (ws[i1] - w2) / (ws[i1] + w2);",
+		"          float kk = max(0.9 / uPS, 0.03);",
+		"          col = mix(cb, col, smoothstep(-kk, kk, mn));",
+		"        }",
+		"      }",
+		"    }",
+		"    res = vec4(col.rgb * col.a, col.a) * t;",
+		"  }",
+		// clouds: gas / fire / plasma / glow / charge
+		"  if (uCloudOn == 1) {",
+		"    vec4 dE = cubicSample(uCD, pc, N);",
+		"    float D = dE.r * DSC, E = dE.g * DSC;",
+		"    if (D > 0.004) {",
+		"      vec2 np = vec2(p.x, p.y + uTime * 0.6) * NSCALE;",
+		"      float n1 = fbm(np);",
+		"      float n2 = fbm(np * 1.9 + vec2(7.3, 3.1 - uTime * 0.25));",
+		"      float dn = D * (1.0 - NOISE + NOISE * 2.0 * n1);",
+		"      float dd = max(dn - 0.04, 0.0);",
+		"      float a = min(1.0 - exp(-dd * 1.8), 0.96);",
+		"      vec2 e1 = vec2(0.9, 0.0);",
+		"      float gx = textureLod(uCD, (pc + e1) / N, 0.0).r - textureLod(uCD, (pc - e1) / N, 0.0).r;",
+		"      float gy = textureLod(uCD, (pc + e1.yx) / N, 0.0).r - textureLod(uCD, (pc - e1.yx) / N, 0.0).r;",
+		"      vec2 gr = vec2(gx, gy) * DSC;",
+		"      float lit = clamp(dot(-gr, vec2(-0.45, -0.9)) * 1.5, -1.0, 1.0);",
+		"      vec3 base = textureLod(uCC, pc / N, 0.0).rgb;",
+		"      vec3 gasC = clamp(base * (0.88 + 0.2*n2) * (0.9 + 0.18*lit) + vec3(0.06) * max(lit, 0.0), 0.0, 1.0);",
+		"      float em = clamp(E / max(D, 1e-3), 0.0, 1.0);",
+		"      vec3 fireC = clamp(mix(base * (1.1 + 0.35*n2), vec3(1.0, 0.94, 0.78), clamp(dd * 0.25, 0.0, 0.4)), 0.0, 1.0);",
+		"      float aE = a * 0.85;",
+		"      float pa = mix(a, aE, em);",
+		"      vec3 pcol = mix(gasC * a, fireC * aE, em);",
+		"      res = vec4(pcol, pa) + res * (1.0 - pa);",
+		"    }",
+		"  }",
+		"  outColor = res * inside;",
+		"}"
+	].join("\n");
+
+	// ---- GL helpers -------------------------------------------------------
+	function compile(type, src) {
+		var s = gl.createShader(type);
+		gl.shaderSource(s, src);
+		gl.compileShader(s);
+		if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+			throw new Error("shader: " + gl.getShaderInfoLog(s));
 		}
-		return id;
+		return s;
 	}
-
-	function ensureGrids(W, H) {
-		if (clsGrid && gw === W && gh === H) return;
-		gw = W; gh = H;
-		pw = W + 2; ph = H + 2;
-		var N = pw * ph;
-		clsGrid = new Int16Array(N);
-		colR = new Float32Array(N);
-		colG = new Float32Array(N);
-		colB = new Float32Array(N);
-		hasCol = new Uint8Array(N);
-		bufA = new Float32Array(N);
-		bufB = new Float32Array(N);
-		bufC = new Float32Array(N);
-		classBufs = {};
-		hashGrid = new Int32Array(N);
-		hashFrame = new Int32Array(N);
-		frameId = 0;
+	function program(fs) {
+		var p = gl.createProgram();
+		gl.attachShader(p, compile(gl.VERTEX_SHADER, VS));
+		gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+		gl.linkProgram(p);
+		if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error("link: " + gl.getProgramInfoLog(p));
+		p.u = {};
+		return p;
 	}
-
-	function getClassBufs(id) {
-		var b = classBufs[id];
-		if (!b) {
-			b = { solid: new Uint8Array(pw * ph), dist: new Float32Array(pw * ph) };
-			classBufs[id] = b;
+	function U(p, name) {
+		var l = p.u[name];
+		if (l === undefined) { l = gl.getUniformLocation(p, name); p.u[name] = l; }
+		return l;
+	}
+	function mkTex(w, h, internal, format, type, filter) {
+		var t = gl.createTexture();
+		gl.bindTexture(gl.TEXTURE_2D, t);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+		gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+		if (w > 0) gl.texImage2D(gl.TEXTURE_2D, 0, internal, w, h, 0, format, type, null);
+		return t;
+	}
+	function mkFbo(tex) {
+		var f = gl.createFramebuffer();
+		gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+		gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+		return f;
+	}
+	function freeCells() {
+		for (var k in T) if (T[k]) gl.deleteTexture(T[k]);
+		for (var k2 in FB) if (FB[k2]) gl.deleteFramebuffer(FB[k2]);
+		T = {}; FB = {};
+	}
+	function allocCells(W, H) {
+		freeCells();
+		cellW = W; cellH = H;
+		T.id = mkTex(W, H, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT, gl.NEAREST);
+		T.cloud = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+		T.tmp = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+		T.field = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+		T.col = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
+		T.cd = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+		T.cc = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
+		FB.tmp = mkFbo(T.tmp); FB.field = mkFbo(T.field); FB.col = mkFbo(T.col);
+		FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
+		ids = new Uint16Array(W * H);
+		cloudArr = new Uint8Array(W * H * 4);
+		cloudDirty = false;
+	}
+	function buildGL() {
+		P.occH = program(FS_OCC_H);
+		P.occV = program(FS_OCC_V);
+		P.col = program(FS_COL);
+		P.cloudD = program(FS_CLOUD_D);
+		P.cloudC = program(FS_CLOUD_C);
+		P.final = program(FS_FINAL);
+		gameTex = mkTex(0, 0, 0, 0, 0, gl.NEAREST);
+		cellW = 0; cellH = 0; T = {}; FB = {};
+		ready = true;
+	}
+	function pass(prog, fbo, w, h, texs, setU) {
+		gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+		gl.viewport(0, 0, w, h);
+		gl.useProgram(prog);
+		for (var i = 0; i < texs.length; i++) {
+			gl.activeTexture(gl.TEXTURE0 + i);
+			gl.bindTexture(gl.TEXTURE_2D, texs[i][1]);
+			gl.uniform1i(U(prog, texs[i][0]), i);
 		}
-		return b;
+		gl.uniform2i(U(prog, "uN"), cellW, cellH);
+		if (setU) setU(prog);
+		gl.drawArrays(gl.TRIANGLES, 0, 3);
 	}
 
-	// Two-pass chamfer distance transform (3/4 weights), in place.
-	function chamfer(field) {
-		var i, x, y, row, v;
-		for (y = 0; y < ph; y++) {
-			row = y * pw;
-			for (x = 0; x < pw; x++) {
-				i = row + x;
-				v = field[i];
-				if (x > 0 && field[i - 1] + 3 < v) v = field[i - 1] + 3;
-				if (y > 0) {
-					if (field[i - pw] + 3 < v) v = field[i - pw] + 3;
-					if (x > 0 && field[i - pw - 1] + 4 < v) v = field[i - pw - 1] + 4;
-					if (x < pw - 1 && field[i - pw + 1] + 4 < v) v = field[i - pw + 1] + 4;
-				}
-				field[i] = v;
+	try { buildGL(); }
+	catch (err) { console.error("nocubes.js: GL init failed —", err); return; }
+
+	glc.addEventListener("webglcontextlost", function (e) { e.preventDefault(); ready = false; });
+	glc.addEventListener("webglcontextrestored", function () {
+		try { buildGL(); } catch (err) { console.error("nocubes.js: GL restore failed —", err); }
+	});
+
+	// ---- Color parsing (cached; only gas/halo pixels need it) -------------
+	var colorCache = new Map();
+	function c255(v) { v = Math.round(v); return v < 0 ? 0 : (v > 255 ? 255 : v); }
+	function hslInt(h, s, l) {
+		h = (((h % 360) + 360) % 360) / 360; s /= 100; l /= 100;
+		var q = l < 0.5 ? l * (1 + s) : l + s - l * s, p = 2 * l - q;
+		function f(t) {
+			if (t < 0) t += 1; if (t > 1) t -= 1;
+			return t < 1 / 6 ? p + (q - p) * 6 * t : t < 0.5 ? q : t < 2 / 3 ? p + (q - p) * (2 / 3 - t) * 6 : p;
+		}
+		return (c255(f(h + 1 / 3) * 255) << 16) | (c255(f(h) * 255) << 8) | c255(f(h - 1 / 3) * 255);
+	}
+	function parseRGB(c) {
+		if (Array.isArray(c)) c = c[0];
+		if (typeof c !== "string") return 0xB4B4B4;
+		var v = colorCache.get(c);
+		if (v !== undefined) return v;
+		v = 0xB4B4B4;
+		var ch = c.charCodeAt(0);
+		if (ch === 35) {
+			var h = c.slice(1);
+			if (h.length === 3 || h.length === 4) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+			if (h.length >= 6) { var n = parseInt(h.slice(0, 6), 16); if (!isNaN(n)) v = n; }
+		} else {
+			var m = c.match(/[\d.]+/g);
+			if (m && m.length >= 3) {
+				if (ch === 104) v = hslInt(+m[0], +m[1], +m[2]);
+				else v = (c255(+m[0]) << 16) | (c255(+m[1]) << 8) | c255(+m[2]);
 			}
 		}
-		for (y = ph - 1; y >= 0; y--) {
-			row = y * pw;
-			for (x = pw - 1; x >= 0; x--) {
-				i = row + x;
-				v = field[i];
-				if (x < pw - 1 && field[i + 1] + 3 < v) v = field[i + 1] + 3;
-				if (y < ph - 1) {
-					if (field[i + pw] + 3 < v) v = field[i + pw] + 3;
-					if (x < pw - 1 && field[i + pw + 1] + 4 < v) v = field[i + pw + 1] + 4;
-					if (x > 0 && field[i + pw - 1] + 4 < v) v = field[i + pw - 1] + 4;
-				}
-				field[i] = v;
-			}
-		}
+		if (colorCache.size > 4000) colorCache.clear();
+		colorCache.set(c, v);
+		return v;
 	}
 
-	// Separable gaussian blur of src into dst (src may equal dst).
-	function blurField(src, dst) {
-		var x, y, k, i, acc, row, ii;
-		for (y = 0; y < ph; y++) {
-			row = y * pw;
-			for (x = 0; x < pw; x++) {
-				acc = 0;
-				for (k = -KR; k <= KR; k++) {
-					i = x + k; if (i < 0) i = 0; else if (i >= pw) i = pw - 1;
-					acc += src[row + i] * KERNEL[k + KR];
-				}
-				bufC[row + x] = acc;
-			}
-		}
-		for (y = 0; y < ph; y++) {
-			row = y * pw;
-			for (x = 0; x < pw; x++) {
-				acc = 0;
-				for (k = -KR; k <= KR; k++) {
-					i = y + k; if (i < 0) i = 0; else if (i >= ph) i = ph - 1;
-					acc += bufC[i * pw + x] * KERNEL[k + KR];
-				}
-				dst[row + x] = acc;
-			}
-		}
+	// ---- Per-frame work ---------------------------------------------------
+	var idMap = Object.create(null), nextId = 1;
+	function idFor(name) {
+		var v = idMap[name];
+		if (v === undefined) { v = nextId < 65535 ? nextId++ : 65535; idMap[name] = v; }
+		return v;
 	}
 
-	// Signed distance field for one material: positive inside, negative
-	// outside, in cells. The world border counts as solid, so pixels stay
-	// flush with the world edge.
-	function buildClassField(id, b) {
-		var i, N = pw * ph, c, member;
-		for (i = 0; i < N; i++) {
-			c = clsGrid[i];
-			member = (c === id || c === -2) ? 1 : 0;
-			b.solid[i] = member;
-			bufA[i] = member ? 1e9 : 0; // distance to nearest non-member
-			bufB[i] = member ? 0 : 1e9; // distance to nearest member
-		}
-		chamfer(bufA);
-		chamfer(bufB);
-		for (i = 0; i < N; i++) {
-			if (bufA[i] === 0) b.dist[i] = Math.min(bufB[i] === 1e9 ? D_CAP : bufB[i] / 3, D_CAP) * -1;
-			else b.dist[i] = Math.min(bufA[i] / 3, D_CAP);
-		}
-		blurField(b.dist, b.dist);
+	var cloudCount = 0, gridW = 0;
+	function putCloud(gi, color, amp, emissive) {
+		var rgb = parseRGB(color), o = gi * 4;
+		cloudArr[o] = (rgb >> 16) & 255;
+		cloudArr[o + 1] = (rgb >> 8) & 255;
+		cloudArr[o + 2] = rgb & 255;
+		cloudArr[o + 3] = (emissive ? 128 : 0) + Math.round((amp > 1 ? 1 : amp) * 127);
+		cloudCount++;
 	}
 
 	function smoothPost(ctx) {
-		// Drop glow halos older than the last drawn frame, so pixels that
-		// stopped rendering (burned out, moved away) leave no lingering cloud
-		if (glowClouds.length) {
-			var keepC = [];
-			for (var ci = 0; ci < glowClouds.length; ci++) {
-				if (glowClouds[ci].cf >= cloudFrame) keepC.push(glowClouds[ci]);
-			}
-			glowClouds = keepC;
-		}
+		if (!ready || !API.enabled) return;
 		if (view !== 1 && view !== 3) return;
 		if (typeof width !== "number" || typeof height !== "number" || width < 1 || height < 1) return;
-		var W = width + 1, H = height + 1; // sim coords are 0..width inclusive
-		var PS = pixelSize;
+		var W = width + 1, H = height + 1, PS = pixelSize;
 		if (!PS || PS < 2) return;
-		var canvas = ctx.canvas;
-		if (canvas.width < W * PS || canvas.height < H * PS) return; // mid-resize safety
+		var canvas = ctx.canvas, cw = canvas.width, ch = canvas.height;
+		if (cw < W * PS || ch < H * PS) return; // mid-resize safety
 
-		ensureGrids(W, H);
-		clsGrid.fill(-1);
-		cloudPixels.length = 0; // rebuild every frame so old clouds never linger
+		try {
+			if (W !== cellW || H !== cellH) allocCells(W, H);
+			if (glc.width !== cw || glc.height !== ch) { glc.width = cw; glc.height = ch; }
 
-		var i, d, gi;
-
-		// Pass 1: classify the live pixels; collect gas/glow cloud particles
-		presentClasses.length = 0;
-		for (i = 0; i < currentPixels.length; i++) {
-			var pixel = currentPixels[i];
-			if (!pixel || pixel.del === true) continue;
-			if (!pixelMap[pixel.x] || pixelMap[pixel.x][pixel.y] === undefined) continue;
-			if (pixel.con) {
-				if (!elements[pixel.con.element]) delete pixel.con;
-				else if (elements[pixel.element].canContain === true) pixel = pixel.con;
-			}
-			var info = elements[pixel.element];
-			if (!info) continue;
-			if (pixel.x < 0 || pixel.y < 0 || pixel.x >= W || pixel.y >= H) continue;
-
-			// Gases and glow pixels become soft cloud particles instead of
-			// blocky squares, plus shapes or custom renderers (drawn after
-			// the pixel pass).
-			if (isCloudy(pixel, info)) {
-				cloudPixels.push([pixel.x, pixel.y, pixel.color,
-					pixel.alpha === undefined ? 1 : pixel.alpha]);
-				continue;
-			}
-
-			var s;
-			if (view === 3) {
-				if (pixel.alpha === 0) continue;
-				s = 1;
-			} else {
-				s = (settings.textures !== 0) ? (pixel.alpha === undefined ? 1 : pixel.alpha) : 1;
-				if (s === 0) continue;
-			}
-
-			gi = (pixel.y + 1) * pw + (pixel.x + 1);
-			var id = elemId(pixel.element);
-			clsGrid[gi] = (s >= 0.5) ? id : -3; // -3 = translucent, leave as drawn
-			if (presentClasses.indexOf(id) === -1) presentClasses.push(id);
-		}
-
-		// World border ring
-		var lastRow = (ph - 1) * pw;
-		for (var x = 0; x < pw; x++) { clsGrid[x] = -2; clsGrid[lastRow + x] = -2; }
-		for (var y = 0; y < ph; y++) { clsGrid[y * pw] = -2; clsGrid[y * pw + pw - 1] = -2; }
-
-		// Build this frame's distance fields
-		for (i = 0; i < presentClasses.length; i++) {
-			buildClassField(presentClasses[i], getClassBufs(presentClasses[i]));
-		}
-
-		// Pass 2: boundary cells (any cell touching a cell of another phase or
-		// material). Gas/glow neighbors no longer shield a cell: their cloud
-		// halos are drawn over the smoothed edge, so surfaces touching fire,
-		// steam etc. are rounded too instead of staying hard squares.
-		edgeCells.length = 0;
-		effectCells.length = 0;
-		var minX = 1e9, minY = 1e9, maxX = -1, maxY = -1;
-		var sq = squareCoords;
-		for (y = 0; y < H; y++) {
-			var rowBase = (y + 1) * pw + 1;
-			for (x = 0; x < W; x++) {
-				gi = rowBase + x;
-				var cls = clsGrid[gi];
-				if (cls < 0 && cls !== -1) continue; // border/translucent
-				var prot = false;
-				var edge = false;
-				for (d = 0; d < 8; d++) {
-					var nc = clsGrid[gi + sq[d][1] * pw + sq[d][0]];
-					if (nc === -3) { prot = true; break; }
-					if (nc !== -2 && nc !== cls) edge = true;
+			// 1) classify pixels (one linear pass, typed-array writes only)
+			ids.fill(0);
+			if (cloudDirty) { cloudArr.fill(0); cloudDirty = false; }
+			cloudCount = 0;
+			var normalView = (view === 1);
+			var texturesOn = (settings.textures !== 0);
+			for (var i = 0; i < currentPixels.length; i++) {
+				var pixel = currentPixels[i];
+				if (!pixel || pixel.del === true) continue;
+				var x = pixel.x, y = pixel.y;
+				if (x < 0 || y < 0 || x >= W || y >= H) continue;
+				var host = pixel;
+				if (pixel.con && elements[host.element] && elements[host.element].canContain === true && elements[pixel.con.element]) pixel = pixel.con; // read-only
+				var info = elements[pixel.element];
+				if (!info) continue;
+				if (pixel.alpha === 0 && (view === 3 || texturesOn)) continue;
+				var gi = y * W + x;
+				var cloudy = normalView && pixel.glow !== false && (info.isGas === true || info.category === "energy");
+				if (cloudy) {
+					var al = pixel.alpha === undefined ? 1 : pixel.alpha;
+					if (info.category === "energy") putCloud(gi, pixel.color, 1, true);
+					else putCloud(gi, pixel.color, CFG.cloudOpacity * al, false);
+					cloudDirty = true;
+					continue;
 				}
-				if (prot) continue;
-				if (edge) edgeCells.push(gi);
-				else if (cls >= 0 && classEffect[cls]) effectCells.push(gi);
-				else continue;
-				if (x < minX) minX = x;
-				if (y < minY) minY = y;
-				if (x > maxX) maxX = x;
-				if (y > maxY) maxY = y;
-			}
-		}
-		if (!edgeCells.length && !effectCells.length) {
-			if (view === 1) drawClouds(ctx);
-			return;
-		}
-
-		// Pass 3: read the drawn boundary from the pixels layer, so render
-		// presets (heat glow, textures, ...) are preserved, then re-render the
-		// boundary cells as smooth curves.
-		minX = Math.max(0, minX - 1); minY = Math.max(0, minY - 1);
-		maxX = Math.min(W - 1, maxX + 1); maxY = Math.min(H - 1, maxY + 1);
-		var bx = minX * PS, by = minY * PS;
-		var bw = (maxX - minX + 1) * PS, bh = (maxY - minY + 1) * PS;
-		var img = ctx.getImageData(bx, by, bw, bh);
-		var data = img.data;
-		frameId++;
-		var canvasW = canvas.width, canvasH = canvas.height;
-		if (!smoothImg || smoothImg.width !== canvasW || smoothImg.height !== canvasH) {
-			smoothImg = ctx.createImageData(canvasW, canvasH);
-			smoothU32 = new Uint32Array(smoothImg.data.buffer);
-			hashFrame.fill(0); // cached cells no longer have pixels stored
-		}
-		var imgU32 = new Uint32Array(img.data.buffer);
-
-		// Sample each material cell's drawn color at its center (fallback:
-		// the first drawn subpixel in the cell).
-		for (var cy = minY; cy <= maxY; cy++) {
-			for (var cx = minX; cx <= maxX; cx++) {
-				gi = (cy + 1) * pw + (cx + 1);
-				hasCol[gi] = 0;
-				if (clsGrid[gi] < 0) continue;
-				var ox = (cx - minX) * PS, oy = (cy - minY) * PS;
-				var ci = ((oy + (PS >> 1)) * bw + ox + (PS >> 1)) * 4;
-				if (data[ci + 3] < 40) { // custom renderer left the center empty
-					var found = false;
-					for (var sy = 0; sy < PS && !found; sy++) {
-						for (var sx = 0; sx < PS; sx++) {
-							var ti = ((oy + sy) * bw + ox + sx) * 4;
-							if (data[ti + 3] >= 40) { ci = ti; found = true; break; }
-						}
-					}
-					if (!found) continue;
-				}
-				colR[gi] = data[ci]; colG[gi] = data[ci + 1]; colB[gi] = data[ci + 2];
-				hasCol[gi] = 1;
-			}
-		}
-
-		// Interior cells of glow/shimmer materials (heat glow, magma): re-render
-		// them too when their 3x3 drawn colors vary, so temp gradients and the
-		// molten shimmer blend into smooth gradients instead of mosaic squares.
-		for (i = 0; i < effectCells.length; i++) {
-			gi = effectCells[i];
-			if (!hasCol[gi]) continue;
-			var vR = colR[gi], vG = colG[gi], vB = colB[gi], vary = false;
-			for (d = 0; d < 8 && !vary; d++) {
-				var gj2 = gi + sq[d][1] * pw + sq[d][0];
-				if (hasCol[gj2] &&
-					(Math.abs(colR[gj2] - vR) > VAR_T ||
-					 Math.abs(colG[gj2] - vG) > VAR_T ||
-					 Math.abs(colB[gj2] - vB) > VAR_T)) vary = true;
-			}
-			if (vary) edgeCells.push(gi);
-		}
-
-		// Per-boundary-cell scratch (small plain arrays, reused).
-		var kList = [], kMode = [], kHasRep = [], kRepR = [], kRepG = [], kRepB = [];
-		for (i = 0; i < edgeCells.length; i++) {
-			gi = edgeCells[i];
-			var cellX = (gi % pw) - 1, cellY = ((gi / pw) | 0) - 1;
-			var ox = (cellX - minX) * PS, oy = (cellY - minY) * PS;
-
-			// Cells whose 3x3 neighborhood (materials + drawn colors) is
-			// unchanged since they were last rendered are copied from the
-			// cache instead of recomputed — big scenes stay cheap.
-			var h = 0x9e3779b9;
-			for (var hy = -1; hy <= 1; hy++) {
-				for (var hx = -1; hx <= 1; hx++) {
-					var gj2 = gi + hy * pw + hx;
-					h = (Math.imul(h ^ clsGrid[gj2], 0x85ebca6b) + hasCol[gj2]) | 0;
-					if (hasCol[gj2]) {
-						h = (Math.imul(h ^ (colR[gj2] | 0), 0x27d4eb2f) + ((colG[gj2] | 0) << 2)) | 0;
-						h = Math.imul(h ^ (colB[gj2] | 0), 0x165667b1) | 0;
-					}
-				}
-			}
-			if (hashFrame[gi] !== 0 && hashGrid[gi] === h) {
-				var sx0 = cellX * PS, sy0 = cellY * PS;
-				for (var cy2 = 0; cy2 < PS; cy2++) {
-					var src = (sy0 + cy2) * canvasW + sx0;
-					var dst = (oy + cy2) * bw + ox;
-					for (var cx2 = 0; cx2 < PS; cx2++) imgU32[dst + cx2] = smoothU32[src + cx2];
-				}
-				continue;
-			}
-
-			// Materials present in the 3x3 neighborhood, with per-material
-			// mode (curve-only vs exact floor) and fallback color.
-			kList.length = 0;
-			for (var dy = -1; dy <= 1; dy++) {
-				for (var dx = -1; dx <= 1; dx++) {
-					var nc = clsGrid[gi + dy * pw + dx];
-					if (nc >= 0 && kList.indexOf(nc) === -1) kList.push(nc);
-				}
-			}
-			kMode.length = kHasRep.length = kRepR.length = kRepG.length = kRepB.length = kList.length;
-			for (var ki = 0; ki < kList.length; ki++) {
-				var kBuf = getClassBufs(kList[ki]);
-				kMode[ki] = kBuf.dist[gi] >= T_SOLID ? 1 : 0;
-				kHasRep[ki] = 0;
-				if (hasCol[gi]) { // the cell itself may already carry this material's color
-					kRepR[ki] = colR[gi]; kRepG[ki] = colG[gi]; kRepB[ki] = colB[gi];
-					kHasRep[ki] = 1;
-				}
-				for (var q = 0; q < 8 && !kHasRep[ki]; q++) {
-					var gj = gi + sq[q][1] * pw + sq[q][0];
-					if (clsGrid[gj] === kList[ki] && hasCol[gj]) {
-						kRepR[ki] = colR[gj]; kRepG[ki] = colG[gj]; kRepB[ki] = colB[gj];
-						kHasRep[ki] = 1;
-					}
+				ids[gi] = idFor(pixel.element);
+				if (normalView) { // soft halos replace the game's blocky charge / glow squares
+					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
+					else if (info.glow || pixel.glow) { putCloud(gi, pixel.color, 0.6, true); cloudDirty = true; }
 				}
 			}
 
-			for (var py = 0; py < PS; py++) {
-				var v = (py + 0.5) / PS - 0.5;
-				var j = Math.floor(v), fv = v - j;
-				var r0 = gi + j * pw, wT = 1 - fv, wB = fv;
-				for (var px = 0; px < PS; px++) {
-					var u = (px + 0.5) / PS - 0.5;
-					var ii = Math.floor(u), fu = u - ii;
-					var c0 = r0 + ii, c1 = c0 + 1, c2 = c0 + pw, c3 = c1 + pw;
-					var w00 = (1 - fu) * wT, w10 = fu * wT, w01 = (1 - fu) * wB, w11 = fu * wB;
-					// Pick the material that covers this subpixel most; ties go
-					// to the one whose smoothed surface is closest. Colors are
-					// taken from the winner only, so materials never mix.
-					var best = 0, bestKi = -1, bestD = -1e9;
-					for (ki = 0; ki < kList.length; ki++) {
-						var b = getClassBufs(kList[ki]);
-						var e = w00 * b.solid[c0] + w10 * b.solid[c1] +
-							w01 * b.solid[c2] + w11 * b.solid[c3];
-						var dv = w00 * b.dist[c0] + w10 * b.dist[c1] +
-							w01 * b.dist[c2] + w11 * b.dist[c3];
-						var t2 = (dv + EDGE_A) / (EDGE_A * 2);
-						var a = t2 <= 0 ? 0 : (t2 >= 1 ? 1 : t2 * t2 * (3 - 2 * t2));
-						if (!kMode[ki]) { // small feature: keep the exact grid as a floor
-							var t1 = (e - (0.5 - EDGE_SOFT)) / (EDGE_SOFT * 2);
-							var a1 = t1 <= 0 ? 0 : (t1 >= 1 ? 1 : t1 * t1 * (3 - 2 * t1));
-							if (a1 > a) a = a1;
-						}
-						if (a > best || (a === best && dv > bestD)) {
-							best = a; bestKi = ki; bestD = dv;
-						}
-					}
-					var di = ((oy + py) * bw + ox + px) * 4;
-					if (best <= 0 || bestKi < 0) {
-						data[di] = 0; data[di + 1] = 0; data[di + 2] = 0; data[di + 3] = 0;
-						continue;
-					}
-					var win = kList[bestKi];
-					var wsum = 0, rr = 0, gg = 0, bb = 0;
-					if (clsGrid[c0] === win && hasCol[c0]) { wsum += w00; rr += w00 * colR[c0]; gg += w00 * colG[c0]; bb += w00 * colB[c0]; }
-					if (clsGrid[c1] === win && hasCol[c1]) { wsum += w10; rr += w10 * colR[c1]; gg += w10 * colG[c1]; bb += w10 * colB[c1]; }
-					if (clsGrid[c2] === win && hasCol[c2]) { wsum += w01; rr += w01 * colR[c2]; gg += w01 * colG[c2]; bb += w01 * colB[c2]; }
-					if (clsGrid[c3] === win && hasCol[c3]) { wsum += w11; rr += w11 * colR[c3]; gg += w11 * colG[c3]; bb += w11 * colB[c3]; }
-					if (wsum > 1e-6) {
-						data[di] = rr / wsum; data[di + 1] = gg / wsum; data[di + 2] = bb / wsum;
-					} else if (kHasRep[bestKi]) {
-						data[di] = kRepR[bestKi]; data[di + 1] = kRepG[bestKi]; data[di + 2] = kRepB[bestKi];
-					} else {
-						continue; // winning material has no color here: leave as drawn
-					}
-					data[di + 3] = best * 255;
-				}
+			// 2) upload
+			gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+			gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+			gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+			gl.activeTexture(gl.TEXTURE0);
+			gl.bindTexture(gl.TEXTURE_2D, T.id);
+			gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RED_INTEGER, gl.UNSIGNED_SHORT, ids);
+			if (cloudCount) {
+				gl.bindTexture(gl.TEXTURE_2D, T.cloud);
+				gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, cloudArr);
 			}
-			// remember this cell's rendered pixels + what they depend on
-			var sx0 = cellX * PS, sy0 = cellY * PS;
-			for (var cy2 = 0; cy2 < PS; cy2++) {
-				var src = (sy0 + cy2) * canvasW + sx0;
-				var dst = (oy + cy2) * bw + ox;
-				for (var cx2 = 0; cx2 < PS; cx2++) smoothU32[src + cx2] = imgU32[dst + cx2];
+			gl.bindTexture(gl.TEXTURE_2D, gameTex);
+			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+
+			// 3) cell-resolution passes (tiny: one fragment per cell)
+			gl.disable(gl.BLEND);
+			pass(P.occH, FB.tmp, W, H, [["uId", T.id]]);
+			pass(P.occV, FB.field, W, H, [["uTmp", T.tmp]]);
+			pass(P.col, FB.col, W, H, [["uId", T.id], ["uGame", gameTex]], function (p) {
+				gl.uniform1f(U(p, "uPS"), PS);
+			});
+			if (cloudCount) {
+				pass(P.cloudD, FB.cd, W, H, [["uCloud", T.cloud]]);
+				pass(P.cloudC, FB.cc, W, H, [["uCloud", T.cloud]]);
 			}
-			hashGrid[gi] = h;
-			hashFrame[gi] = frameId;
+
+			// 4) final full-resolution composite
+			gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+			gl.clearColor(0, 0, 0, 0);
+			gl.viewport(0, 0, cw, ch);
+			gl.clear(gl.COLOR_BUFFER_BIT);
+			pass(P.final, null, cw, ch,
+				[["uId", T.id], ["uField", T.field], ["uCol", T.col], ["uCD", T.cd], ["uCC", T.cc]],
+				function (p) {
+					gl.uniform1f(U(p, "uPS"), PS);
+					gl.uniform1f(U(p, "uCanvasH"), ch);
+					gl.uniform1f(U(p, "uTime"), (performance.now() * 0.001) % 3600);
+					gl.uniform1i(U(p, "uCloudOn"), cloudCount ? 1 : 0);
+				});
+
+			// 5) replace the game's squares with the smooth render
+			ctx.save();
+			ctx.setTransform(1, 0, 0, 1, 0, 0);
+			ctx.globalAlpha = 1;
+			ctx.globalCompositeOperation = "source-over";
+			ctx.clearRect(0, 0, cw, ch);
+			ctx.drawImage(glc, 0, 0);
+			ctx.restore();
+		} catch (err) {
+			// Fail safe: leave the vanilla frame alone and stop trying.
+			console.error("nocubes.js: render failed, falling back to vanilla —", err);
+			ready = false;
 		}
-		ctx.putImageData(img, bx, by);
-		if (view === 1) drawClouds(ctx);
-		cloudFrame++; // halos pushed after this belong to the next frame
 	}
-
-	// --- Gas / glow cloud particles ------------------------------------
-
-	function rgbaStr(rgb, a) {
-		return "rgba(" + (rgb[0] | 0) + "," + (rgb[1] | 0) + "," + (rgb[2] | 0) + "," + a + ")";
-	}
-
-	function parseColorRGB(c) {
-		if (!c || !c.charCodeAt) return null;
-		var ch = c.charCodeAt(0);
-		if (ch === 35) { // '#...'
-			var h = c.substring(1);
-			if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
-			if (h.length >= 6) return [parseInt(h.substring(0, 2), 16), parseInt(h.substring(2, 4), 16), parseInt(h.substring(4, 6), 16)];
-			return null;
-		}
-		var m = c.match(/[\d\.]+/g);
-		if (ch === 114 && m) return [+m[0], +m[1], +m[2]]; // rgb(...)
-		if (ch === 104 && m && typeof HSLtoRGB === "function") { // hsl(...)
-			var rgb = HSLtoRGB([m[0] / 360, m[1] / 100, m[2] / 100]);
-			return [rgb[0], rgb[1], rgb[2]];
-		}
-		return null;
-	}
-
-	var CLOUD_R = 2.5;  // cloud radius, in cells (5-cell glow diameter)
-	var CLOUD_A = 0.55; // base opacity of a single gas pixel's cloud
-	var cloudCache = {}, cloudCachePS = 0;
-
-	// Renderers that tint whole cells with a temp-driven glow/shimmer overlay:
-	// their per-pixel color variation is re-blended by the field pass, so hot
-	// metal, magma and molten liquids show smooth gradients, not mosaic tiles.
-	function isEffectRenderer(el) {
-		if (!el || !el.renderer || typeof renderPresets !== "object" || !renderPresets) return false;
-		return el.renderer === renderPresets.HEATGLOW || el.renderer === renderPresets.MOLTEN;
-	}
-
-	// Which pixels render as clouds in the normal view: gases and glow pixels,
-	// plus custom-renderer energy elements (fire, smoke...) whose renderers
-	// would otherwise draw them as blocky squares.
-	function isCloudy(pixel, info) {
-		if (view !== 1 || pixel.glow === false || !info) return false;
-		if (info.isGas || info.glow || pixel.glow) return true;
-		return !!(info.renderer && info.category === "energy");
-	}
-
-	function cloudSprite(color) {
-		if (Array.isArray(color)) color = color[0]; // some elements list several colors
-		var rgb = parseColorRGB(color);
-		if (!rgb) rgb = [255, 255, 255]; // unparsable color: draw a neutral puff, never a hole
-		// Quantize colors to 16-level buckets: fire's continuously shifting
-		// rgb(...) colors would otherwise overflow the cache every frame and
-		// force dozens of sprite rebuilds — that made fire scenes lag badly.
-		var qr = rgb[0] & ~15, qg = rgb[1] & ~15, qb = rgb[2] & ~15;
-		var key = qr + "," + qg + "," + qb;
-		var sprite = cloudCache[key];
-		if (sprite) return sprite;
-		var r = Math.ceil(CLOUD_R * pixelSize);
-		sprite = document.createElement("canvas");
-		sprite.width = sprite.height = r * 2;
-		var sctx = sprite.getContext("2d");
-		var grad = sctx.createRadialGradient(r, r, 0, r, r, r);
-		grad.addColorStop(0, rgbaStr([qr, qg, qb], 0.8));
-		grad.addColorStop(0.35, rgbaStr([qr, qg, qb], 0.4));
-		grad.addColorStop(0.7, rgbaStr([qr, qg, qb], 0.12));
-		grad.addColorStop(1, rgbaStr([qr, qg, qb], 0));
-		sctx.fillStyle = grad;
-		sctx.fillRect(0, 0, r * 2, r * 2);
-		if (Object.keys(cloudCache).length > 512) cloudCache = {};
-		cloudCache[key] = sprite;
-		return sprite;
-	}
-
-	function drawOneCloud(ctx, g, r) {
-		var sprite = cloudSprite(g[2]);
-		if (!sprite) return false;
-		var a = CLOUD_A * g[3];
-		ctx.globalAlpha = a > 1 ? 1 : a; // canvas ignores globalAlpha values above 1
-		// Overlapping soft circles stack up: a group of nearby gas pixels
-		// fades into one bigger cloud that wraps the whole shape.
-		ctx.drawImage(sprite, (g[0] + 0.5) * pixelSize - r, (g[1] + 0.5) * pixelSize - r, r * 2, r * 2);
-		return true;
-	}
-
-	function drawClouds(ctx) {
-		if (!cloudPixels.length && !glowClouds.length) return;
-		if (cloudCachePS !== pixelSize) { cloudCache = {}; cloudCachePS = pixelSize; }
-		var r = CLOUD_R * pixelSize;
-		for (var i = 0; i < cloudPixels.length; i++) {
-			drawOneCloud(ctx, cloudPixels[i], r);
-		}
-		// Halos pushed by the patched renderers earlier this frame
-		// (e.g. the yellow glow of charged pixels).
-		for (var j = 0; j < glowClouds.length; j++) {
-			if (glowClouds[j].cf !== cloudFrame) continue;
-			drawOneCloud(ctx, glowClouds[j].p, r);
-		}
-		ctx.globalAlpha = 1;
-	}
-
-	// A halo for a pixel whose vanilla look was a translucent effect square
-	// (e.g. the yellow glow of a charged pixel).
-	function pushGlowCloud(x, y, color, strength) {
-		glowClouds.push({ cf: cloudFrame, p: [x, y, color, strength] });
-	}
-
-	// Some elements (like fire) draw through a custom renderer; bypass those
-	// in the normal view too — the clouds replace their rendering entirely.
-	// `el` must be captured per iteration: sharing one `var el` across the
-	// loop made every wrapper test the LAST iterated element, which is why
-	// fire kept slipping through and drawing its blocky vanilla renderer.
-	for (var elName in elements) {
-		(function (el) {
-			if (!el || !el.renderer) return;
-			var orig = el.renderer;
-			el.renderer = function (pixel, ctx) {
-				if (isCloudy(pixel, el)) return;
-				orig(pixel, ctx);
-			};
-		})(elements[elName]);
-	}
-
-	// The game draws gas/glow pixels as a plus shape and charged pixels with
-	// a yellow square in the normal view; skip both — clouds replace them.
-	var origView1Pixel = viewInfo[1].pixel;
-	viewInfo[1].pixel = function (pixel, ctx) {
-		if (view === 1) {
-			var info = elements[pixel.element];
-			if (info && isCloudy(pixel, info)) return;
-			if (pixel.charge && !(info && info.colorOn)) {
-				drawSquare(ctx, pixel.color, pixel.x, pixel.y, undefined,
-					(settings.textures !== 0) ? pixel.alpha : undefined);
-				pushGlowCloud(pixel.x, pixel.y, "rgb(255,255,0)", 1.14);
-				return;
-			}
-		}
-		origView1Pixel(pixel, ctx);
-	};
 
 	renderPostPixel(smoothPost);
+	console.log("nocubes.js v2 loaded (WebGL2). Toggle with noCubes.enabled = false/true");
 })();
