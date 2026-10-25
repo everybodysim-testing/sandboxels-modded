@@ -39,8 +39,10 @@
 		sigmaSmooth: 1.6,    // blur for normal shapes — raise for rounder, lower for tighter
 		sigmaBulk: 3.2,      // blur used to decide "is this a thin feature or a big body"
 		thinBoost: 0.15,     // keeps lone grains visible
-		colorSigma: 0.55,    // per-material color smoothing (low = keeps grain/texture, high = flat)
-		grain: 0.85,         // sub-cell texture sparkle, scaled by how much the material's colors vary
+		colorSigma: 0.35,    // color averaging between neighbors (keep low: textures stay crisp)
+		grain: 0.3,          // extra sub-cell sparkle on smooth materials
+		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
+		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
 		looseRadius: 0.55,   // radius of free-falling grains/droplets (cells)
 		looseMax: 2,         // a movable pixel with <= this many neighbors renders as a free grain
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
@@ -66,7 +68,7 @@
 	var ready = false;
 	var P = {}, T = {}, FB = {};
 	var gameTex = null;
-	var cand = null, cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
+	var prof = null, idLevel = new Uint8Array(32768), cand = null, cellW = 0, cellH = 0, ids = null, cloudArr = null, cloudDirty = false;
 
 	function F(x) { var s = String(x); return /[.e]/.test(s) ? s : s + ".0"; }
 
@@ -75,42 +77,44 @@
 
 	var RB = Math.ceil(3 * CFG.sigmaBulk);
 	var LOOSE = 32768; // id flag: pixel is a free-falling grain, drawn as its own round dot
-	var SIGV = "vec3(" + F(CFG.sigmaFine) + "," + F(CFG.sigmaSmooth) + "," + F(CFG.sigmaBulk) + ")";
+	var SIGV = "vec4(" + F(CFG.sigmaFine) + "," + F(CFG.sigmaSmooth) + "," + F(CFG.sigmaBulk) + "," + F(CFG.sigmaSmooth) + ")";
 
-	// Pass 1: horizontal blur of "is there matter here" at three scales (cell resolution)
+	// Pass 1: horizontal blur of "is there matter here" at three scales, plus the
+	// smoothing level of that matter (4th channel), at cell resolution
 	var FS_OCC_H = HEAD + [
-		"uniform usampler2D uId; uniform ivec2 uN; out vec4 o;",
-		"const vec3 SIG = " + SIGV + ";",
+		"uniform usampler2D uId; uniform sampler2D uProf; uniform ivec2 uN; out vec4 o;",
+		"const vec4 SIG = " + SIGV + ";",
 		"const int R = " + RB + ";",
 		"void main(){",
 		"  ivec2 c = ivec2(gl_FragCoord.xy);",
-		"  vec3 acc = vec3(0.0), ws = vec3(0.0);",
+		"  vec4 acc = vec4(0.0), ws = vec4(0.0);",
 		"  for (int k = -R; k <= R; k++) {",
 		"    int x = clamp(c.x + k, 0, uN.x - 1);",   // clamp = edge replicate => flush with world edge
 		"    uint r = texelFetch(uId, ivec2(x, c.y), 0).r;",
 		"    float v = (r > 0u && r < 32768u) ? 1.0 : 0.0;",
-		"    vec3 w = exp(-float(k*k) / (2.0*SIG*SIG));",
-		"    acc += v*w; ws += w;",
+		"    float lv = texelFetch(uProf, ivec2(x, c.y), 0).r;",
+		"    vec4 w = exp(-float(k*k) / (2.0*SIG*SIG));",
+		"    acc += vec4(v, v, v, v*lv) * w; ws += w;",
 		"  }",
-		"  o = vec4(acc/ws, 1.0);",
+		"  o = acc / ws;",
 		"}"
 	].join("\n");
 
 	// Pass 2: vertical blur
 	var FS_OCC_V = HEAD + [
 		"uniform sampler2D uTmp; uniform ivec2 uN; out vec4 o;",
-		"const vec3 SIG = " + SIGV + ";",
+		"const vec4 SIG = " + SIGV + ";",
 		"const int R = " + RB + ";",
 		"void main(){",
 		"  ivec2 c = ivec2(gl_FragCoord.xy);",
-		"  vec3 acc = vec3(0.0), ws = vec3(0.0);",
+		"  vec4 acc = vec4(0.0), ws = vec4(0.0);",
 		"  for (int k = -R; k <= R; k++) {",
 		"    int y = clamp(c.y + k, 0, uN.y - 1);",
-		"    vec3 v = texelFetch(uTmp, ivec2(c.x, y), 0).rgb;",
-		"    vec3 w = exp(-float(k*k) / (2.0*SIG*SIG));",
+		"    vec4 v = texelFetch(uTmp, ivec2(c.x, y), 0);",
+		"    vec4 w = exp(-float(k*k) / (2.0*SIG*SIG));",
 		"    acc += v*w; ws += w;",
 		"  }",
-		"  o = vec4(acc/ws, 1.0);",
+		"  o = acc / ws;",
 		"}"
 	].join("\n");
 
@@ -237,15 +241,16 @@
 		"}",
 		"",
 		// smoothed color of material `id` at p, bilinear over the 4 nearest cells of that material
-		"vec4 colFor(uint id, vec2 p){",
+		"vec4 colFor(uint id, vec2 p, float soft){",
 		"  gContrast = 0.0;",
 		"  vec2 q = p - 0.5; ivec2 b = ivec2(floor(q)); vec2 f = q - floor(q);",
+		"  vec2 fs = vec2(smoothstep(0.5 - soft, 0.5 + soft, f.x), smoothstep(0.5 - soft, 0.5 + soft, f.y));",
 		"  vec4 acc = vec4(0.0); float ws = 0.0; float lmin = 1.0, lmax = 0.0;",
 		"  for (int k = 0; k < 4; k++) {",
 		"    int dx = k & 1, dy = k >> 1;",
 		"    ivec2 cc = clamp(b + ivec2(dx, dy), ivec2(0), uN - ivec2(1));",
 		"    if (idAt(cc) != id) continue;",
-		"    float w = (dx == 0 ? 1.0 - f.x : f.x) * (dy == 0 ? 1.0 - f.y : f.y);",
+		"    float w = (dx == 0 ? 1.0 - fs.x : fs.x) * (dy == 0 ? 1.0 - fs.y : fs.y);",
 		"    vec4 cv = texelFetch(uCol, cc, 0);",
 		"    float l = dot(cv.rgb, vec3(0.299, 0.587, 0.114));",
 		"    lmin = min(lmin, l); lmax = max(lmax, l);",
@@ -269,26 +274,54 @@
 		"  vec2 p = vec2(gl_FragCoord.x, uCanvasH - gl_FragCoord.y) / uPS;",
 		"  float inside = (p.x < N.x && p.y < N.y) ? 1.0 : 0.0;",
 		"  vec2 pc = clamp(p, vec2(0.0), N - 0.001);",
-		// silhouette: thin features use the tight field, big bodies the smooth one
+		// silhouette: rigid materials hug the pixel grid, soft materials (sand, water) get smooth curves
 		"  vec4 Fd = cubicSample(uField, pc, N);",
+		"  float lvl = clamp(Fd.w / max(Fd.y, 0.02), 0.0, 1.0);",
 		"  float bulk = smoothstep(0.2, 0.4, Fd.z);",
-		"  float G = mix(Fd.x + THIN, Fd.y, bulk);",
+		"  float Gs = mix(Fd.x + THIN, Fd.y, bulk);",
+		"  float Gt = Fd.x + 0.06;",
+		"  float G = mix(Gt, Gs, lvl);",
 		"  float fw = max(fwidth(G), 1e-4);",
 		"  float t = clamp((G - 0.5) / fw + 0.5, 0.0, 1.0);",
 		"  t = t*t*(3.0 - 2.0*t);",
-		"  vec4 res = vec4(0.0);",
-		"  if (t > 0.0) {",
-		"    ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
-		"    uint c0 = idAt(c);",
-		"    bool uni = (c0 != 0u);",
-		"    for (int dy = -1; dy <= 1; dy++) {",
-		"      for (int dx = -1; dx <= 1; dx++) {",
-		"        if (idAt(clamp(c + ivec2(dx, dy), ivec2(0), uN - ivec2(1))) != c0) uni = false;",
+		"  ivec2 c = clamp(ivec2(floor(pc)), ivec2(0), uN - ivec2(1));",
+		"  uint nb[9] = uint[9](0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u);",
+		"  bool nearM = (Fd.x > 0.004) || (t > 0.0);",
+		"  uint c0 = 0u; bool uni = false;",
+		"  if (nearM) {",
+		"    c0 = idAt(c); uni = (c0 != 0u);",
+		"    for (int k = 0; k < 9; k++) {",
+		"      nb[k] = idAt(clamp(c + ivec2(k % 3 - 1, k / 3 - 1), ivec2(0), uN - ivec2(1)));",
+		"      if (nb[k] != c0) uni = false;",
+		"    }",
+		// min/max reshaping: the curve may never cut deeper than `inset` into a pixel,
+		// nor spill further than `growth` outside the pixel grid (tighter for rigid materials)
+		"    float inset = mix(0.03, 0.30, lvl), growth = mix(0.05, 0.55, lvl);",
+		"    float onePx = 1.0 / uPS;",
+		"    float dmin = 9.0, core = 0.0;",
+		"    for (int k = 0; k < 9; k++) {",
+		"      if (nb[k] == 0u) continue;",
+		"      vec2 u = abs(pc - (vec2(c + ivec2(k % 3 - 1, k / 3 - 1)) + 0.5));",
+		"      dmin = min(dmin, length(max(u - 0.5, 0.0)));",
+		"      if (k == 4) {",
+		"        float h = 0.5 - inset; float r = h * 0.5;",
+		"        float sd = length(max(u - (h - r), 0.0)) - r;",
+		"        core = clamp(0.5 - sd / onePx, 0.0, 1.0);",
 		"      }",
 		"    }",
+		"    t = min(t, clamp((growth - dmin) / onePx + 0.5, 0.0, 1.0));",
+		"    t = max(t, core);",
+		"  }",
+		"  vec4 res = vec4(0.0);",
+		"  if (t > 0.0) {",
+		"    float soft = mix(0.03, 0.2, lvl);",
+		"    float warp = mix(0.0, 0.3, lvl);",
+		"    float ss = mix(0.4, SS, lvl);",
+		"    vec2 pw = pc + warp * (vec2(vnoise(p * 1.9), vnoise(p * 1.9 + 7.7)) - 0.5) * 2.0;",
+		"    pw = clamp(pw, vec2(0.0), N - 0.001);",
 		"    vec4 col = vec4(0.0);",
 		"    if (uni) {",
-		"      col = colFor(c0, pc);",
+		"      col = colFor(c0, pw, soft);",
 		"    } else {",
 		"      uint mids[4] = uint[4](0u, 0u, 0u, 0u);",
 		"      float ws[4] = float[4](0.0, 0.0, 0.0, 0.0);",
@@ -299,7 +332,7 @@
 		"          uint qi = idAt(q);",
 		"          if (qi == 0u) continue;",
 		"          vec2 d = vec2(q) + 0.5 - pc;",
-		"          float w = exp(-dot(d, d) / (2.0*SS*SS));",
+		"          float w = exp(-dot(d, d) / (2.0*ss*ss));",
 		"          bool placed = false;",
 		"          for (int k = 0; k < 4; k++) { if (k < n && mids[k] == qi) { ws[k] += w; placed = true; } }",
 		"          if (!placed && n < 4) { mids[n] = qi; ws[n] = w; n++; }",
@@ -310,9 +343,9 @@
 		"        for (int k = 1; k < 4; k++) { if (k < n && ws[k] > ws[i1]) i1 = k; }",
 		"        int i2 = -1; float w2 = 0.0;",
 		"        for (int k = 0; k < 4; k++) { if (k < n && k != i1 && ws[k] > w2) { w2 = ws[k]; i2 = k; } }",
-		"        col = colFor(mids[i1], pc);",
+		"        col = colFor(mids[i1], pw, soft);",
 		"        if (i2 >= 0) {",
-		"          vec4 cb = colFor(mids[i2], pc);",
+		"          vec4 cb = colFor(mids[i2], pw, soft);",
 		"          float mn = (ws[i1] - w2) / (ws[i1] + w2);",
 		"          float kk = max(0.9 / uPS, 0.03);",
 		"          col = mix(cb, col, smoothstep(-kk, kk, mn));",
@@ -320,7 +353,7 @@
 		"      }",
 		"    }",
 		"    float gn = vnoise(p * 2.2) * 0.6 + vnoise(p * 5.1 + 3.7) * 0.4;",
-		"    col.rgb = clamp(col.rgb + (gn - 0.5) * 2.0 * gContrast * GRAIN, 0.0, 1.0);",
+		"    col.rgb = clamp(col.rgb + (gn - 0.5) * 2.0 * gContrast * GRAIN * lvl, 0.0, 1.0);",
 		"    res = vec4(col.rgb * col.a, col.a) * t;",
 		"  }",
 		// free-falling grains / droplets: stable round dots in their own raw color
@@ -423,6 +456,7 @@
 		freeCells();
 		cellW = W; cellH = H;
 		T.id = mkTex(W, H, gl.R16UI, gl.RED_INTEGER, gl.UNSIGNED_SHORT, gl.NEAREST);
+		T.prof = mkTex(W, H, gl.R8, gl.RED, gl.UNSIGNED_BYTE, gl.NEAREST);
 		T.cloud = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
 		T.tmp = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.NEAREST);
 		T.field = mkTex(W, H, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, gl.LINEAR);
@@ -433,6 +467,7 @@
 		FB.cd = mkFbo(T.cd); FB.cc = mkFbo(T.cc);
 		ids = new Uint16Array(W * H);
 		cand = new Int32Array(W * H);
+		prof = new Uint8Array(W * H);
 		cloudArr = new Uint8Array(W * H * 4);
 		cloudDirty = false;
 	}
@@ -506,9 +541,29 @@
 
 	// ---- Per-frame work ---------------------------------------------------
 	var idMap = Object.create(null), nextId = 1;
-	function idFor(name) {
+	// How much a material may be smoothed: 1 = fluid/pile (sand, water...), 0 = rigid (wood, metal...)
+	var RIGID_CATS = { solids: 1, life: 1, machines: 1, weapons: 1, food: 1, tools: 1 };
+	var RIGID_NAMES = /wood|tree|leaf|plant|grass|vine|flower|bush|branch|root|brick|wall|glass|steel|iron|paper|wire|fiber|bone|cloth|metal|copper|gold|silver/;
+	function levelFor(name, info) {
+		var o = CFG.smoothOverrides[name];
+		if (typeof o === "number") return o;
+		var cat = info.category;
+		var beh = info.behavior;
+		var fluidBeh = typeof behaviors === "object" && beh && (beh === behaviors.POWDER || beh === behaviors.POWDER_OLD ||
+			beh === behaviors.LIQUID || beh === behaviors.LIQUID_OLD || beh === behaviors.SUPERFLUID || beh === behaviors.MOLTEN);
+		var fluid = info.state === "liquid" || info.isGas === true || info.movable === true || fluidBeh ||
+			cat === "liquids" || cat === "powders";
+		if (fluid) return 1;
+		if (info.movable === false || RIGID_CATS[cat] || RIGID_NAMES.test(name)) return CFG.structuredLevel;
+		return 0.5;
+	}
+	function idFor(name, info) {
 		var v = idMap[name];
-		if (v === undefined) { v = nextId < 32767 ? nextId++ : 32767; idMap[name] = v; }
+		if (v === undefined) {
+			v = nextId < 32767 ? nextId++ : 32767;
+			idMap[name] = v;
+			idLevel[v] = Math.round(Math.max(0, Math.min(1, levelFor(name, info))) * 255);
+		}
 		return v;
 	}
 
@@ -561,10 +616,12 @@
 					cloudDirty = true;
 					continue;
 				}
-				ids[gi] = idFor(pixel.element);
-				if (info.movable !== false) {
-					var mov = (info.movable === true || info.state === "liquid") ? 1 : 0;
-					cand[nCand++] = gi * 2 + mov;
+				var idn = idFor(pixel.element, info);
+				ids[gi] = idn;
+				var lvb = idLevel[idn];
+				prof[gi] = lvb;
+				if (lvb >= 128) { // only soft materials can become free-falling grains
+					cand[nCand++] = gi * 2 + ((info.movable === true || info.state === "liquid") ? 1 : 0);
 				}
 				if (normalView) { // soft halos replace the game's blocky charge / glow squares
 					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
@@ -596,6 +653,9 @@
 			gl.activeTexture(gl.TEXTURE0);
 			gl.bindTexture(gl.TEXTURE_2D, T.id);
 			gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RED_INTEGER, gl.UNSIGNED_SHORT, ids);
+			gl.bindTexture(gl.TEXTURE_2D, T.prof);
+			gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RED, gl.UNSIGNED_BYTE, prof);
+			gl.activeTexture(gl.TEXTURE0);
 			if (cloudCount) {
 				gl.bindTexture(gl.TEXTURE_2D, T.cloud);
 				gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, cloudArr);
@@ -605,7 +665,7 @@
 
 			// 3) cell-resolution passes (tiny: one fragment per cell)
 			gl.disable(gl.BLEND);
-			pass(P.occH, FB.tmp, W, H, [["uId", T.id]]);
+			pass(P.occH, FB.tmp, W, H, [["uId", T.id], ["uProf", T.prof]]);
 			pass(P.occV, FB.field, W, H, [["uTmp", T.tmp]]);
 			pass(P.col, FB.col, W, H, [["uId", T.id], ["uGame", gameTex]], function (p) {
 				gl.uniform1f(U(p, "uPS"), PS);
