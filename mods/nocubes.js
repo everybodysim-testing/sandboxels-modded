@@ -44,7 +44,8 @@
 		structuredLevel: 0.1, // smoothing for rigid things (wood, metal, plants, walls); 0 = pixel exact, 1 = fully smooth
 		smoothOverrides: {},  // per-element override, e.g. { sand: 1, wood: 0, water: 1 }
 		looseRadius: 0.55,   // radius of free-falling grains/droplets (cells)
-		looseMax: 2,         // a movable pixel with <= this many neighbors renders as a free grain
+		looseSupport: 0.5,   // a pixel renders as a lone grain dot ONLY when nothing touches it
+		                     // (solid/gas contact weight: orth = 1, diagonal = 0.5, through-gas = 0.25)
 		seamSigma: 1.0,      // smoothness of boundaries between two materials
 		cloudSigma: 1.3,     // size of one gas pixel's puff
 		cloudOpacity: 0.55,  // base opacity of one gas pixel
@@ -296,7 +297,7 @@
 		"    }",
 		// min/max reshaping: the curve may never cut deeper than `inset` into a pixel,
 		// nor spill further than `growth` outside the pixel grid (tighter for rigid materials)
-		"    float inset = mix(0.03, 0.30, lvl), growth = mix(0.05, 0.55, lvl);",
+		"    float inset = mix(0.03, 0.22, lvl), growth = mix(0.05, 0.78, lvl);",
 		"    float onePx = 1.0 / uPS;",
 		"    float dmin = 9.0, core = 0.0;",
 		"    for (int k = 0; k < 9; k++) {",
@@ -621,7 +622,7 @@
 				var lvb = idLevel[idn];
 				prof[gi] = lvb;
 				if (lvb >= 128) { // only soft materials can become free-falling grains
-					cand[nCand++] = gi * 2 + ((info.movable === true || info.state === "liquid") ? 1 : 0);
+					cand[nCand++] = gi;
 				}
 				if (normalView) { // soft halos replace the game's blocky charge / glow squares
 					if (pixel.charge && !info.colorOn) { putCloud(gi, "rgb(255,255,0)", 0.9, true); cloudDirty = true; }
@@ -629,21 +630,28 @@
 				}
 			}
 
-			// 1b) free-falling grains/droplets (few neighbors) become stable round dots
-			//     instead of merging into blobs that pop in and out as they move
+			// 1b) a soft pixel only becomes an isolated grain dot when the smoothed shape
+			//     does NOT pass over its center — i.e. NOTHING touches it: no solid,
+			//     no diagonal contact, not even a gas pixel in between. Any contact keeps
+			//     it inside the smoothed silhouette, so grains resting on a pile (even on
+			//     a slope, even with just 1-2 contacts) never show up as lone outlier
+			//     dots, and pixels stop flickering in/out as their neighbor count wobbles.
 			for (var ci = 0; ci < nCand; ci++) {
-				var cg = cand[ci] >> 1, cm = cand[ci] & 1;
-				var cx = cg % W, cy = (cg / W) | 0, cnt = 0;
+				var cg = cand[ci];
+				var cx = cg % W, cy = (cg / W) | 0, sup = 0;
 				for (var oy = -1; oy <= 1; oy++) {
 					var ny = cy + oy;
 					if (ny < 0 || ny >= H) continue;
 					for (var ox = -1; ox <= 1; ox++) {
 						if (ox === 0 && oy === 0) continue;
 						var nx = cx + ox;
-						if (nx >= 0 && nx < W && ids[ny * W + nx] !== 0) cnt++;
+						if (nx < 0 || nx >= W) continue;
+						var ngi = ny * W + nx;
+						if (ids[ngi] !== 0) sup += (ox === 0 || oy === 0) ? 1 : 0.5;
+						else if (cloudArr[ngi * 4 + 3] !== 0) sup += 0.25; // gas pixel bridging the gap
 					}
 				}
-				if (cnt <= (cm ? CFG.looseMax : 1)) ids[cg] |= LOOSE;
+				if (sup < CFG.looseSupport) ids[cg] |= LOOSE;
 			}
 
 			// 2) upload
