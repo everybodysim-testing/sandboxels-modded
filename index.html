@@ -14326,6 +14326,10 @@ keybinds["Backspace"] = ()=>{ // Select previous element
 // If the localStorage key "enabledMods" exists, load it as an array.
 // If it doesn't exist, create an empty array.
 enabledMods = localStorage.getItem("enabledMods") ? JSON.parse(localStorage.getItem("enabledMods")) : [];
+// Realistic liquid physics ships with this build: always load it, nothing to enable.
+// Drop the superseded duplicate so it cannot run on top of the solver.
+enabledMods = enabledMods.filter(function (m) { return !/^mods\/realistic(\s|%20)fluids\.js$/.test(m); });
+if (enabledMods.indexOf("mods/realistic_fluids.js") === -1) { enabledMods.push("mods/realistic_fluids.js"); }
 enabledModNames = [];
 loadedMods = [];
 queuedMods = [];

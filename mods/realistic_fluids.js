@@ -321,14 +321,27 @@ function substep(dt) {
       }
     }
 
-    // buoyancy seeding: denser liquid directly above lighter liquid swaps (Rayleigh-Taylor)
-    const below = cellAt(p.x, p.y + 1);
-    if (CFG.stratification > 0 && below && below !== BORDER && isLiq(below) && below.element !== p.element || (below && below !== BORDER && isLiq(below) && Math.abs((below.temp || 20) - (p.temp || 20)) > 0.5)) {
-      const ra = rho(p), rb = rho(below);
-      if (ra > rb * 1.001 && Math.random() < Math.min(1, CFG.stratification * dt * (ra - rb) / rb / mu)) {
-        swapPixels(p, below);
-        p.rfy = 0; below.rfy = 0;
-        continue;
+    // buoyancy (Rayleigh-Taylor): a heavier liquid over a lighter one swaps down, and
+    // a lighter liquid under a heavier one bubbles up, so oil/water separate in both
+    // directions instead of only waiting for the heavy pixel above to push down.
+    if (CFG.stratification > 0) {
+      const below = cellAt(p.x, p.y + 1);
+      if (below && below !== BORDER && isLiq(below)) {
+        const ra = rho(p), rb = rho(below);
+        if (ra > rb * 1.001 && Math.random() < Math.min(1, CFG.stratification * dt * (ra - rb) / rb / mu)) {
+          swapPixels(p, below);
+          p.rfy = 0; below.rfy = 0;
+          continue;
+        }
+      }
+      const above = cellAt(p.x, p.y - 1);
+      if (above && above !== BORDER && isLiq(above)) {
+        const ra = rho(p), rb = rho(above);
+        if (rb > ra * 1.001 && Math.random() < Math.min(1, CFG.stratification * dt * (rb - ra) / ra / mu)) {
+          swapPixels(p, above);
+          p.rfy = 0; above.rfy = 0;
+          continue;
+        }
       }
     }
 
@@ -356,47 +369,44 @@ function isSolidCell(c) {
   const i = elements[c.element];
   return !!i && i.state !== "gas" && i.state !== "plasma" && !(i.state === "liquid" && managed[c.element] !== undefined);
 }
-// move one cell: empty -> move, gas -> swap, otherwise blocked
+// Move one cell through the game's own tryMove, so reactions (water + acid, ...),
+// density swaps (oil over water), onCollide/onMoveInto and relation moves keep
+// working for the liquids the solver drives. A blocked move feeds back into the
+// particle velocity instead of silently pressing against the wall.
 function tryMove(p, dx, dy) {
   const nx = p.x + dx, ny = p.y + dy;
-  const c = cellAt(nx, ny);
-  if (!c) { movePixel(p, nx, ny); return true; }
-  if (c === BORDER) { if (dx) p.rvx = 0; else p.rvy = 0; return false; }
-  const ci = elements[c.element];
-  if (ci && (ci.state === "gas" || ci.state === "plasma")) { swapPixels(p, c); return true; }
-  if (!isLiq(c)) { if (dx) p.rvx = 0; else p.rvy = 0; }      // solid wall: kill that velocity component
+  if (outOfBounds(nx, ny)) { if (dx) p.rvx = 0; else p.rvy = 0; return false; }
+  if (window.tryMove(p, nx, ny)) return true;
+  if (!isLiq(cellAt(nx, ny))) { if (dx) p.rvx = 0; else p.rvy = 0; }
   return false;
 }
 
 /* ---------------- installing on every liquid ----------------------- */
-const NOMOVE = ["XX|XX|XX", "XX|XX|XX", "XX|XX|XX"];
 const managed = {};
 
-function stripMovement(beh) {      // drop movement tokens, keep reactions / spawning / etc.
-  if (!Array.isArray(beh)) return NOMOVE;
-  for (let i = 0; i < beh.length; i++) if (typeof beh[i] !== "string") return NOMOVE;
-  return beh.map(function (row) {
-    return row.split("|").map(function (cell) {
-      const toks = cell.split(" AND ").filter(function (t) { return !/^(M1|M2|SW|BO)\b/.test(t.trim()); });
-      return toks.length ? toks.join(" AND ") : "XX";
-    }).join("|");
-  });
+// The engine turns a function `behavior` into `tick` while the elements are built,
+// so a liquid's movement lives in `tick` (its `behavior` is already gone by then).
+// Replace the tick with one that keeps everything except movement: heat, burning,
+// electricity, staining and reactions still run; the solver decides where liquid goes.
+function liquidTick(pixel) {
+  if (pixel.del === true || pixel.start === pixelTicks) return;
+  doDefaults(pixel);
 }
 function applyTo(name) {
   const info = elements[name];
-  if (!info || info.state !== "liquid" || managed[name] || SKIP.has(name)) return;
-  managed[name] = { behavior: info.behavior, tick: info.tick, movable: info.movable };
-  info.behavior = stripMovement(info.behavior);
-  info.movable = true;                // movement is done by the solver, not per-pixel ticks
+  if (!info || info.state !== "liquid" || SKIP.has(name)) return;
+  if (info.tick === liquidTick) return;          // already solver-driven
+  // The engine finalizes every element a second time after the load hooks run,
+  // which puts the original tick back; keep the vanilla tick so disable() can
+  // restore it and install ours again whenever it has been replaced.
+  if (!managed[name]) managed[name] = { tick: info.tick };
+  info.tick = liquidTick;
 }
 function applyAll() { for (const name in elements) applyTo(name); }
 function revertAll() {
   for (const name in managed) {
     const m = managed[name], info = elements[name];
-    if (info) {
-      info.behavior = m.behavior;
-      if (m.movable === undefined) delete info.movable; else info.movable = m.movable;
-    }
+    if (info) info.tick = m.tick;
     delete managed[name];
   }
 }
@@ -414,7 +424,9 @@ runAfterLoad(function () {
 });
 runEveryTick(function () {
   if (!CFG.enabled) return;
-  if (typeof pixelTicks !== "undefined" && pixelTicks % 90 === 0) applyAll();
+  // install on the first ticks (the engine re-finalizes elements after load) and
+  // refresh now and then so liquids added by later mods are picked up too
+  if (typeof pixelTicks !== "undefined" && (pixelTicks < 3 || pixelTicks % 90 === 0)) applyAll();
   if (typeof currentPixels === "undefined") return;
   const dt = 1 / CFG.substeps;
   for (let s = 0; s < CFG.substeps; s++) substep(dt);
