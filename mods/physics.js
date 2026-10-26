@@ -23,7 +23,7 @@
    ========================================================================== */
 (function () {
 
-var G = 0.09, MAXV = 3.0, MAXW = 0.22, HOLD = 25;
+var G = 0.09, MAXV = 3.0, MAXW = 0.22, HOLD = 12;
 var BODIES = {}, FALL = {}, PC = {};
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, dirtyA = [], dirtyS = new Set();
@@ -56,7 +56,7 @@ function physOf(id){
   var hard = e.hardness !== undefined ? e.hardness : 0.3 + 0.6*r1;
   var bounce = 0.03 + 0.27*r2, fric = 0.25 + 0.55*r3;
   if (/rubber|slime|jelly|gummy|tire|ball|bounc/.test(id)){ bounce = 0.7 + 0.25*r2; fric = 0.85; hard = Math.max(hard, 0.7); }
-  else if (/ice|rime/.test(id)){ bounce = 0.2 + 0.1*r2; fric = 0.02; hard = Math.min(hard, 0.3); }
+  else if (/ice|rime/.test(id)){ bounce = 0.08; fric = 0.1; hard = Math.min(hard, 0.3); }
   else if (/glass|porcelain|crystal|ceramic|pyrite|ruby|sapphire|quartz/.test(id)){ bounce = 0.05 + 0.15*r2; hard = Math.min(hard, 0.25); fric = 0.3 + 0.2*r3; }
   else if (/steel|titan|tungsten|adamant|iron/.test(id)){ bounce = 0.02 + 0.05*r2; fric = 0.3 + 0.15*r3; hard = Math.max(hard, 0.93); }
   else if (/copper|gold|silver|lead|zinc|tin|nickel|alumin|brass|bronze|platin|metal|cobalt|chrom/.test(id)){ bounce = 0.02 + 0.08*r2; fric = 0.28 + 0.2*r3; hard = Math.max(hard, 0.75); }
@@ -101,7 +101,7 @@ function calc(b, keepWorld){
 function makeBody(cells, ang, vx, vy, w, gf){
   var b = { id: baseId + (idc++), cells: cells, x: 0, y: 0, a: ang || 0, vx: vx || 0, vy: vy || 0,
     w: w || 0, gf: gf || 1, com: { x:0, y:0 }, proxies: new Map(), dirty: false, sleep: 0, sleepT: 0,
-    rest: 0, wet: 0, debris: [], dead: false, stuck: false, touch: false, plow: 0, hold: 0, frozen: false, needSync: false };
+    rest: 0, sinkLeft: 4, wet: 0, debris: [], dead: false, stuck: false, touch: false, plow: 0, hold: 0, frozen: false, needSync: false };
   calc(b); BODIES[b.id] = b; return b;
 }
 function raster(b, x, y, a){
@@ -128,7 +128,7 @@ function blocker(b, gx, gy, speed, cov){
   if (e.state === "liquid" || e.state === "gas") return (cov !== undefined && cov < COV_SOFT) ? 4 : 0;
   if (e.movable === true && e.category !== "tools"){          // sand, gravel, plants, critters...
     var ratio = (b.m / b.cells.size) / Math.max(1, e.density || 1000);
-    if (ratio > 1.5 || (ratio > 1.0 && speed > 2.0)) return (cov !== undefined && cov < COV_SOFT) ? 4 : 3;
+    if ((ratio > 1.5 || (ratio > 1.0 && speed > 2.0)) && b.sinkLeft > 0) return (cov !== undefined && cov < COV_SOFT) ? 4 : 3;   // sinks at most ~4 pixels
     return 1;                                                 // lighter bodies rest ON the powder
   }
   return 1;
@@ -191,7 +191,7 @@ function impulse(b, c, n){
   }
   var vn = (vcx - ovx)*n.x + (vcy - ovy)*n.y;
   if (vn >= -0.01) return 0;
-  var e = Math.abs(vn) < 0.25 ? 0 : (o ? Math.min(b.bounce, o.bounce) : b.bounce);   // resting contact: no bounce
+  var e = Math.abs(vn) < 0.6 ? 0 : (o ? Math.min(b.bounce, o.bounce) : b.bounce);   // resting contact: no bounce
   var rn = rx*n.y - ry*n.x, orn = orx*n.y - ory*n.x;
   var j = -(1+e)*vn/(1/b.m + rn*rn/b.I + invm2 + orn*orn*invI2);
   b.vx += j*n.x/b.m; b.vy += j*n.y/b.m; b.w += rn*j/b.I;
@@ -258,7 +258,14 @@ function moveSub(b, h){
     while (c.n > 0 && moved < 8){ nx += n.x*0.08; ny += n.y*0.08; moved++; c = contacts(b, nx, ny, na, spd); }
     if (c.n === 0){ ok = true; break; }
   }
-  if (ok){ b.x = nx; b.y = ny; b.a = na; b.w *= 0.995; } else b.stuck = true;
+  if (ok){ b.x = nx; b.y = ny; b.a = na; b.w *= 0.995; }
+  else {                                                   // clipped: push out of the overlap instead of freezing
+    var n0 = contacts(b, b.x, b.y, b.a, spd);
+    if (n0.n > 0){
+      var nn = normalAt(b, n0, spd); b.x += nn.x*0.2; b.y += nn.y*0.2;
+      var vn0 = b.vx*nn.x + b.vy*nn.y; if (vn0 < 0){ b.vx -= vn0*nn.x; b.vy -= vn0*nn.y; }
+    } else b.stuck = true;
+  }
 }
 function escape(b){
   for (var r = 1; r <= 5; r++) for (var d = 0; d < 8; d++){
@@ -491,10 +498,12 @@ function stepBody(b){
 
   var rr = Math.sqrt(b.vx*b.vx + b.vy*b.vy) + Math.abs(b.w)*b.rad;
   var n = Math.min(8, Math.max(1, Math.ceil(rr/0.45))), h = 1/n;
-  b.touch = false; b.plow = 0;
+  b.touch = false; b.plow = 0; var y0 = b.y;
   for (var s = 0; s < n; s++){ moveSub(b, h); if (!b.cells.size){ b.dirty = true; break; } }
   if (b.plow > 0){ var d = Math.max(0.25, 1 - 0.1*b.plow/n); b.vx *= d; b.vy *= d; b.w *= d; }   // heavy bodies sink through powder slowly
   if (!b.cells.size){ killBody(b); return; }
+  if (b.plow > 0){ b.sinkLeft -= Math.abs(b.y - y0); b.lt3 = pixelTicks; }
+  else if (pixelTicks - (b.lt3 || -99) > 20 && !b.touch) b.sinkLeft = 4;
   var spd = Math.sqrt(b.vx*b.vx + b.vy*b.vy);
   if (b.touch && b.wet === 0){                     // ground contact: friction decides how long it slides
     var damp = 1 - 0.09*Math.max(0.07, b.fric);
@@ -512,7 +521,7 @@ function stepBody(b){
   }
   carry(b);
   if (pixelTicks - (b.lt2 || -99) < 8 && b.wet === 0 && spd < 0.12 && Math.abs(b.w) < 0.015 && !b.dirty) b.rest++; else b.rest = 0;
-  if (b.rest > 30){ b.sleep = 1; b.sleepT = 0; b.vx = 0; b.vy = 0; b.w = 0; b.rest = 0; }
+  if (false){ b.sleep = 1; b.sleepT = 0; b.vx = 0; b.vy = 0; b.w = 0; b.rest = 0; }
 }
 function carry(b){                                    // loose solids on top + water inside hulls ride along
   if (Math.abs(b.vx) + Math.abs(b.vy) + Math.abs(b.w)*b.rad < 0.03) return;
