@@ -1,10 +1,12 @@
 /*
- * bestModManager.js  -  a full remake of the Sandboxels mod manager.
+ * bestModManager.js  v2  -  a full remake of the Sandboxels mod manager.
  *
- * Does NOT modify the game's code. It only:
+ * Does NOT modify the game's files. It only:
  *   1. intercepts the "Mods" button so it opens a new blank page instead of the Mods panel,
  *   2. builds a profile-based mod manager in that page (profiles, Browse tab, import/export),
- *   3. writes the active profile's mods into the game's own `enabledMods` setting.
+ *   3. loads the active profile's mods itself, from the R74n GitHub repos via the jsDelivr CDN,
+ *      registering each one under its normal "mods/<file>.js" name so the ~85 official mods that
+ *      check enabledMods / dependOn() by that name keep working.
  *
  * Install once: open the normal Mods panel, paste this file's full URL, press Enter, reload.
  * After that the Mods button opens this manager. Shift+click Mods to open the original panel.
@@ -16,86 +18,94 @@
   if (window.__bmmGameSide) return;
   window.__bmmGameSide = true;
 
-  var VERSION = '1.0.0';
+  var VERSION = '2.0.0';
   var SELF_RE = /bestModManager/i;
+  var OFFICIAL_RE = /^https?:\/\/cdn\.jsdelivr\.net\/gh\/R74nCom\/[^\/@]+@[^\/]+\/mods\/[^\/]+$/i;
 
   /* ---------------------------------------------------------------------------
-   * Stylesheet for the manager page (Sandboxels-like: dark, yellow accent)
+   * Stylesheet for the manager page. Mirrors the game's look: black background,
+   * grey --theme borders, pixel fonts. Purple is only used to highlight things.
    * ------------------------------------------------------------------------- */
   var BMM_CSS = [
-    ':root{--bg:#161616;--panel:#222;--panel2:#2b2b2b;--line:#3a3a3a;--text:#f2f2f2;--dim:#9b9b9b;',
-    '--accent:#e6d577;--accentText:#1a1a1a;--btn:#383838;--btntext:#fff;--danger:#7a2b2b;--font:Arial}',
+    ':root{--theme:rgb(127,127,127);--theme-dark:rgb(63,63,63);--theme-darker:rgb(25,25,25);--theme-darkest:rgb(0,0,0);--theme-darkest2:rgb(0,0,0);',
+    '--hl:#a77bff;--hl-dark:#2b2050;--hl-line:#6f4fd1;--text:#fff;--dim:#a0a0a0;--danger:#6a2323;--ok:#5ee05e;--err:#ff6b6b;',
+    '--font:"VT323",Arial,sans-serif;--px:"Press Start 2P","VT323",monospace}',
     '*{box-sizing:border-box}',
-    'html,body{margin:0;background:var(--bg);color:var(--text);font-family:var(--font),Arial,sans-serif;font-size:15px}',
+    '::selection{background:var(--hl-line)}',
+    'html,body{margin:0;background:var(--theme-darkest2);color:var(--text);font-family:var(--font);font-size:21px}',
     'button,input,textarea{font:inherit;color:inherit}',
-    'h2{margin:0;font-size:22px}',
+    'h2{margin:0;font-size:1.5em;font-weight:normal;text-decoration:underline}',
     '#head{position:sticky;top:0;z-index:20}',
-    '.top{display:flex;align-items:center;gap:8px;padding:10px 16px;background:#0d0d0d;border-bottom:2px solid var(--line);flex-wrap:wrap}',
-    '.brand{font-weight:700;color:var(--accent);margin-right:12px;letter-spacing:.5px}',
+    '.top{display:flex;align-items:center;gap:8px;padding:10px 16px;background:var(--theme-darkest);border-bottom:2px solid var(--theme);flex-wrap:wrap}',
+    '.brand{font-family:var(--px);font-size:12px;margin-right:14px;color:var(--text)}',
     '.grow{flex:1}',
-    '.tab,.btn{background:var(--btn);color:var(--btntext);border:0;border-radius:6px;padding:8px 14px;cursor:pointer}',
-    '.tab:hover,.btn:hover{filter:brightness(1.3)}',
-    '.tab.on{background:var(--accent);color:var(--accentText);font-weight:700}',
-    '.btn.accent{background:var(--accent);color:var(--accentText);font-weight:700}',
-    '.btn.danger{background:var(--danger)}',
-    '.btn.big{padding:14px 22px;font-size:17px}',
-    '.btn.sm{padding:5px 10px;font-size:13px}',
-    '.btn:disabled{opacity:.5;cursor:default;filter:none}',
-    '.pulse{animation:pulse 1.2s infinite}',
-    '@keyframes pulse{50%{box-shadow:0 0 0 5px rgba(230,213,119,.35)}}',
-    '.banner{display:flex;gap:10px;align-items:center;padding:10px 16px;background:#3d3716;border-bottom:2px solid var(--accent)}',
-    '.banner b{color:var(--accent)}',
+    '.btn,.tab{background:var(--theme-darkest2);color:var(--text);border:2px solid var(--theme);border-radius:5px;padding:3px 13px;cursor:pointer;transition:transform .15s}',
+    '.btn:hover,.tab:hover{filter:brightness(1.35)}',
+    '.btn:active,.tab:active{transform:scale(.95)}',
+    '.tab.on{background:var(--hl-dark);border-color:var(--hl);color:#fff}',
+    '.btn.primary{background:rgb(85,85,85);border-color:rgb(160,160,160)}',
+    '.btn.hl{background:var(--hl-dark);border-color:var(--hl)}',
+    '.btn.danger{background:var(--danger);border-color:#a34a4a}',
+    '.btn.big{padding:8px 22px;font-size:1.25em}',
+    '.btn.sm{padding:0 9px;font-size:.9em}',
+    '.btn:disabled{opacity:.45;cursor:not-allowed;filter:none;transform:none}',
+    '.pulse{animation:pulse 1.2s infinite;border-color:var(--hl)}',
+    '@keyframes pulse{50%{box-shadow:0 0 0 4px rgba(167,123,255,.4)}}',
+    '.banner{display:flex;gap:10px;align-items:center;padding:8px 16px;background:var(--hl-dark);border-bottom:2px solid var(--hl)}',
+    '.banner b{color:var(--hl)}',
     'main{max-width:980px;margin:0 auto;padding:18px 16px 80px}',
     '.pagehead{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap}',
-    '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:12px}',
-    '.card{display:flex;gap:12px;align-items:center;background:var(--panel);border:2px solid var(--line);border-radius:8px;padding:12px;cursor:pointer;position:relative}',
-    '.card:hover{border-color:#666}',
-    '.card.active{border-color:var(--accent)}',
-    '.cardname{font-weight:700;font-size:16px}',
-    '.badge{background:var(--accent);color:var(--accentText);border-radius:4px;font-size:11px;font-weight:700;padding:2px 6px;margin-left:6px}',
-    '.badge.dim{background:#444;color:#ddd}',
+    '.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:12px}',
+    '.card{display:flex;gap:12px;align-items:center;background:var(--theme-darker);border:2px solid var(--theme-dark);border-radius:6px;padding:12px;cursor:pointer;position:relative}',
+    '.card:hover{border-color:var(--theme)}',
+    '.card.active{border-color:var(--hl)}',
+    '.cardname{font-size:1.2em}',
+    '.badge{background:var(--hl);color:#12082b;border-radius:3px;font-size:.7em;padding:0 6px;margin-left:6px;vertical-align:middle}',
+    '.badge.dim{background:var(--theme-dark);color:#ddd}',
     '.card .badge{position:absolute;top:8px;right:8px;margin:0}',
-    '.ico{flex:none;width:48px;height:48px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:22px;color:#fff}',
-    '.ico.lg{width:56px;height:56px}',
-    '.meta{color:var(--dim);font-size:13px;margin-top:2px;word-break:break-all}',
-    '.empty{text-align:center;color:var(--dim);padding:40px 10px;line-height:1.7}',
-    '.hero{display:flex;gap:16px;align-items:center;background:var(--panel);border:2px solid var(--line);border-radius:10px;padding:16px;flex-wrap:wrap}',
-    '.hero.active{border-color:var(--accent)}',
+    '.ico{flex:none;width:46px;height:46px;border-radius:5px;display:flex;align-items:center;justify-content:center;font-family:var(--px);font-size:16px;color:#fff;border:2px solid rgba(255,255,255,.2)}',
+    '.ico.lg{width:56px;height:56px;font-size:20px}',
+    '.meta{color:var(--dim);font-size:.85em;margin-top:2px;word-break:break-all}',
+    '.st{font-size:.85em;margin-top:2px}.st.ok{color:var(--ok)}.st.err{color:var(--err)}.st.wait{color:var(--dim)}',
+    '.empty{text-align:center;color:var(--dim);padding:40px 10px;line-height:1.5}',
+    '.hero{display:flex;gap:16px;align-items:center;background:var(--theme-darker);border:2px solid var(--theme-dark);border-radius:8px;padding:16px;flex-wrap:wrap}',
+    '.hero.active{border-color:var(--hl)}',
     '.hero-main{flex:1;min-width:200px}',
-    '.title{width:100%;background:transparent;border:2px solid transparent;border-radius:6px;font-size:26px;font-weight:700;padding:2px 6px;margin-left:-6px}',
-    '.title:hover,.title:focus{border-color:var(--line);background:#1a1a1a;outline:none}',
+    '.title{width:100%;background:transparent;border:2px solid transparent;border-radius:5px;font-size:1.7em;padding:0 6px;margin-left:-6px}',
+    '.title:hover,.title:focus{border-color:var(--theme);background:var(--theme-darkest);outline:none}',
     '.hero-actions{display:flex;gap:10px;flex-wrap:wrap}',
-    '.note{margin:12px 0 0;padding:10px 12px;background:#2a2a2a;border-left:4px solid var(--accent);border-radius:4px;color:#ddd;font-size:14px}',
+    '.note{margin:12px 0 0;padding:8px 12px;background:var(--theme-darker);border-left:4px solid var(--hl);border-radius:4px;color:#ddd}',
     '.toolbar{display:flex;gap:8px;margin:16px 0 10px;flex-wrap:wrap}',
-    '.inp{flex:1;min-width:180px;background:#101010;border:2px solid var(--line);border-radius:6px;padding:9px 12px}',
-    '.inp:focus{outline:none;border-color:var(--accent)}',
+    '.inp{flex:1;min-width:180px;background:var(--theme-darkest);border:2px solid var(--theme);border-radius:5px;padding:4px 10px}',
+    '.inp:focus{outline:none;border-color:var(--hl);box-shadow:0 0 0 2px rgba(167,123,255,.3)}',
+    '.inp.paste{border-color:var(--hl-line);background:#120d26}',
     '.list{display:flex;flex-direction:column;gap:8px}',
-    '.row{display:flex;gap:12px;align-items:center;background:var(--panel);border:2px solid var(--line);border-radius:8px;padding:10px 12px}',
-    '.row.off{opacity:.55}',
+    '.row{display:flex;gap:12px;align-items:center;background:var(--theme-darker);border:2px solid var(--theme-dark);border-radius:6px;padding:9px 12px}',
+    '.row:hover{border-color:var(--theme)}',
+    '.row.off{opacity:.5}',
     '.info{flex:1;min-width:0}',
-    '.name{font-weight:700}',
-    '.desc{margin-top:6px;padding:8px 10px;background:#161616;border-radius:6px;color:#cfcfcf;font-size:13px;white-space:pre-wrap;word-break:break-word}',
+    '.name{font-size:1.15em}',
+    '.desc{margin-top:6px;padding:8px 10px;background:var(--theme-darkest);border-left:3px solid var(--hl);color:#cfcfcf;font-size:.85em;white-space:pre-wrap;word-break:break-word}',
     '.acts{display:flex;gap:6px;align-items:center;flex:none;flex-wrap:wrap;justify-content:flex-end}',
     '.sw{position:relative;width:44px;height:24px;display:inline-block;margin:0 4px}',
     '.sw input{opacity:0;width:0;height:0;position:absolute}',
-    '.sw span{position:absolute;inset:0;background:#555;border-radius:24px;cursor:pointer;transition:.15s}',
-    '.sw span:before{content:"";position:absolute;width:18px;height:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.15s}',
-    '.sw input:checked+span{background:var(--accent)}',
-    '.sw input:checked+span:before{transform:translateX(20px);background:#222}',
-    '.foot{color:var(--dim);font-size:12px;margin-top:14px;text-align:center}',
-    '#modal{display:none}',
-    '#modal.on{display:block}',
-    '.mback{position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:40}',
-    '.mbox{position:fixed;z-index:41;top:50%;left:50%;transform:translate(-50%,-50%);width:min(520px,92vw);max-height:86vh;overflow:auto;background:var(--panel);border:2px solid var(--accent);border-radius:10px;padding:18px}',
-    '.mbox h3{margin:0 0 12px;font-size:18px}',
+    '.sw span{position:absolute;inset:0;background:var(--theme-dark);border:2px solid var(--theme);border-radius:24px;cursor:pointer;transition:.15s}',
+    '.sw span:before{content:"";position:absolute;width:14px;height:14px;left:3px;top:3px;background:#ddd;border-radius:50%;transition:.15s}',
+    '.sw input:checked+span{background:var(--hl-line);border-color:var(--hl)}',
+    '.sw input:checked+span:before{transform:translateX(20px);background:#fff}',
+    '.foot{color:var(--dim);font-size:.8em;margin-top:14px;text-align:center}',
+    '#modal{display:none}#modal.on{display:block}',
+    '.mback{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:40}',
+    '.mbox{position:fixed;z-index:41;top:50%;left:50%;transform:translate(-50%,-50%);width:min(520px,92vw);max-height:86vh;overflow:auto;background:var(--theme-darker);border:3px solid var(--hl);border-radius:8px;padding:18px}',
+    '.mbox h3{margin:0 0 10px;font-size:1.3em;font-weight:normal;text-decoration:underline}',
     '.mbox .btn{margin:4px 4px 4px 0}',
-    '.mbox textarea{width:100%;min-height:100px;background:#101010;border:2px solid var(--line);border-radius:6px;padding:8px;resize:vertical}',
+    '.mbox textarea{width:100%;min-height:100px;background:var(--theme-darkest);border:2px solid var(--theme);border-radius:5px;padding:8px;resize:vertical}',
+    '.mbox textarea:focus{outline:none;border-color:var(--hl)}',
     '.pick{display:flex;width:100%;justify-content:space-between;align-items:center;text-align:left;margin:6px 0 !important}',
-    '.srcrow{display:flex;gap:8px;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--line)}',
     '.mbox .inp{margin:4px 0}',
     '#toasts{position:fixed;bottom:16px;left:50%;transform:translateX(-50%);z-index:60;display:flex;flex-direction:column;gap:8px;align-items:center;pointer-events:none}',
-    '.toast{background:#101010;border:2px solid var(--accent);border-radius:8px;padding:10px 16px;max-width:90vw}',
-    '.toast.err{border-color:#e85d5d}'
+    '.toast{background:var(--theme-darkest);border:2px solid var(--hl);border-radius:6px;padding:6px 16px;max-width:90vw}',
+    '.toast.err{border-color:var(--err)}'
   ].join('\n');
 
   /* ---------------------------------------------------------------------------
@@ -107,13 +117,16 @@
     'use strict';
     window.__bmmReady = true;
 
-    var STORE = 'bmm_v1', REGKEY = 'bmm_registry_v1', ENABLED = 'enabledMods', LOADED = 'bmm_loaded', SELFKEY = 'bmm_self';
+    var STORE = 'bmm_v1', REGKEY = 'bmm_registry_v1', ENABLED = 'enabledMods', LOADED = 'bmm_loaded', SELFKEY = 'bmm_self', STATUS = 'bmm_status';
     var SELF_RE = /bestModManager/i;
+    var OFFICIAL_RE = /^https?:\/\/cdn\.jsdelivr\.net\/gh\/R74nCom\/[^\/@]+@[^\/]+\/mods\/[^\/]+$/i;
     var PAGE = 40;
-    var DEFAULT_SOURCES = [
+    /* Mods are only ever listed from R74n's own repositories. */
+    var SOURCES = [
       { repo: 'R74nCom/Sandboxels-Mods', path: 'mods', branch: 'main' },
-      { repo: 'everybodysim/sandboxels-modded', path: 'mods', branch: 'main' }
+      { repo: 'R74nCom/sandboxels', path: 'mods', branch: 'main' }
     ];
+    var SIG = 'r74n-v2';
 
     /* ---------- helpers ---------- */
     var $ = function (s, r) { return (r || document).querySelector(s); };
@@ -134,7 +147,7 @@
     var hue = function (s) { var h = 0; for (var i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) >>> 0; return h % 360; };
     var fmtSize = function (b) { return !b ? '' : b < 1024 ? b + ' B' : b < 1048576 ? (b / 1024).toFixed(1) + ' KB' : (b / 1048576).toFixed(1) + ' MB'; };
     var okUrl = function (u) {
-      return typeof u === 'string' && (/^https?:\/\/[^\s]+\.js(\?[^\s]*)?$/i.test(u) || /^[\w\-./]+\.js$/i.test(u));
+      return typeof u === 'string' && (/^https?:\/\/[^\s]+\.js(\?[^\s]*)?$/i.test(u) || /^[\w\-. \/]+\.js$/i.test(u));
     };
     var byName = function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : a.name.toLowerCase() > b.name.toLowerCase() ? 1 : 0; };
     function readJSON(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
@@ -142,24 +155,26 @@
       try { localStorage.setItem(k, JSON.stringify(v)); return true; }
       catch (e) { if (!silent) toast('Could not save (storage full or blocked).', 'err'); return false; }
     }
+    /* The name the game (and other mods) see in enabledMods for a managed mod. */
+    function entryOf(m) { return OFFICIAL_RE.test(m.url) ? 'mods/' + m.file : m.url; }
 
     /* ---------- data ---------- */
     function mkProfile(name) { return { id: uid(), name: name, createdAt: Date.now(), mods: [] }; }
-    function modFromUrl(u) {
+    function modFromEntry(u) {
       var f = fileOf(u);
-      return { id: uid(), name: pretty(f), file: f, url: u, source: 'imported', ref: '', size: 0, enabled: true };
+      return { id: uid(), name: pretty(f), file: f, url: u, source: /^https?:/i.test(u) ? 'imported' : 'local', ref: '', size: 0, enabled: true };
     }
     var db = readJSON(STORE, null);
     if (!db || !Array.isArray(db.profiles)) db = migrate();
-    if (!Array.isArray(db.sources) || !db.sources.length) db.sources = DEFAULT_SOURCES.map(function (s) { return Object.assign({}, s); });
+    delete db.sources; /* v1 allowed custom sources; v2 is R74n-only */
 
     function migrate() {
-      var d = { version: 1, activeProfileId: null, lastExport: 0, profiles: [], sources: DEFAULT_SOURCES.map(function (s) { return Object.assign({}, s); }) };
+      var d = { version: 2, activeProfileId: null, lastExport: 0, profiles: [] };
       var cur = readJSON(ENABLED, []);
       var others = (Array.isArray(cur) ? cur : []).filter(function (x) { return typeof x === 'string' && !SELF_RE.test(x); });
       if (others.length) {
         var p = mkProfile('Imported');
-        p.mods = others.map(modFromUrl);
+        p.mods = others.map(modFromEntry);
         d.profiles.push(p);
         d.activeProfileId = p.id;
       }
@@ -174,29 +189,46 @@
       return name;
     }
 
-    /* Write the active profile's enabled mods into the game's enabledMods (manager always stays in). */
+    /* Everything any profile manages (both the native name and the raw url), so we can keep it
+       out of the game's own enabledMods: the manager loads these itself. */
+    function managedSet() {
+      var s = {};
+      db.profiles.forEach(function (p) { p.mods.forEach(function (m) { s[entryOf(m)] = 1; s[m.url] = 1; }); });
+      return s;
+    }
+    function desiredEntries() {
+      var p = activeProfile(), out = [];
+      if (p) p.mods.forEach(function (m) { if (!m.enabled || SELF_RE.test(m.url)) return; var e = entryOf(m); if (out.indexOf(e) < 0) out.push(e); });
+      return out;
+    }
+    /* The game's enabledMods only needs the manager itself (plus any mods we don't manage). */
     function applyEnabled() {
-      var list = [];
       var self = localStorage.getItem(SELFKEY) || boot.selfUrl || '';
+      var cur = readJSON(ENABLED, []); if (!Array.isArray(cur)) cur = [];
+      var man = managedSet(), list = [];
       if (self) list.push(self);
-      else readJSON(ENABLED, []).forEach(function (x) { if (typeof x === 'string' && SELF_RE.test(x)) list.push(x); });
-      var p = activeProfile();
-      if (p) p.mods.forEach(function (m) { if (m.enabled && list.indexOf(m.url) < 0) list.push(m.url); });
+      else cur.forEach(function (x) { if (typeof x === 'string' && SELF_RE.test(x) && list.indexOf(x) < 0) list.push(x); });
+      cur.forEach(function (x) { if (typeof x !== 'string' || SELF_RE.test(x) || man[x] || list.indexOf(x) >= 0) return; list.push(x); });
       try { localStorage.setItem(ENABLED, JSON.stringify(list)); }
       catch (e) { toast('Could not write the game\'s mod list.', 'err'); }
     }
     function save() { writeJSON(STORE, db); applyEnabled(); }
     function pending() {
-      var a = localStorage.getItem(ENABLED) || '[]', b = localStorage.getItem(LOADED);
-      if (b == null) return false;
-      try { return JSON.stringify(JSON.parse(a)) !== JSON.stringify(JSON.parse(b)); } catch (e) { return a !== b; }
+      var b = readJSON(LOADED, null); if (!Array.isArray(b)) return false;
+      return JSON.stringify(desiredEntries()) !== JSON.stringify(b);
+    }
+    function statusFor(m) {
+      if (!m.enabled || db.activeProfileId == null || pending()) return null;
+      var st = readJSON(STATUS, null);
+      return st && st.items ? st.items[entryOf(m)] || null : null;
     }
     function installedIn(url) {
       return db.profiles.filter(function (p) { return p.mods.some(function (m) { return m.url === url; }); }).map(function (p) { return p.name; });
     }
 
-    /* ---------- registry (mods from GitHub via jsDelivr CDN) ---------- */
+    /* ---------- registry (R74n mods from GitHub via the jsDelivr CDN) ---------- */
     var registry = readJSON(REGKEY, null);
+    if (registry && registry.sig !== SIG) registry = null;
     var regState = registry && registry.items && registry.items.length ? 'ready' : 'idle';
     var regError = '';
     function indexRegistry() {
@@ -206,24 +238,22 @@
     indexRegistry();
 
     async function listFiles(repo, ref) {
+      var enc = encodeURIComponent(ref);
       var tries = [
         async function () {
-          var r = await fetch('https://data.jsdelivr.com/v1/packages/gh/' + repo + '@' + encodeURIComponent(ref) + '?structure=flat');
+          var r = await fetch('https://data.jsdelivr.com/v1/packages/gh/' + repo + '@' + enc + '?structure=flat');
           if (!r.ok) throw new Error('jsDelivr ' + r.status);
-          var j = await r.json();
-          return (j.files || []).map(function (f) { return { name: f.name, size: f.size }; });
+          return ((await r.json()).files || []).map(function (f) { return { name: f.name, size: f.size }; });
         },
         async function () {
-          var r = await fetch('https://data.jsdelivr.com/v1/package/gh/' + repo + '@' + encodeURIComponent(ref) + '/flat');
+          var r = await fetch('https://data.jsdelivr.com/v1/package/gh/' + repo + '@' + enc + '/flat');
           if (!r.ok) throw new Error('jsDelivr ' + r.status);
-          var j = await r.json();
-          return (j.files || []).map(function (f) { return { name: f.name, size: f.size }; });
+          return ((await r.json()).files || []).map(function (f) { return { name: f.name, size: f.size }; });
         },
         async function () {
-          var r = await fetch('https://api.github.com/repos/' + repo + '/git/trees/' + encodeURIComponent(ref) + '?recursive=1');
+          var r = await fetch('https://api.github.com/repos/' + repo + '/git/trees/' + enc + '?recursive=1');
           if (!r.ok) throw new Error('GitHub ' + r.status);
-          var j = await r.json();
-          return (j.tree || []).filter(function (t) { return t.type === 'blob'; }).map(function (t) { return { name: '/' + t.path, size: t.size }; });
+          return ((await r.json()).tree || []).filter(function (t) { return t.type === 'blob'; }).map(function (t) { return { name: '/' + t.path, size: t.size }; });
         }
       ];
       var err;
@@ -241,31 +271,38 @@
             var rr = await fetch('https://data.jsdelivr.com/v1/packages/gh/' + src.repo + '/resolved?specifier=' + encodeURIComponent(br));
             if (rr.ok) { var rj = await rr.json(); if (/^[0-9a-f]{40}$/i.test(rj.version || '')) ref = rj.version; }
           } catch (e) { /* fall back to branch name */ }
-          var files = (await listFiles(src.repo, ref)).filter(function (f) { return /\.js$/i.test(f.name) && !/\.min\.js$/i.test(f.name) && !SELF_RE.test(f.name); });
-          var prefix = src.path ? '/' + String(src.path).replace(/^\/+|\/+$/g, '') + '/' : '';
-          var scoped = prefix ? files.filter(function (f) { return f.name.indexOf(prefix) === 0; }) : files;
-          if (!scoped.length) scoped = files;
-          if (!scoped.length) throw new Error('no .js files found');
-          return scoped.map(function (f) {
+          var prefix = '/' + String(src.path).replace(/^\/+|\/+$/g, '') + '/';
+          var files = (await listFiles(src.repo, ref)).filter(function (f) {
+            return f.name.indexOf(prefix) === 0 && f.name.indexOf('/', prefix.length) < 0 && /\.js$/i.test(f.name) && !/\.min\.js$/i.test(f.name) && !SELF_RE.test(f.name);
+          });
+          if (!files.length) throw new Error('no mods found in /' + src.path);
+          return files.map(function (f) {
             var file = f.name.split('/').pop();
-            return { name: pretty(file), file: file, url: 'https://cdn.jsdelivr.net/gh/' + src.repo + '@' + ref + f.name, source: src.repo, ref: ref === br ? br : ref.slice(0, 7), size: f.size || 0 };
+            return {
+              name: pretty(file), file: file,
+              url: 'https://cdn.jsdelivr.net/gh/' + src.repo + '@' + ref + f.name.split('/').map(encodeURIComponent).join('/'),
+              source: src.repo, ref: ref === br ? br : ref.slice(0, 7), size: f.size || 0
+            };
           });
         } catch (e) { err = e; }
       }
       throw err;
     }
     async function ensureRegistry(force) {
-      var sig = JSON.stringify(db.sources);
-      if (!force && registry && registry.sig === sig && Date.now() - registry.fetchedAt < 864e5 && registry.items.length) { regState = 'ready'; return; }
+      if (!force && registry && registry.sig === SIG && Date.now() - registry.fetchedAt < 864e5 && registry.items.length) { regState = 'ready'; return; }
       if (regState === 'loading') return;
       regState = 'loading'; regError = ''; refresh();
-      var items = [], errs = [];
-      await Promise.all(db.sources.map(async function (s) {
-        try { items.push.apply(items, await fetchSource(s)); } catch (e) { errs.push(s.repo + ' (' + (e.message || e) + ')'); }
+      var results = await Promise.all(SOURCES.map(async function (s) {
+        try { return { items: await fetchSource(s) }; } catch (e) { return { err: s.repo + ' (' + (e.message || e) + ')' }; }
       }));
+      var seen = {}, items = [], errs = [];
+      results.forEach(function (r) { /* source order = priority; same filename is listed once */
+        if (r.err) { errs.push(r.err); return; }
+        r.items.forEach(function (it) { var k = it.file.toLowerCase(); if (!seen[k]) { seen[k] = 1; items.push(it); } });
+      });
       if (items.length) {
         items.sort(byName);
-        registry = { fetchedAt: Date.now(), sig: sig, items: items };
+        registry = { sig: SIG, fetchedAt: Date.now(), items: items };
         writeJSON(REGKEY, registry, true);
         regState = 'ready';
         if (errs.length) toast('Some sources failed: ' + errs.join(', '), 'err');
@@ -274,18 +311,66 @@
       } else { regState = 'error'; regError = errs.join('; ') || 'No mods found.'; }
       indexRegistry(); ui.shown = PAGE; refresh();
     }
+    var texts = {};
+    async function getText(url) {
+      if (texts[url] !== undefined) return texts[url];
+      var r = await fetch(url); if (!r.ok) throw new Error('HTTP ' + r.status);
+      return (texts[url] = await r.text());
+    }
     var descs = {};
     async function loadDesc(it) {
       if (descs[it.url] !== undefined) return;
       descs[it.url] = null; refresh();
       try {
-        var r = await fetch(it.url); if (!r.ok) throw new Error('HTTP ' + r.status);
-        var t = await r.text();
+        var t = await getText(it.url);
         var m = t.match(/^\s*(\/\*[\s\S]*?\*\/|(?:\/\/.*(?:\r?\n|$))+)/);
         var d = m ? m[1].replace(/^\/\*+|\*+\/$/g, '').replace(/^\s*\/\/ ?/gm, '').replace(/^\s*\* ?/gm, '').trim() : '';
         descs[it.url] = (d ? d.slice(0, 500) : 'No description in the file header.') + (m && d.length > 500 ? '…' : '');
       } catch (e) { descs[it.url] = 'Could not load details (' + (e.message || e) + ').'; }
       refresh();
+    }
+
+    /* Mods that force-load other mods (dependOn(..., true)) or insert a library into enabledMods
+       need those mods installed too. Find them in the source so we can add them automatically. */
+    function findDeps(text) {
+      var out = {}, re = /dependOn\(/g, m;
+      while ((m = re.exec(text))) {
+        var i = re.lastIndex, end = i + 4000, depth = 1, args = [], cur = '', q = null;
+        for (; i < text.length && i < end; i++) {
+          var c = text[i];
+          if (q) { cur += c; if (c === '\\') { cur += text[++i] || ''; } else if (c === q) q = null; continue; }
+          if (c === '"' || c === "'" || c === '`') { q = c; cur += c; continue; }
+          if (c === '(' || c === '[' || c === '{') { depth++; cur += c; continue; }
+          if (c === ')' || c === ']' || c === '}') { depth--; if (depth === 0) { args.push(cur); break; } cur += c; continue; }
+          if (c === ',' && depth === 1) { args.push(cur); cur = ''; continue; }
+          cur += c;
+        }
+        if (args.length >= 3) {
+          var n = args[0].trim().match(/^["'`]([^"'`]+\.js)["'`]$/);
+          if (n && args[2].trim() === 'true') out[n[1].replace(/^mods\//, '')] = 1;
+        }
+      }
+      var lib = text.match(/libraryMod\s*=\s*["'`](?:mods\/)?([^"'`]+\.js)["'`]/);
+      if (lib && /enabledMods\.splice\([\s\S]{0,80}?libraryMod/.test(text)) out[lib[1]] = 1;
+      return Object.keys(out);
+    }
+    async function addDependencies(pid, item) {
+      if (!OFFICIAL_RE.test(item.url) || !registry || !registry.items) return;
+      try {
+        var deps = findDeps(await getText(item.url)), added = [], missing = [], p = P(pid);
+        if (!p) return;
+        deps.forEach(function (d) {
+          var low = d.toLowerCase();
+          var hit = registry.items.find(function (it) { return it.file === d; }) || registry.items.find(function (it) { return it.file.toLowerCase() === low; });
+          if (!hit) { missing.push(d); return; }
+          if (p.mods.some(function (m) { return m.url === hit.url || m.file === hit.file; })) return;
+          p.mods.splice(Math.max(0, p.mods.findIndex(function (m) { return m.url === item.url; })), 0,
+            { id: uid(), name: hit.name, file: hit.file, url: hit.url, source: hit.source, ref: hit.ref, size: hit.size, enabled: true });
+          added.push(hit.name);
+        });
+        if (added.length) { save(); toast(item.name + ' needs ' + added.join(', ') + ' — added too.'); refresh(); }
+        if (missing.length) toast(item.name + ' also needs ' + missing.join(', ') + ' (not found).', 'err');
+      } catch (e) { /* dependency check is best-effort */ }
     }
 
     /* ---------- UI state ---------- */
@@ -295,7 +380,7 @@
     function toast(msg, kind) {
       var box = $('#toasts'); if (!box) return;
       var t = document.createElement('div'); t.className = 'toast' + (kind === 'err' ? ' err' : ''); t.textContent = msg;
-      box.appendChild(t); setTimeout(function () { t.remove(); }, kind === 'err' ? 5000 : 2800);
+      box.appendChild(t); setTimeout(function () { t.remove(); }, kind === 'err' ? 5000 : 3200);
     }
     function openModal(html, cb) {
       var m = $('#modal'); m.innerHTML = '<div class="mback" data-a="closeModal"></div><div class="mbox">' + html + '</div>';
@@ -305,7 +390,7 @@
     function closeModal() { var m = $('#modal'); m.classList.remove('on'); m.innerHTML = ''; modalCb = null; }
     function askName(title, initial, okLabel, cb) {
       openModal('<h3>' + esc(title) + '</h3><input class="inp" type="text" data-val maxlength="60" value="' + esc(initial) + '" style="width:100%">' +
-        '<div style="margin-top:10px"><button class="btn accent" data-a="modalOk">' + esc(okLabel) + '</button><button class="btn" data-a="closeModal">Cancel</button></div>', cb);
+        '<div style="margin-top:10px"><button class="btn primary" data-a="modalOk">' + esc(okLabel) + '</button><button class="btn" data-a="closeModal">Cancel</button></div>', cb);
       var i = $('#modal [data-val]'); if (i) i.select();
     }
     function confirmModal(text, okLabel, cb) {
@@ -316,14 +401,14 @@
     function renderTop() {
       var pend = pending(), t = ui.target ? P(ui.target) : null;
       $('#head').innerHTML =
-        '<div class="top"><div class="brand">&#9638; MOD MANAGER</div>' +
+        '<div class="top"><div class="brand">MOD MANAGER</div>' +
         '<button class="tab ' + (ui.view === 'browse' ? '' : 'on') + '" data-a="tab" data-v="profiles">Profiles</button>' +
         '<button class="tab ' + (ui.view === 'browse' ? 'on' : '') + '" data-a="tab" data-v="browse">Browse Mods</button>' +
         '<div class="grow"></div>' +
-        '<button class="btn ' + (pend ? 'accent pulse' : '') + '" data-a="reload">' + (pend ? 'Reload game to apply changes' : 'Reload game') + '</button></div>' +
-        (t ? '<div class="banner">Installing into profile <b>' + esc(t.name) + '</b><div class="grow"></div><button class="btn sm accent" data-a="doneTarget">Done</button></div>' : '');
+        '<button class="btn ' + (pend ? 'hl pulse' : '') + '" data-a="reload">' + (pend ? 'Reload game to apply changes' : 'Reload game') + '</button></div>' +
+        (t ? '<div class="banner">Installing into profile <b>' + esc(t.name) + '</b><div class="grow"></div><button class="btn sm primary" data-a="doneTarget">Done</button></div>' : '');
     }
-    function icon(name, cls) { return '<div class="ico ' + (cls || '') + '" style="background:hsl(' + hue(name) + ' 40% 36%)">' + esc((name[0] || '?').toUpperCase()) + '</div>'; }
+    function icon(name, cls) { return '<div class="ico ' + (cls || '') + '" style="background:hsl(' + hue(name) + ' 22% 30%)">' + esc((name[0] || '?').toUpperCase()) + '</div>'; }
 
     function vProfiles() {
       var cards = db.profiles.map(function (p) {
@@ -335,7 +420,7 @@
       var back = db.lastExport ? 'Last backup: ' + Math.floor((Date.now() - db.lastExport) / 864e5) + ' day(s) ago.' : 'You have not exported a backup yet.';
       return '<div class="pagehead"><h2>Profiles</h2><div class="grow"></div>' +
         '<button class="btn" data-a="importModal">Import</button><button class="btn" data-a="exportAll">Export all</button>' +
-        '<button class="btn accent" data-a="newProfile">+ New profile</button></div>' +
+        '<button class="btn primary" data-a="newProfile">+ New profile</button></div>' +
         (cards ? '<div class="grid">' + cards + '</div>' :
           '<div class="empty">No profiles yet.<br>Create one, or open <b>Browse Mods</b> and install something &mdash; a profile is made for you.</div>') +
         '<div class="foot">Only one profile can be active at a time. ' + back + ' Export to keep profiles if you clear browser data.</div>';
@@ -348,12 +433,18 @@
         '<section class="hero ' + (on ? 'active' : '') + '">' + icon(p.name, 'lg') +
         '<div class="hero-main"><input class="title" data-c="rename" value="' + esc(p.name) + '" maxlength="60" title="Click to rename">' +
         '<div class="meta">' + p.mods.length + ' mod' + (p.mods.length === 1 ? '' : 's') + ' &middot; ' + en + ' enabled' + (on ? ' <span class="badge">ACTIVE</span>' : ' <span class="badge dim">DISABLED</span>') + '</div></div>' +
-        '<div class="hero-actions"><button class="btn big ' + (on ? 'danger' : 'accent') + '" data-a="toggleProfile">' + (on ? 'Disable profile' : 'Enable profile') + '</button>' +
+        '<div class="hero-actions"><button class="btn big ' + (on ? 'danger' : 'primary') + '" data-a="toggleProfile">' + (on ? 'Disable profile' : 'Enable profile') + '</button>' +
         '<button class="btn big" data-a="addContent">+ Add content</button></div></section>' +
         (on ? '' : '<div class="note">This profile is disabled, so none of its mods will load. Press <b>Enable profile</b> to use it (this turns off whichever profile is active).</div>') +
         '<div class="toolbar"><input class="inp" id="pfilter" data-i="pfilter" placeholder="Filter mods in this profile…" value="' + esc(ui.pfilter) + '">' +
         '<button class="btn" data-a="duplicate">Duplicate</button><button class="btn" data-a="exportOne">Export</button><button class="btn danger" data-a="deleteProfile">Delete</button></div>' +
         '<div class="list" id="plist"></div>';
+    }
+    function statusHtml(m) {
+      var s = statusFor(m); if (!s) return '';
+      if (s.state === 'loaded') return '<div class="st ok">&#10003; Loaded in game</div>';
+      if (s.state === 'loading') return '<div class="st wait">Loading…</div>';
+      return '<div class="st err" title="' + esc(s.msg || '') + '">&#10007; ' + (s.state === 'failed' ? 'Failed to download' : 'Error: ' + esc((s.msg || 'see console').slice(0, 90))) + '</div>';
     }
     function renderPList() {
       var box = $('#plist'), p = P(ui.pid); if (!box || !p) return;
@@ -364,7 +455,7 @@
       box.innerHTML = rows.map(function (x) {
         var m = x.m;
         return '<div class="row ' + (m.enabled ? '' : 'off') + '">' + icon(m.name) +
-          '<div class="info"><div class="name">' + esc(m.name) + '</div><div class="meta">' + esc(m.file) + ' &middot; ' + esc(m.source) + (m.ref ? ' @ ' + esc(m.ref) : '') + (m.size ? ' &middot; ' + fmtSize(m.size) : '') + '</div></div>' +
+          '<div class="info"><div class="name">' + esc(m.name) + '</div><div class="meta">' + esc(entryOf(m)) + ' &middot; ' + esc(m.source) + (m.ref ? ' @ ' + esc(m.ref) : '') + (m.size ? ' &middot; ' + fmtSize(m.size) : '') + '</div>' + statusHtml(m) + '</div>' +
           '<div class="acts"><button class="btn sm" data-a="up" data-id="' + m.id + '" title="Load earlier">&#9650;</button><button class="btn sm" data-a="down" data-id="' + m.id + '" title="Load later">&#9660;</button>' +
           '<label class="sw" title="Enable / disable"><input type="checkbox" data-c="toggleMod" data-id="' + m.id + '" ' + (m.enabled ? 'checked' : '') + '><span></span></label>' +
           '<button class="btn sm danger" data-a="removeMod" data-id="' + m.id + '">Remove</button></div></div>';
@@ -372,9 +463,9 @@
     }
 
     function vBrowse() {
-      return '<div class="pagehead"><h2>Browse Mods</h2><div class="grow"></div><button class="btn" data-a="sourcesModal">Sources</button><button class="btn" data-a="refreshReg">Refresh list</button></div>' +
-        '<div class="toolbar"><input class="inp" id="q" data-i="query" placeholder="Search mods…" value="' + esc(ui.query) + '" autocomplete="off"></div>' +
-        '<div class="toolbar"><input class="inp" id="custom" placeholder="…or paste a mod URL (https://…/mod.js) to add it directly"><button class="btn" data-a="addCustom">Add URL</button></div>' +
+      return '<div class="pagehead"><h2>Browse Mods</h2><div class="grow"></div><button class="btn" data-a="refreshReg">Refresh list</button></div>' +
+        '<div class="toolbar"><input class="inp" id="q" data-i="query" placeholder="Search R74n mods…" value="' + esc(ui.query) + '" autocomplete="off"></div>' +
+        '<div class="toolbar"><input class="inp paste" id="custom" placeholder="Paste a mod link (https://…/mod.js) to add it directly"><button class="btn hl" data-a="addCustom">Add link</button></div>' +
         '<div class="list" id="results"></div>';
     }
     function searchResults() {
@@ -390,7 +481,7 @@
       var have = registry && registry.items && registry.items.length;
       if (regState === 'loading' && !have) { box.innerHTML = '<div class="empty">Loading the mod list from GitHub…</div>'; return; }
       if (!have) {
-        box.innerHTML = '<div class="empty">' + (regState === 'error' ? 'Could not load the mod list.<br>' + esc(regError) + '<br><br><button class="btn accent" data-a="refreshReg">Retry</button>' : 'Loading…') + '</div>';
+        box.innerHTML = '<div class="empty">' + (regState === 'error' ? 'Could not load the mod list.<br>' + esc(regError) + '<br><br><button class="btn primary" data-a="refreshReg">Retry</button>' : 'Loading…') + '</div>';
         return;
       }
       var all = searchResults(), slice = all.slice(0, ui.shown), tgt = ui.target ? P(ui.target) : null;
@@ -402,9 +493,9 @@
           (where.length ? ' <span class="badge dim">IN: ' + esc(where.join(', ')) + '</span>' : '') + '</div>' +
           '<div class="meta">' + esc(it.file) + ' &middot; ' + esc(it.source) + (it.size ? ' &middot; ' + fmtSize(it.size) : '') + '</div>' + d + '</div>' +
           '<div class="acts"><button class="btn sm" data-a="details" data-i="' + it.i + '">' + (ui.open[it.url] ? 'Hide' : 'Details') + '</button>' +
-          '<button class="btn accent" data-a="install" data-i="' + it.i + '" ' + (inT ? 'disabled' : '') + '>' + (inT ? 'Added' : 'Install') + '</button></div></div>';
+          '<button class="btn primary" data-a="install" data-i="' + it.i + '" ' + (inT ? 'disabled' : '') + '>' + (inT ? 'Added' : 'Install') + '</button></div></div>';
       }).join('') + (all.length > slice.length ? '<button class="btn" data-a="more" style="margin:8px auto">Show more (' + (all.length - slice.length) + ' left)</button>' : '') +
-        '<div class="foot">' + all.length + ' mod' + (all.length === 1 ? '' : 's') + ' &middot; mods run with full access to the game &mdash; only install ones you trust.</div>';
+        '<div class="foot">' + all.length + ' mod' + (all.length === 1 ? '' : 's') + ' from R74n&rsquo;s repositories &middot; mods run with full access to the game.</div>';
     }
 
     function renderMain() {
@@ -433,7 +524,9 @@
       p.mods.push({ id: uid(), name: item.name, file: item.file, url: item.url, source: item.source || 'custom', ref: item.ref || '', size: item.size || 0, enabled: true });
       save();
       toast('Installed ' + item.name + ' into ' + p.name + (db.activeProfileId === p.id ? '' : ' (profile is disabled)'));
-      refresh(); return true;
+      refresh();
+      addDependencies(pid, item);
+      return true;
     }
     function startInstall(item) {
       if (ui.target && P(ui.target)) return addMod(ui.target, item);
@@ -448,7 +541,7 @@
           return '<button class="btn pick" data-a="pickProfile" data-id="' + p.id + '"><span>' + esc(p.name) + '</span><span class="meta">' + p.mods.length + ' mods' + (db.activeProfileId === p.id ? ' &middot; ACTIVE' : '') + '</span></button>';
         }).join('') +
         '<div style="margin-top:12px" class="meta">Or create a new profile:</div><input class="inp" type="text" data-val id="newp" placeholder="Profile name" maxlength="60" style="width:100%">' +
-        '<div style="margin-top:8px"><button class="btn accent" data-a="pickNew">Create &amp; install</button><button class="btn" data-a="closeModal">Cancel</button></div>');
+        '<div style="margin-top:8px"><button class="btn primary" data-a="pickNew">Create &amp; install</button><button class="btn" data-a="closeModal">Cancel</button></div>');
     }
 
     /* ---------- import / export ---------- */
@@ -461,7 +554,7 @@
       exportPayload = profilePayload(list);
       var code = 'BMM1:' + btoa(unescape(encodeURIComponent(JSON.stringify(exportPayload))));
       openModal('<h3>Export ' + esc(label) + '</h3><p class="meta">Save the file somewhere safe &mdash; it lets you restore your profiles after clearing data or on another device.</p>' +
-        '<button class="btn accent" data-a="dlExport">Download file</button><button class="btn" data-a="copyCode">Copy share code</button>' +
+        '<button class="btn primary" data-a="dlExport">Download file</button><button class="btn hl" data-a="copyCode">Copy share code</button>' +
         '<textarea id="codebox" readonly>' + esc(code) + '</textarea><div style="margin-top:8px"><button class="btn" data-a="closeModal">Close</button></div>');
     }
     function parseImport(text) {
@@ -539,8 +632,8 @@
       details: function (el) {
         var it = registry.items[+el.dataset.i]; if (!it) return;
         ui.open[it.url] = !ui.open[it.url];
-        if (ui.open[it.url]) loadDesc(it); else refresh();
-        if (ui.open[it.url] && descs[it.url] !== undefined) refresh();
+        if (ui.open[it.url]) loadDesc(it);
+        refresh();
       },
       more: function () { ui.shown += PAGE; refresh(); },
       refreshReg: function () { ensureRegistry(true); },
@@ -551,10 +644,10 @@
       },
       addCustom: function () {
         var u = (($('#custom') || {}).value || '').trim();
-        if (!okUrl(u)) { toast('Enter a link ending in .js (or a mods/ filename).', 'err'); return; }
+        if (!okUrl(u)) { toast('Enter a link ending in .js.', 'err'); return; }
         if (SELF_RE.test(u)) { toast('That is this manager — it is always installed.', 'err'); return; }
         var f = fileOf(u); $('#custom').value = '';
-        startInstall({ name: pretty(f), file: f, url: u, source: 'custom', ref: '', size: 0 });
+        startInstall({ name: pretty(f), file: f, url: u, source: 'custom link', ref: '', size: 0 });
       },
       exportAll: function () { if (!db.profiles.length) return toast('No profiles to export.', 'err'); exportModal(db.profiles, 'all profiles'); },
       exportOne: function () { var p = P(ui.pid); if (p) exportModal([p], '"' + p.name + '"'); },
@@ -574,24 +667,10 @@
       importModal: function () {
         openModal('<h3>Import profiles</h3><p class="meta">Imported profiles are added as new profiles &mdash; nothing is overwritten. Only import files from people you trust: mods run with full access to the game.</p>' +
           '<input type="file" accept=".json,application/json" data-c="importFile"><div class="meta" style="margin:10px 0 4px">…or paste a share code / JSON:</div>' +
-          '<textarea data-val placeholder="BMM1:…"></textarea><div style="margin-top:8px"><button class="btn accent" data-a="doImport">Import</button><button class="btn" data-a="closeModal">Cancel</button></div>');
+          '<textarea data-val placeholder="BMM1:…"></textarea><div style="margin-top:8px"><button class="btn primary" data-a="doImport">Import</button><button class="btn" data-a="closeModal">Cancel</button></div>');
       },
-      doImport: function () { doImport(($('#modal [data-val]') || {}).value); },
-      sourcesModal: function () {
-        openModal('<h3>Mod sources</h3><p class="meta">GitHub repos searched in Browse. Mods are loaded through the jsDelivr CDN.</p>' +
-          db.sources.map(function (s, i) { return '<div class="srcrow"><span>' + esc(s.repo) + ' <span class="meta">/' + esc(s.path || '') + ' @' + esc(s.branch || 'main') + '</span></span><button class="btn sm danger" data-a="rmSource" data-i="' + i + '">Remove</button></div>'; }).join('') +
-          '<div style="margin-top:12px" class="meta">Add a source:</div><input class="inp" id="srepo" placeholder="owner/repo" style="width:100%"><input class="inp" id="spath" placeholder="folder (default: mods)" style="width:49%"> <input class="inp" id="sbranch" placeholder="branch (default: main)" style="width:49%">' +
-          '<div style="margin-top:8px"><button class="btn accent" data-a="addSource">Add source</button><button class="btn" data-a="resetSources">Reset to defaults</button><button class="btn" data-a="closeModal">Close</button></div>');
-      },
-      rmSource: function (el) { db.sources.splice(+el.dataset.i, 1); afterSources(); },
-      addSource: function () {
-        var repo = (($('#srepo') || {}).value || '').trim().replace(/^https?:\/\/github\.com\//i, '').replace(/\/+$/, '');
-        if (!/^[\w.\-]+\/[\w.\-]+$/.test(repo)) { toast('Use the form owner/repo.', 'err'); return; }
-        db.sources.push({ repo: repo, path: (($('#spath') || {}).value || 'mods').trim(), branch: (($('#sbranch') || {}).value || 'main').trim() }); afterSources();
-      },
-      resetSources: function () { db.sources = DEFAULT_SOURCES.map(function (s) { return Object.assign({}, s); }); afterSources(); }
+      doImport: function () { doImport(($('#modal [data-val]') || {}).value); }
     };
-    function afterSources() { writeJSON(STORE, db); closeModal(); ensureRegistry(true); A.sourcesModal(); }
     function moveMod(id, d) {
       var p = P(ui.pid); if (!p) return;
       var i = p.mods.findIndex(function (m) { return m.id === id; }), j = i + d;
@@ -621,9 +700,7 @@
 
     /* ---------- boot ---------- */
     var root = document.documentElement;
-    if (boot.font) root.style.setProperty('--font', boot.font);
-    if (boot.btnBg) root.style.setProperty('--btn', boot.btnBg);
-    if (boot.btnColor) root.style.setProperty('--btntext', boot.btnColor);
+    if (boot.theme) Object.keys(boot.theme).forEach(function (k) { root.style.setProperty(k, boot.theme[k]); });
     document.title = 'Mod Manager - Sandboxels';
     document.body.innerHTML = '<div id="head"></div><main id="view"></main><div id="modal"></div><div id="toasts"></div>';
 
@@ -643,49 +720,186 @@
     window.addEventListener('storage', function (e) {
       if (e.key === STORE) { db = readJSON(STORE, db); if (ui.view === 'profile' && !P(ui.pid)) ui.view = 'profiles'; renderTop(); renderMain(); }
       else if (e.key === ENABLED || e.key === LOADED) renderTop();
+      else if (e.key === STATUS) { renderTop(); if (ui.view === 'profile') renderPList(); }
     });
     renderTop(); renderMain();
   }
 
   /* ---------------------------------------------------------------------------
-   * Game side: record state, hook the Mods button, open the manager page.
+   * Game side: load the active profile's mods the way the game itself would.
    * ------------------------------------------------------------------------- */
   var selfSrc = '';
   try { selfSrc = (document.currentScript && document.currentScript.src) || ''; } catch (e) { /* ignore */ }
   if (!selfSrc) {
     var ss = document.scripts;
-    for (var i = 0; i < ss.length; i++) { if (ss[i].src && SELF_RE.test(ss[i].src)) { selfSrc = ss[i].src; break; } }
+    for (var si = 0; si < ss.length; si++) { if (ss[si].src && SELF_RE.test(ss[si].src)) { selfSrc = ss[si].src; break; } }
   }
 
-  try {
-    var cur = [];
-    try { cur = JSON.parse(localStorage.getItem('enabledMods') || '[]'); } catch (e) { cur = []; }
-    if (!Array.isArray(cur)) cur = [];
-    var entry = '';
-    for (var k = 0; k < cur.length; k++) { if (typeof cur[k] === 'string' && SELF_RE.test(cur[k])) { entry = cur[k]; break; } }
-    if (!entry && selfSrc) { /* self-heal: the manager must always stay enabled */
-      entry = selfSrc; cur.unshift(entry);
-      localStorage.setItem('enabledMods', JSON.stringify(cur));
-    }
-    if (entry) localStorage.setItem('bmm_self', entry);
-    localStorage.setItem('bmm_loaded', JSON.stringify(cur)); /* what the game loaded this session */
-  } catch (e) { console.warn('[bestModManager] could not record state', e); }
+  function readJSON(k, d) { try { var v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } }
+  function entryOf(m) { return OFFICIAL_RE.test(m.url) ? 'mods/' + m.file : m.url; }
+  function lastSeg(e) { var p = String(e).split('/'); return p[p.length - 1]; }
 
+  var nativeSetItem = null;
+  function bootGameSide() {
+    var db = readJSON('bmm_v1', null);
+    var cur = readJSON('enabledMods', []); if (!Array.isArray(cur)) cur = [];
+
+    /* the manager must always stay enabled */
+    var selfEntry = '';
+    for (var k = 0; k < cur.length; k++) { if (typeof cur[k] === 'string' && SELF_RE.test(cur[k])) { selfEntry = cur[k]; break; } }
+    if (!selfEntry && selfSrc) { selfEntry = selfSrc; cur.unshift(selfEntry); try { localStorage.setItem('enabledMods', JSON.stringify(cur)); } catch (e) { /* ignore */ } }
+    if (selfEntry) { try { localStorage.setItem('bmm_self', selfEntry); } catch (e) { /* ignore */ } }
+
+    /* what the active profile wants loaded, and everything any profile manages */
+    var managed = {}, plan = [], ap = null;
+    if (db && Array.isArray(db.profiles)) {
+      db.profiles.forEach(function (p) {
+        if (p.id === db.activeProfileId) ap = p;
+        (p.mods || []).forEach(function (m) { if (m && m.url) { managed[entryOf(m)] = 1; managed[m.url] = 1; } });
+      });
+    }
+    if (ap) (ap.mods || []).forEach(function (m) {
+      if (!m || !m.enabled || !m.url || SELF_RE.test(m.url)) return;
+      var e = entryOf(m);
+      if (plan.some(function (x) { return x.entry === e; })) return;
+      plan.push({ entry: e, src: m.url });
+    });
+
+    var G = window;
+    var haveGlobals = Array.isArray(G.enabledMods) && Array.isArray(G.enabledModNames) && Array.isArray(G.loadedMods) &&
+      Array.isArray(G.queuedMods) && typeof G.checkDependents === 'function';
+
+    /* A previous version put profile mods straight into enabledMods, so the game already loaded
+       them by their CDN url. Clean that up and reload once so they load the right way. */
+    var natives = haveGlobals ? G.enabledMods.slice() : cur.slice();
+    var leaked = natives.some(function (n) { return typeof n === 'string' && !SELF_RE.test(n) && managed[n]; });
+    if (leaked) {
+      var cleaned = natives.filter(function (n) { return typeof n === 'string' && (SELF_RE.test(n) || !managed[n]); });
+      var guard = false; try { guard = sessionStorage.getItem('bmm_fix'); } catch (e) { guard = true; }
+      if (!guard) {
+        try { sessionStorage.setItem('bmm_fix', '1'); localStorage.setItem('enabledMods', JSON.stringify(cleaned)); location.reload(); return; } catch (e) { /* carry on */ }
+      }
+    }
+
+    /* keep our injected entries out of anything a mod persists to enabledMods */
+    var injected = {};
+    plan.forEach(function (it) { injected[it.entry] = 1; });
+    nativeSetItem = Storage.prototype.setItem;
+    Storage.prototype.setItem = function (key, value) {
+      if (key === 'enabledMods' && this === window.localStorage) {
+        try {
+          var arr = JSON.parse(value);
+          if (Array.isArray(arr)) {
+            arr = arr.filter(function (e) { return !(typeof e === 'string' && (injected[e] || (managed[e] && !SELF_RE.test(e)))); });
+            if (selfEntry && arr.indexOf(selfEntry) < 0) arr.unshift(selfEntry);
+            value = JSON.stringify(arr);
+          }
+        } catch (e) { /* leave as-is */ }
+      }
+      return nativeSetItem.call(this, key, value);
+    };
+
+    var status = { items: {} };
+    var saveTimer = null;
+    function setStatus(entry, state, msg) {
+      status.items[entry] = { state: state, msg: msg || '' };
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(function () { try { localStorage.setItem('bmm_status', JSON.stringify(status)); } catch (e) { /* ignore */ } }, 50);
+    }
+    try {
+      localStorage.setItem('bmm_loaded', JSON.stringify(plan.map(function (it) { return it.entry; })));
+      localStorage.setItem('bmm_status', JSON.stringify(status));
+    } catch (e) { /* ignore */ }
+    if (!plan.length) return;
+
+    if (!haveGlobals) { /* unknown game version: plain script loading, no name registration */
+      plan.forEach(function (it) { var s = document.createElement('script'); s.async = false; s.src = it.src; document.head.appendChild(s); });
+      console.warn('[bestModManager] game loader globals not found; mods loaded without native names.');
+      return;
+    }
+
+    /* Register every mod under the name the game and other mods look for. */
+    var skip = {};
+    plan.forEach(function (it) {
+      if (natives.indexOf(it.entry) >= 0) { skip[it.entry] = true; return; }
+      G.enabledMods.push(it.entry);
+      var sn = lastSeg(it.entry); if (G.enabledModNames.indexOf(sn) < 0) G.enabledModNames.push(sn);
+    });
+
+    var byUrl = {};
+    window.addEventListener('error', function (ev) {
+      var f = ev && ev.filename, ent = f && byUrl[f];
+      if (ent && status.items[ent] && status.items[ent].state === 'loaded') setStatus(ent, 'error', ev.message);
+      else if (ent) setStatus(ent, 'error', ev.message);
+    });
+
+    /* Mods that force-load other mods (dependOn(name, cb, true)) queue them on queuedDependencies.
+       The game only loads those from inside its own load handlers, so do it for the mods we load. */
+    function resolveDep(name) {
+      var reg = readJSON('bmm_registry_v1', null);
+      if (reg && reg.items) for (var i = 0; i < reg.items.length; i++) if (reg.items[i].file === name) return reg.items[i].url;
+      return 'mods/' + name;
+    }
+    function pump() {
+      var q = G.queuedDependencies; if (!Array.isArray(q)) return;
+      while (q.length) {
+        var src = q.shift(), name = lastSeg(src);
+        if (G.loadedMods.indexOf(name) >= 0 || G.queuedMods.indexOf(name) >= 0) continue;
+        G.queuedMods.push(name);
+        (function (n) {
+          var s = document.createElement('script'), real = resolveDep(n);
+          if (/^https:\/\/cdn\.jsdelivr\.net\//.test(real)) s.crossOrigin = 'anonymous';
+          s.async = false; s.src = real;
+          s.addEventListener('load', function () { try { G.checkDependents(n); } catch (e) { console.error(e); } G.loadedMods.push(n); pump(); });
+          s.addEventListener('error', function () { console.log('Error in mod: ' + real); });
+          document.head.appendChild(s);
+        })(name);
+      }
+    }
+
+    /* Load in profile order. async=false makes the browser run them in that order too. */
+    plan.forEach(function (it) {
+      if (skip[it.entry]) { setStatus(it.entry, 'loaded'); return; }
+      var short = lastSeg(it.entry);
+      var modName = /^https?:/i.test(it.entry) ? it.entry : short; /* the game's own naming rule */
+      G.queuedMods.push(modName);
+      setStatus(it.entry, 'loading');
+      var s = document.createElement('script');
+      if (/^https:\/\/cdn\.jsdelivr\.net\//.test(it.src)) s.crossOrigin = 'anonymous'; /* lets us see a mod's real error message */
+      s.async = false;
+      s.src = it.src;
+      try { byUrl[new URL(it.src, location.href).href] = it.entry; } catch (e) { /* ignore */ }
+      s.addEventListener('load', function () {
+        if (!status.items[it.entry] || status.items[it.entry].state === 'loading') setStatus(it.entry, 'loaded');
+        try { G.checkDependents(modName); } catch (e) { console.error('[bestModManager] error in dependOn callback for ' + it.entry, e); }
+        G.loadedMods.push(modName);
+        pump();
+      });
+      s.addEventListener('error', function () {
+        setStatus(it.entry, 'failed', 'Could not download ' + it.src);
+        console.log('Error in mod: ' + it.entry);
+        console.log('Could not download ' + it.src);
+        pump();
+      });
+      document.head.appendChild(s);
+    });
+  }
+  try { bootGameSide(); } catch (e) { console.error('[bestModManager] startup error', e); }
+
+  /* ---------------------------------------------------------------------------
+   * Mods button hook + opening the manager page.
+   * ------------------------------------------------------------------------- */
   function themeInfo() {
     var t = {};
     try {
-      var cs = getComputedStyle(document.body);
-      if (cs.fontFamily) t.font = cs.fontFamily;
-      var b = document.querySelector('.controlButton') || document.querySelector('button');
-      if (b) {
-        var bs = getComputedStyle(b);
-        if (bs.backgroundColor && !/rgba\(0, 0, 0, 0\)|transparent/.test(bs.backgroundColor)) t.btnBg = bs.backgroundColor;
-        if (bs.color) t.btnColor = bs.color;
-      }
+      var cs = getComputedStyle(document.documentElement);
+      ['--theme', '--theme-dark', '--theme-darker', '--theme-darkest', '--theme-darkest2'].forEach(function (k) {
+        var v = cs.getPropertyValue(k).trim(); if (v) t[k] = v;
+      });
     } catch (e) { /* ignore */ }
-    return t;
+    return { theme: t };
   }
-  function fontFaces() { /* copy the game's @font-face rules so the page uses the same font */
+  function fontFaces() { /* copy the game's @font-face rules so the page uses the same pixel fonts */
     var out = [];
     try {
       for (var s = 0; s < document.styleSheets.length; s++) {
@@ -720,22 +934,16 @@
     catch (e) { console.error('[bestModManager] could not build the page', e); return false; }
   }
 
-  var origShow = window.showMods;
+  var origShow = window.showModManager;
   function fallback() {
     try { alert('Best Mod Manager: your browser blocked the new page. Allow pop-ups for this site and try again.'); } catch (e) { /* ignore */ }
     if (typeof origShow === 'function') origShow();
   }
-  window.showMods = function () {
-    if (!openManager()) fallback();
-  };
+  window.showModManager = function () { if (!openManager()) fallback(); };
   document.addEventListener('click', function (e) {
     if (e.shiftKey) return; /* Shift+click opens the original Mods panel */
     var t = e.target; if (!t || !t.closest) return;
-    var hit = t.closest('[onclick*="showMods"]');
-    if (!hit && !document.querySelector('[onclick*="showMods"]')) {
-      var b = t.closest('button');
-      if (b && b.textContent.trim() === 'Mods') hit = b;
-    }
+    var hit = t.closest('#modsButton,[onclick*="showModManager"]');
     if (!hit) return;
     e.preventDefault(); e.stopImmediatePropagation();
     if (!openManager()) fallback();
