@@ -1,7 +1,21 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v45 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v46 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v46 - PHYSICS MATERIALS TAB + more speed under load:
+         - new "Physics" tab with two placeable wells, Gravity Well and Reverse Gravity Well. They are
+           attractors, never bodies (slNoPhys), so they cannot be swept into a shape or cloned, and they
+           never fall. Clicking one opens the game's own prompt box ("Sublevel Physics is asking you.")
+           asking for the strength: 1 is normal gravity, 0.5 half, 2 twice, 0.05..20 accepted. The pull
+           follows 1/r^2 from 10 cells (strength 1 = exactly normal gravity there), reaches 70 cells and
+           is capped at 30G so nothing gets flung off the map. It applies to every physics object and
+           the value is per material, so changing it re-aims the wells you already placed.
+         - the solver drops from 4 substeps to 2 only when the tick is already running late (19ms
+           moving average) and never while bodies are moving fast, which is where substeps actually
+           prevent tunneling. That halves solver cost in exactly the moments the game is dying and
+           leaves normal play identical.
+         - moon-sized bodies (3000+ cells) get one interpolation pass instead of 3, and a body over
+           4000 cells skips the per-cell border outline test.
    v45 - SPEED, aimed at large complex shapes, crowded objects and heavy contact:
          - raster() walked a body's whole bounding box; a diagonal line or a hollow art piece paid
            for thousands of empty grid points every call. It now walks the cells themselves, one
@@ -134,6 +148,17 @@ var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedCount = 0;
 var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
 var MAXFIX = 260;              // collider budget per body
+/* ---- gravity wells ---- */
+var WELL_REF = 10;             // cells: at this distance strength 1 pulls exactly like normal gravity
+var WELL_REACH = 70;           // cells: beyond this a well is ignored (and 1/r^2 has faded out anyway)
+var WELL_MINR = 1.5;           // cells: floor so a body sitting on the well does not get an infinite pull
+var WELL_MAXA = 30;            // cap in units of G, so one well cannot fling a body out of the map
+var WELL_STR = { gravity_well: 1, antigravity_well: 1 };   // strength per material, asked for on click
+var WELL_CATS = { gravity_well: 1, antigravity_well: 1 };
+var WELLS = [];                // live well pixels: {x, y, s, anti}
+var WELL_SCAN = 0;             // registry rebuilt from the map on demand
+/* ---- adaptive solver ---- */
+var SUBADAPT = 4, TICK_EMA = 8, lastMaxSp = 0;   // substeps drop to 2 only when a tick is already late
 var PROXYCAP = 400;            // proxies looked at per body per scan
 var bodyBudget = 6;            // new bodies allowed per tick (keeps a save load smooth)
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
@@ -580,7 +605,9 @@ function syncProxies(b, R0){
     var mdx = b.x - b.sx, mdy = b.y - b.sy, md = Math.sqrt(mdx*mdx + mdy*mdy) + Math.abs(b.a - b.sa)*b.rad*0.5;
     if (md > 1.2){
       var nst = Math.min(8, Math.ceil(md));
-      if (b.cells.size > 700) nst = Math.min(3, nst);          // big bodies: fewer interpolation passes
+      if (b.cells.size > 3000) nst = 1;                        // a moon-sized body: one pass, it is a rigid block
+      else if (b.cells.size > 1200) nst = Math.min(2, nst);
+      else if (b.cells.size > 700) nst = Math.min(3, nst);      // big bodies: fewer interpolation passes
       for (var st = 1; st < nst; st++){
         var tt = st/nst, qx = b.sx + mdx*tt, qy = b.sy + mdy*tt, SR = raster(b, qx, qy, b.sa + (b.a - b.sa)*tt);
         for (var si = 0; si < SR.gx.length; si++){
@@ -1140,6 +1167,108 @@ function cloneReactions(r){
   Object.keys(r).forEach(function(k){ o[k] = (r[k] && typeof r[k] === "object") ? Object.assign({}, r[k]) : r[k]; });
   return o;
 }
+/* ============================================================ PHYSICS MATERIALS TAB
+   Two placeable wells. They are attractors, never bodies (slNoPhys), so they cannot be swept into a
+   shape, cannot clone, and never fall: they just bend gravity for every physics object around them. */
+function askWellStrength(id){
+  var name = id === "antigravity_well" ? "Reverse Gravity Well" : "Gravity Well";
+  var cur = WELL_STR[id] === undefined ? 1 : WELL_STR[id];
+  if (typeof promptInput !== "function"){
+    logMessage("Sublevel Physics: this build has no prompt box, using strength 1.");
+    return;
+  }
+  promptInput(
+    "Pick how strong this " + name.toLowerCase() + " is. 1 is normal gravity, 0.5 is half as strong, 2 is twice as strong. " +
+    "The pull fades with distance (like real gravity) and affects every physics object in reach. " +
+    "Applies to all " + name.toLowerCase() + "s you place.",
+    function(value){
+      if (value === null || value === undefined || value === "") return;
+      var v = parseFloat(value);
+      if (!isFinite(v) || v <= 0){ logMessage("Sublevel Physics: that is not a strength, keeping " + cur + "."); return; }
+      v = Math.max(0.05, Math.min(20, v));
+      WELL_STR[id] = v;
+      logMessage("Sublevel Physics: " + name + " strength set to " + v + (id === "gravity_well" ? " (pulls)" : " (pushes)") + ".");
+    },
+    "Sublevel Physics is asking you.",
+    String(cur)
+  );
+}
+function hookWellButton(id){
+  if (typeof document === "undefined" || !document.getElementById) return;   /* headless test harness */
+  var btn = document.getElementById("elementButton-" + id);
+  if (!btn || btn.__slWell) return;
+  btn.__slWell = 1;
+  btn.addEventListener("click", function(){ askWellStrength(id); });
+}
+function addWellElements(){
+  if (typeof elements !== "object" || elements.gravity_well) return;
+  elements.gravity_well = {
+    color: "#7d5cff", colorObject: [125, 92, 255],
+    behavior: "XX|XX|XX", category: "physics", state: "solid",
+    density: 3200, desc: "Pulls every physics object toward itself. Click it to set the strength (1 = normal gravity).",
+    slNoPhys: true, hidden: false,
+    onPlace: function(pixel){ WELLS.push({ x: pixel.x, y: pixel.y }); }
+  };
+  elements.antigravity_well = {
+    color: "#ff5ce0", colorObject: [255, 92, 224],
+    behavior: "XX|XX|XX", category: "physics", state: "solid",
+    density: 3200, desc: "Pushes every physics object away from itself. Click it to set the strength (1 = normal gravity).",
+    slNoPhys: true, hidden: false,
+    onPlace: function(pixel){ WELLS.push({ x: pixel.x, y: pixel.y }); }
+  };
+  if (typeof lang === "object" && lang) lang.physics = "Physics";
+  ["gravity_well", "antigravity_well"].forEach(function(id){
+    if (typeof createElementButton === "function"){ try { createElementButton(id); } catch(e){} }
+    hookWellButton(id);
+  });
+  if (typeof runAfterLoad === "function") runAfterLoad(function(){ WELL_SCAN = 0; [ "gravity_well", "antigravity_well" ].forEach(hookWellButton); });
+}
+/* find every well pixel in the map (placement, save load, paste) */
+function scanWells(){
+  WELLS.length = 0; WELL_SCAN = 1;
+  if (typeof pixelMap !== "object" || !pixelMap) return;
+  for (var x = 0; x < width; x++){
+    var col = pixelMap[x]; if (!col) continue;
+    for (var y = 0; y < height; y++){
+      var p = col[y]; if (!p || p.del || p.sub !== undefined) continue;
+      if (WELL_CATS[p.element]) WELLS.push({ x: x, y: y });
+    }
+  }
+}
+function pruneWells(){
+  for (var i = WELLS.length - 1; i >= 0; i--){
+    var w = WELLS[i], p = (typeof pixelMap !== "undefined" && pixelMap[w.x]) ? pixelMap[w.x][w.y] : null;
+    if (!p || p.del || !WELL_CATS[p.element]) WELLS.splice(i, 1);
+  }
+}
+function applyWells(){
+  if (!WELLS.length) return;
+  var ids = Object.keys(BODIES), i, j, b, W = WELLS, nr = 0;
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]];
+    if (!b || b.dead || !b.pb || b.frozen || pixelTicks < b.hold) continue;
+    var c = b.pb.getWorldCenter(), fx = 0, fy = 0, hit = 0;
+    for (j = 0; j < W.length; j++){
+      var w = W[j], dx = w.x + 0.5 - c.x, dy = w.y + 0.5 - c.y, r2 = dx*dx + dy*dy;
+      if (r2 > WELL_REACH*WELL_REACH) continue;
+      var p = pixelMap[w.x] && pixelMap[w.x][w.y];
+      if (!p || p.del || !WELL_CATS[p.element]) continue;
+      var str = WELL_STR[p.element] === undefined ? 1 : WELL_STR[p.element];
+      if (str <= 0) continue;
+      var r = Math.sqrt(r2); if (r < WELL_MINR) r = WELL_MINR;
+      var a = G * str * (WELL_REF*WELL_REF) / (r*r);
+      if (a > G*WELL_MAXA) a = G*WELL_MAXA;
+      if (p.element === "antigravity_well") a = -a;
+      fx += a * dx / r; fy += a * dy / r; hit++;
+    }
+    if (!hit) continue;
+    var m = b.pb.getMass();
+    b.pb.applyForce(PL.Vec2(fx*m, fy*m), c, true);          /* mass cancels: acceleration, like gravity */
+    if (b.pb.isAwake && !b.pb.isAwake()) b.pb.setAwake(true);  /* a well must never leave a body asleep in mid air */
+    nr++;
+  }
+  return nr;
+}
 function hookAll(){
   Object.keys(elements).forEach(function(id){
     var e = elements[id]; if (!e || e.__slh || !calcFall(id, e)) return;
@@ -1437,6 +1566,7 @@ runEveryTick(function(){
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
   if (!sweepQ && pixelTicks > 30 && pixelTicks % 240 === 0) startSweep();   // rolling audit: nothing stays airborne
+  var __t0 = performance.now();
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
     if (!sweepQ){
@@ -1457,6 +1587,8 @@ runEveryTick(function(){
   if (GRAB && (!mouseIsDown || currentElement !== "physgrab" || GRAB.b.dead || !GRAB.b.pb)) GRAB = null;
   if (GRAB && GRAB.b.pb && GRAB.b.pb.setAwake) GRAB.b.pb.setAwake(true);
 
+  if (!WELL_SCAN || (pixelTicks % 600) === 0) scanWells(); else if ((pixelTicks & 31) === 0) pruneWells();
+  applyWells();
   var forces = FRCP; FRN = 0; var maxSp = 0;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
@@ -1553,7 +1685,8 @@ runEveryTick(function(){
       }
     }
   }
-  for (var s = 0; s < SUB; s++){
+  var sub = (TICK_EMA > 19 && lastMaxSp < 3) ? 2 : SUB;
+  for (var s = 0; s < sub; s++){
     for (i = 0; i < FRN; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
     if (GRAB && GRAB.b.pb && GRAB.b.pb.getType() === "dynamic"){
       var gb = GRAB.b, pb = gb.pb, pt = pb.getWorldPoint(PL.Vec2(GRAB.lx, GRAB.ly)), gv = pb.getLinearVelocityFromWorldPoint(pt);
@@ -1563,7 +1696,9 @@ runEveryTick(function(){
     }
     world.step(DT, 6, 2);
   }
+  lastMaxSp = maxSp;
   processImpacts(); processPushes();
+  TICK_EMA = TICK_EMA * 0.9 + (performance.now() - __t0) * 0.1;   /* drives the substep drop above */
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var ps = b.pb.getPosition(); b.x = ps.x; b.y = ps.y; b.a = b.pb.getAngle();
@@ -1610,6 +1745,7 @@ function drawCells(b, ctx, ps, bord){
 renderPostPixel(function(ctx){
   var ps = pixelSize, keys = Object.keys(BODIES);
   var bord = (typeof renderPresets !== "undefined") ? renderPresets.BORDER : null;
+  if (bord && b.cells.size > 4000) bord = null;                 /* outline of a 20k cell body is not worth 4 lookups a cell */
   for (var i = 0; i < keys.length; i++){
     var b = BODIES[keys[i]]; if (!b) continue;
     ctx.save();
@@ -1626,18 +1762,20 @@ renderPostPixel(function(ctx){
   }
 });
 
+addWellElements();
 loadPlanck();
 globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
-    raster: raster, refreshTerrain: refreshTerrain, syncProxies: syncProxies, hookAll: hookAll };
+    raster: raster, refreshTerrain: refreshTerrain, syncProxies: syncProxies, hookAll: hookAll,
+    setStrength: function(id, v){ WELL_STR[id] = v; }, wells: function(){ return WELLS; }, applyWells: applyWells };
 }
 if (typeof logMessage === "function" && typeof elements !== "undefined"){
   var _sl = 0, _mv = 0;
   for (var _id in elements){ try { if (isSolidLike(_id)) _sl++; else _mv++; } catch(e){} }
-  logMessage("Sublevel Physics v45 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
+  logMessage("Sublevel Physics v46 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
 }
 
 })();
