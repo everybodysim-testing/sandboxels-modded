@@ -1,42 +1,31 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v27 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v30 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
-   v27 - packed sand's own description is the answer: it is a SUPPORT material, and support
-         materials carry a move rule in their behaviour grid (they fall straight down until
-         something holds them up). That single shared property is what concrete, quicklime and
-         packed sand have in common, and it is the only thing the duplication ever needed: such a
-         pixel keeps obeying its own move rule after it becomes a body's placeholder, so the game
-         walks it out of the body. The body then needs a fresh placeholder for that cell and the
-         walked-away pixel stays in the world as free material.
-         So support materials are no longer taken over at all: they stay exactly as Sandboxels
-         ships them, supporting themselves, never converted, never duplicated. Everything with no
-         move rule of its own (plain solids, rock, glass, metal, wood...) keeps getting physics.
-         Also: a placeholder that no longer matches its cell is now deleted on the spot instead of
-         being left loose, and ALL of the debug output is gone.
-   v26 - three things, each one measured instead of guessed:
-         1. anchored blocks are anchors again, never physics material (as ordered)
-         2. ONE PIXEL, ONE CELL, enforced: every 30 ticks the map is swept and any cell whose
-            pixel reports a different x/y is a stale duplicate reference and is cleared. This is
-            the duplication law, and it does not care which code path broke it.
-         3. every solid block is a physics object, including supported ones: a supported region
-            becomes ONE static body (frozen) instead of staying loose pixels. A shelf is now an
-            object whether it floats or rests on a bracket. Every 300 ticks support is re-checked:
-            a frozen body that lost its support is unfrozen and falls, and a body that settles on
-            support again is frozen.
-         Every body also gets a cell/proxy parity repair, and there is a health line every 600
-         ticks plus window.SL_STATS so we can always read what the mod thinks is happening.
-   v25 - the real common trait of concrete / quicklime / packed sand: they are the materials
-         whose breakInto is a GRANULE (gravel / quicklime / sand), so the damage path was
-         dropping a loose granule onto the block that was just hit. That granule then had to be
-         shoved out of the body by the shove code, and a shoved pixel was written into its new
-         cell WITHOUT vacating the old one, so one pixel ended up referenced by two cells and the
-         game ticked it twice: it multiplied. Normal solids break into nothing, which is why they
-         never did it.
-         Feature disabled: bodies no longer spawn break-debris at all (that single feature), and a
-         shoved pixel can never occupy two cells.
-         Also fixed: anchored_* blocks ARE physics material now (the laboratory shelf), and a body
-         born frozen/held switches back to dynamic instead of staying static forever.
+   v30 - support materials are enforced at ONE choke point now, not two guesses:
+         - movesItself(id) decides once: M1/M2 in the behaviour grid, behaviours.SUPPORT by
+           identity, a behaviour function, movable:true, or the named support materials
+           (concrete, quicklime, packed_sand, brick). Both the fall test and the soft-solid test
+           read that one answer, so concrete cannot be a body by one rule and not the other.
+         - bodyFromPixels drops any pixel whose material moves itself, so even a stray call can
+           never turn concrete into a body placeholder
+         - 'art' is not body material and regions held only by a map edge are not converted: that
+           was what made the laboratory shelf drop out from under its jars, so it is gone
+         - one pixel, one cell is swept every 30 ticks: any map slot whose pixel reports another
+           position is a stale duplicate reference and is cleared
+   v29 - back to the v22 support model (nothing collapses, nothing turns into an object just for
+         existing) with only these changes on top:
+         - the debug rectangles are gone: no light blue box around frozen bodies, no yellow tint
+           on changed cells
+         - SUPPORT materials (packed sand, quicklime, concrete: anything with M1 in its behaviour)
+           are left entirely to the engine, as agreed. They support themselves and are never
+           taken over, which is what stopped them duplicating
+         - 'art' counts as solid body material. The laboratory shelf is a run of art pixels
+         - a region whose ONLY support is the side or top edge of the sandbox becomes one FROZEN
+           body: it is a real physics object (grabbable, freezable, kickable) but it does not
+           drop out from under the jars it is carrying. Support from the floor still just holds
+           things up, exactly as before
+         - break-debris stays off, and a body born held/frozen wakes up when it is released
    v22 - concrete specifically, three independent nets:
          1. debris may never be the material that broke (concrete's breakInto IS concrete in
             some element tables, and that alone is self-replication) and must be a grain
@@ -233,8 +222,7 @@ function selfMoving(e){
         if (!Array.isArray(row)) continue;
         for (j = 0; j < row.length; j++){
           s = String(row[j]);
-          if (/M2/.test(s)) return true;                            // powders slide
-          if (/M1/.test(s)) return true;                            // SUPPORT materials: they move themselves
+          if (/M[12]/.test(s)) return true;                         // powders and SUPPORT materials move themselves
         }
       }
     } else if (/M[12]/.test(JSON.stringify(bh))) return true;
@@ -247,10 +235,10 @@ function selfMoving(e){
 var PHYS_WHITELIST = { rock_wall: 1 };
 function calcFall(id, e){
   if (PHYS_WHITELIST[id]) return !!(e && (e.state === undefined || e.state === "solid") && !e.anchored);
-  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
+  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall") return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
-  if (selfMoving(e)) return false;
+  if (selfMoving(e) || movesItself(id)) return false;
   return true;
 }
 Object.keys(PHYS_WHITELIST).forEach(function(id){ delete FC[id]; });
@@ -524,10 +512,7 @@ function placeNear(p, gx, gy){
       if (!outOfBounds(x,y) && pixelMap[x][y] === undefined){ p.x = x; p.y = y; pixelMap[x][y] = p; return true; }
     }
   }
-  if (!p.del && pixelMap[gx] && pixelMap[gx][gy] === undefined){
-    if (pixelMap[p.x] && pixelMap[p.x][p.y] === p && !(p.x === gx && p.y === gy)) pixelMap[p.x][p.y] = undefined;
-    p.x = gx; p.y = gy; pixelMap[gx][gy] = p; return true;      /* one pixel, one cell */
-  }
+  if (!p.del && pixelMap[gx] && pixelMap[gx][gy] === undefined){ p.x = gx; p.y = gy; pixelMap[gx][gy] = p; return true; }
   dropPix(p); return false;
 }
 function mkProxy(b, cell, gx, gy, spareBy){
@@ -648,13 +633,7 @@ function watchProxies(b){
       b.proxies.delete(gk); if (b.cells.delete(pix.ck)) b.dirty = true; return;
     }
     if (pix.sub !== b.id || !pixelMap[pix.x] || pixelMap[pix.x][pix.y] !== pix || GK(pix.x, pix.y) !== gk){
-      var ours = (pix.sub === b.id);
-      b.proxies.delete(gk); b.needSync = true;
-      if (ours && !pix.del){                      /* our placeholder went walkabout: the cell is the truth */
-        if (pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
-        dropPix(pix);
-      }
-      return;
+      b.proxies.delete(gk); b.needSync = true; return;
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
@@ -787,8 +766,7 @@ function removeCell(b, k, debris){
   var cell = b.cells.get(k); if (!cell) return;
   b.cells.delete(k); b.dirty = true;
   if (debris && chance(0.55)){
-    return;                                                    /* FEATURE OFF: break-debris spawned granules that
-                                                                  the shove code then duplicated. No debris, no clone. */
+    return;                                                    /* break-debris off: a granule spawned on a block gets duplicated by the shove path */
     var w = toWorld(b, cell.x, cell.y), d = physOf(cell.e).debris;
     /* a material may never produce itself, and debris must be a loose grain: anything else is
        either self-replication (concrete!) or a fresh block appearing out of a shove */
@@ -925,62 +903,17 @@ function fluidInfo(b, R){
 
 /* ------------------------------------------------ falling: support detection */
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
-var INPROXY = false;
-var SL_STATS = { version: "v26", bodies: 0, cells: 0, proxies: 0, repairs: 0, lawFixes: 0, wdKills: 0 };
-function auditBodies(){
-  var n = 0, c = 0, p = 0, reps = 0;
-  for (var id in BODIES){
-    var b = BODIES[id]; if (!b || b.dead) continue;
-    n++; c += b.cells.size; p += b.proxies.size;
-    /* parity: a proxy with no cell is a leftover copy, a cell with no proxy is unbacked */
-    var drop = [];
-    b.proxies.forEach(function(pix, gk){
-      if (pix.del || !b.cells.has(pix.ck)) drop.push(gk);
-    });
-    drop.forEach(function(gk){
-      var pix = b.proxies.get(gk); if (!pix) return;
-      b.proxies.delete(gk); reps++;
-      if (!pix.del) dropPix(pix);
-    });
-    /* support: the lowest row of cells decides whether a frozen body stays frozen */
-    var low = null, cells = [];
-    b.cells.forEach(function(cell){ cells.push(cell); if (low === null || cell.y > low) low = cell.y; });   /* y grows downward: the bottom row is the LARGEST y */
-    var held = false;
-    for (var i = 0; i < cells.length && !held; i++){
-      var cell = cells[i]; if (cell.y !== low) continue;
-      var w = toWorld(b, cell.x, cell.y), wx = Math.round(w.x), wy = Math.round(w.y) + 1;
-      if (outOfBounds(wx, wy)) { held = true; break; }
-      var under = pixelMap[wx] ? pixelMap[wx][wy] : undefined;
-      if (!under || under.del) continue;
-      if (under.sub !== undefined) { held = true; break; }          // resting on another object
-      if (GC.has(under)) { held = true; break; }
-      var ue = elements[under.element];
-      if (ue && (ue.state === undefined || ue.state === "solid")) { held = true; break; }
-    }
-    if (b.frozen && !held){ b.frozen = false; ensurePB(b); if (b.pb && b.pb.setAwake) b.pb.setAwake(true); reps++; }
-    else if (!b.frozen && held && b.pb && Math.abs(b.pb.getLinearVelocity ? b.pb.getLinearVelocity().x : 0) < 0.05 &&
-             Math.abs(b.pb.getLinearVelocity ? b.pb.getLinearVelocity().y : 0) < 0.05){ b.frozen = true; ensurePB(b); }
-  }
-  SL_STATS.bodies = n; SL_STATS.cells = c; SL_STATS.proxies = p; SL_STATS.repairs += reps;
-  /* silent: repairs are recorded in SL_STATS */
-}
-function healthLine(){
-  try { globalThis.SL_STATS = SL_STATS; } catch (err){}   /* no logging: readable from the console */
-  return SL_STATS;
-}
-function enforceMap(){                                          /* ONE PIXEL, ONE CELL: a cell whose pixel
-                                                                   reports another position is a stale duplicate */
+var INPROXY = false, SL_WD_KILLS = 0;
+function enforceMap(){                                          /* ONE PIXEL, ONE CELL */
   if (typeof pixelMap === "undefined" || !pixelMap) return;
-  var fixed = 0;
   for (var x = 0; x < pixelMap.length; x++){
     var col = pixelMap[x]; if (!col) continue;
     for (var y = 0; y < col.length; y++){
       var p = col[y];
       if (!p || p.del) continue;
-      if (p.x !== x || p.y !== y){ col[y] = undefined; fixed++; }
+      if (p.x !== x || p.y !== y) col[y] = undefined;
     }
   }
-  if (fixed) SL_STATS.lawFixes += fixed;
 }
 var MAT_BASE = {}, MAT_PLACED = {}, MAT_LAST = -999;
 function auditMaterials(){
@@ -1002,9 +935,9 @@ function auditMaterials(){
     var arr = free[id] || [], kill = Math.min(growth, arr.length);
     for (i = arr.length - 1; i >= 0 && kill > 0; i--, kill--){
       var q = arr[i];
-      if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); SL_STATS.wdKills++; }
+      if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); }
     }
-    if (kill > 0) SL_STATS.wdKills += kill;
+    if (kill > 0) SL_WD_KILLS += kill;   /* silent */
   }
   MAT_PLACED = {};
 }
@@ -1030,36 +963,29 @@ function dropPix(p){ p.del = true; p.sub = undefined; p.inPx = false; PIXDIRTY =
 var SSC = {};
 /* a solid that is neither a grain nor an anchor: it must get physics if its region is unsupported,
    even if the "does it fall" heuristic says no. this is what makes coverage exhaustive. */
-/* ------------------------------------------------------------------ element policy, one place
-   Every material resolves to exactly one policy. Nothing else in the file decides on its own
-   whether a material may become a body, which is what keeps a material from being half-taken. */
-var POLICY_CACHE = {};
-function policyOf(id){
-  var C = POLICY_CACHE[id]; if (C) return C;
-  var e = elements[id], p = { id: id, body: false, why: "missing" };
-  if (!e){ POLICY_CACHE[id] = p; return p; }
-  if (e.tool && !e.canPlace){ p.why = "tool"; POLICY_CACHE[id] = p; return p; }
-  if (e.category === "tools" || e.category === "energy"){ p.why = "tool category"; POLICY_CACHE[id] = p; return p; }
-  if (e.anchored || e.category === "anchored" || /^anchored_/.test(id)){ p.why = "anchored"; POLICY_CACHE[id] = p; return p; }
-  if (e.slNoPhys || id === "wall"){ p.why = "static material"; POLICY_CACHE[id] = p; return p; }
-  if (e.state !== undefined && e.state !== "solid"){ p.why = "not solid"; POLICY_CACHE[id] = p; return p; }
-  if (e.movable === true){ p.why = "grain"; POLICY_CACHE[id] = p; return p; }
-  var bh = e.behavior;
-  if (Array.isArray(bh) && /M[12]/.test(JSON.stringify(bh))){ p.why = "moves itself (support/powder)"; POLICY_CACHE[id] = p; return p; }
-  if (typeof bh === "function"){ p.why = "has behaviour of its own"; POLICY_CACHE[id] = p; return p; }
-  p.body = true; p.why = "plain solid";
-  POLICY_CACHE[id] = p; return p;
+var SELF_MOVE_NAMES = { concrete:1, quicklime:1, packed_sand:1, brick:1 };
+var MOVES_CACHE = {};
+function movesItself(id){
+  if (MOVES_CACHE[id] !== undefined) return MOVES_CACHE[id];
+  var e = elements[id], r = false;
+  if (!e){ MOVES_CACHE[id] = false; return false; }
+  if (SELF_MOVE_NAMES[id] === 1) r = true;
+  else if (e.movable === true) r = true;
+  else {
+    var bh = e.behavior;
+    if (typeof bh === "function") r = true;
+    else if (Array.isArray(bh) && /M[12]/.test(JSON.stringify(bh))) r = true;
+    else if (typeof behaviors !== "undefined" && behaviors && behaviors.SUPPORT && bh === behaviors.SUPPORT) r = true;
+  }
+  MOVES_CACHE[id] = r; return r;
 }
 function isSoftSolid(id){
   if (SSC[id] !== undefined) return SSC[id];
   var e = elements[id], r = false;
   if (e && (e.state === undefined || e.state === "solid")){
-    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.category === "anchored" ||
-          e.slNoPhys || id === "wall" || /^anchored_/.test(id))){
+    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys || id === "wall")){
       var bh = e.behavior;
-      /* grains, powders and SUPPORT materials are left entirely to the engine. A support material
-         carries its own move rule and would walk its placeholder out of any body we built. */
-      r = policyOf(id).body;
+      r = !movesItself(id);                                 // support materials stay powders, forever
     }
   }
   SSC[id] = r; return r;
@@ -1070,7 +996,7 @@ function scanWorthy(p){
 }
 function bodyFromPixels(list){
   if (!list || !list.length) return null;
-  list = list.filter(function(q){ return q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q; });
+  list = list.filter(function(q){ return q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q && !movesItself(q.element); });
   if (!list.length) return null;                                    // nothing live left to convert
   if (bodyBudget <= 0) return null;                                 // try again next tick, pixels left as-is
   bodyBudget--;
@@ -1093,7 +1019,7 @@ function checkSupport(p, checked){
     var c = stack.pop();
     for (var d = 0; d < 4; d++){
       var nx = c.x + SDIR[d][0], ny = c.y + SDIR[d][1];
-      if (outOfBounds(nx, ny)){ supported = true; break; }
+      if (outOfBounds(nx, ny)){ supported = true; break; }           /* the map edge counts as support, as v22 did */
       var n = pixelMap[nx][ny];
       if (!n || n.del) continue;
       if (n.sub !== undefined){ if (!host && BODIES[n.sub]) host = BODIES[n.sub]; continue; }
@@ -1109,19 +1035,7 @@ function checkSupport(p, checked){
     }
   }
   fall.forEach(function(x){ checked.add(x); });
-  if (supported){
-    /* a supported region is still one physics object: frozen, so it does not move, but real */
-    var grp = [];
-    seen.forEach(function(px){
-      if (px && !px.del && px.sub === undefined && pixelMap[px.x] && pixelMap[px.x][px.y] === px && (fallEl(px.element) || isSoftSolid(px.element))) grp.push(px);
-    });
-    if (grp.length && grp.length <= 2000 && bodyBudget > 0){
-      var nb = bodyFromPixels(grp);
-      if (nb){ nb.frozen = true; ensurePB(nb); }
-    }
-    seen.forEach(function(x){ GC.add(x); });
-    return;
-  }
+  if (supported){ seen.forEach(function(x){ GC.add(x); }); return; }   /* supported: untouched, exactly as v22 did */
   if (host){                                       // pixels the user JUST placed beside a body join it
     var rest = [];
     fall.forEach(function(px){
@@ -1336,10 +1250,10 @@ elements.physicsspin = { color: "#7bdcff", category: "tools", canPlace: false,
   } };
 elements.physicsfreeze = { color: "#7bdcff", category: "tools", canPlace: false,
   desc: "Freezes a physics body in place (still rotated, still off-grid).",
-  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = true; ensurePB(b); } } };
+  tool: function(p){ var b = bodyOf(p); if (b) b.frozen = true; } };
 elements.physicsunfreeze = { color: "#ff9d7b", category: "tools", canPlace: false,
   desc: "Unfreezes a frozen physics body so it moves again.",
-  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = false; b.hold = 0; ensurePB(b); } } };
+  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = false; b.hold = 0; } } };
 elements.physicsflip = { color: "#c792ff", category: "tools", canPlace: false,
   desc: "Flips the gravity direction of a physics body.",
   tool: function(p){
@@ -1555,8 +1469,6 @@ runEveryTick(function(){
   if (!world) return;
   if (pixelTicks % 30 === 0) enforceMap();
   if (pixelTicks > 40 && pixelTicks % 60 === 0) auditMaterials();
-  if (pixelTicks > 60 && pixelTicks % 300 === 0) auditBodies();
-  if (pixelTicks > 60 && pixelTicks % 600 === 0) healthLine();
   if (!sweepQ && pixelTicks > 30 && pixelTicks % 300 === 0) startSweep();   // rolling audit: nothing stays airborne
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
@@ -1709,7 +1621,7 @@ function drawCells(b, ctx, ps, bord){
       px.x = ox; px.y = oy;
       ctx.restore();
     }
-    if (c.chg){ ctx.fillStyle = "rgba(255,255,0,0.55)"; ctx.fillRect(X, Y, size, size); }
+    /* no debug tint */
     if (bord && rn && rn.__bord){
       var edge = false;
       for (var d = 0; d < 4; d++) if (!b.cells.has(K(c.x + D4[d][0], c.y + D4[d][1]))){ edge = true; break; }
@@ -1725,7 +1637,7 @@ renderPostPixel(function(ctx){
     ctx.save();
     ctx.translate((b.x + 0.5)*ps, (b.y + 0.5)*ps); ctx.rotate(b.a);
     drawCells(b, ctx, ps, bord);
-    if (b.frozen){ ctx.strokeStyle = "rgba(123,220,255,0.9)"; ctx.lineWidth = 1; ctx.strokeRect(-ps*b.rad, -ps*b.rad, ps*2*b.rad, ps*2*b.rad); }
+    /* no debug boxes */
     ctx.restore();
   }
   if (GRAB && GRAB.b && !GRAB.b.dead && GRAB.b.pb){
@@ -1743,8 +1655,8 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
     hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials,
-    auditBodies: auditBodies, enforceMap: enforceMap, stats: function(){ return SL_STATS; } };
+    enforceMap: enforceMap, movesItself: movesItself };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v27 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v30 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
