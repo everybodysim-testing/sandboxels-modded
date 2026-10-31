@@ -1,7 +1,13 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v17 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v18 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v18 - THE clone fix. When a pixel became part of a body it was cleared out of the map and
+         flagged dead, but it was never taken out of Sandboxels' own currentPixels list. A dead
+         pixel that is still in that list gets ticked, and when its old cell is empty again it
+         writes itself back into the map: one pixel placed becomes two, then four, each new copy
+         another physics object. Every mod deletion now removes the pixel from currentPixels too
+         (batched once per pass), and a revived spare proxy is pushed back in.
    v17 - coverage + leaks:
          - the support scan no longer trusts the per-element "can this fall" guess for what
            becomes a body. Anything solid that is not a grain (movable / powder behaviour),
@@ -439,17 +445,21 @@ function placeNear(p, gx, gy){
     }
   }
   if (!p.del && pixelMap[gx] && pixelMap[gx][gy] === undefined){ p.x = gx; p.y = gy; pixelMap[gx][gy] = p; return true; }
-  p.del = true; return false;
+  dropPix(p); return false;
 }
 function mkProxy(b, cell, gx, gy, spareBy){
   if (outOfBounds(gx, gy) || !pixelMap[gx]) return null;      // outside the sandbox: no proxy needed
   if (pixelMap[gx][gy] !== undefined) return null;            // cell taken: never overwrite a live pixel
   var list = spareBy[cell.e], pix;
-  if (list && list.length){ pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix; }
+  if (list && list.length){
+    pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix;
+    if (!pix.inPx && typeof currentPixels !== "undefined" && currentPixels){ currentPixels.push(pix); pix.inPx = true; }
+  }
   else {
     var prev = NOJOIN, prevPx = INPROXY; NOJOIN = true; INPROXY = true;
     try { createPixel(cell.e, gx, gy); } finally { NOJOIN = prev; INPROXY = prevPx; }
     pix = pixelMap[gx][gy]; if (!pix || pix.del) return null;
+    pix.inPx = true;
     pix.temp = cell.t !== undefined ? cell.t : 20;
   }
   if (cell.c) pix.color = cell.c; else cell.c = pix.color;
@@ -520,7 +530,7 @@ function syncProxies(b, R0){
     pix.sub = b.id; pix.ck = R.ck[idx]; cell.px = pix;
     b.proxies.set(gk, pix);
   });
-  for (var el in spareBy) spareBy[el].forEach(function(pix){ pix.sub = undefined; pix.del = true; });
+  for (var el in spareBy) spareBy[el].forEach(function(pix){ dropPix(pix); });
   if (riders.length){
     var byCk = new Map();
     b.proxies.forEach(function(pix){ byCk.set(pix.ck, pix); });
@@ -531,13 +541,15 @@ function syncProxies(b, R0){
     });
   }
   b.sx = b.x; b.sy = b.y; b.sa = b.a;
+  compactPixels();
 }
 function releaseProxies(b){
   b.proxies.forEach(function(pix){
     if (!pix.del && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
-    pix.sub = undefined; pix.del = true;
+    dropPix(pix);
   });
   b.proxies.clear();
+  compactPixels();
 }
 function killBody(b){
   releaseProxies(b);
@@ -808,6 +820,25 @@ function fluidInfo(b, R){
 /* ------------------------------------------------ falling: support detection */
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
 var INPROXY = false;
+var PIXDIRTY = false;
+/* a pixel the mod removed must leave Sandboxels' currentPixels as well, or it gets ticked and
+   writes itself back into the map (= material cloning itself, one extra physics object each time) */
+function compactPixels(){
+  if (!PIXDIRTY) return;
+  PIXDIRTY = false;
+  if (typeof currentPixels === "undefined" || !currentPixels || !currentPixels.length) return;
+  var keep = [];
+  for (var i = 0; i < currentPixels.length; i++){
+    var p = currentPixels[i];
+    if (!p) continue;
+    if (p.del){ p.inPx = false; continue; }
+    p.inPx = true; keep.push(p);
+  }
+  if (keep.length === currentPixels.length) return;
+  currentPixels.length = 0;
+  for (i = 0; i < keep.length; i++) currentPixels.push(keep[i]);
+}
+function dropPix(p){ p.del = true; p.sub = undefined; p.inPx = false; PIXDIRTY = true; }
 var SSC = {};
 /* a solid that is neither a grain nor an anchor: it must get physics if its region is unsupported,
    even if the "does it fall" heuristic says no. this is what makes coverage exhaustive. */
@@ -834,7 +865,7 @@ function bodyFromPixels(list){
   bodyBudget--;
   var ax = list[0].x, ay = list[0].y, cells = new Map();
   list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
-  list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; q.del = true; } });
+  list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); } });
   var b = makeBody(cells, 0);
   b.x = ax; b.y = ay;
   ensurePB(b);
@@ -940,6 +971,7 @@ function processSupport(){
     }
     if (!sweepQ.length){ sweepQ = null; sweepChecked = null; }
   }
+  compactPixels();
   if (typeof currentPixels !== "undefined" && currentPixels.length){
     for (i = 0; i < 8; i++){
       var r = currentPixels[Math.floor(Math.random()*currentPixels.length)];
@@ -954,7 +986,7 @@ function joinPixel(b, p){
   if (b.cells.has(K(lx, ly))) return false;                     // cell taken: refuse rather than eat the pixel
   b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
   if (pixelMap[p.x] && pixelMap[p.x][p.y] === p) pixelMap[p.x][p.y] = undefined;
-  p.del = true;
+  dropPix(p);
   b.dirty = true; b.hold = pixelTicks + HOLD;
   return true;
 }
@@ -1477,6 +1509,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v17 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
