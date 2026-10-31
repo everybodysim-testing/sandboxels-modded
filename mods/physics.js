@@ -1,7 +1,14 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v21 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v22 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v22 - concrete specifically, three independent nets:
+         1. debris may never be the material that broke (concrete's breakInto IS concrete in
+            some element tables, and that alone is self-replication) and must be a grain
+         2. a material watchdog: for physics materials only, if a material's population grows
+            by more than 40 in 2 s while none of it was placed by hand, the surplus free
+            pixels are deleted on the spot. Whatever the source, concrete cannot accumulate.
+         3. smash() refuses to "change" a pixel into its own material and never touches proxies
    v21 - the runaway element factory. Since v20 anchored blocks are physics material, so the
          "make an anchored twin of every falling element" pass started minting twins OF ITS OWN
          TWINS (anchored_concrete -> anchored_anchored_concrete -> ...) every time it re-ran. The
@@ -719,17 +726,27 @@ function refreshTerrain(){
 
 /* ------------------------------------------------ impacts / powder pushing */
 function smash(p){
+  if (!p || p.del || p.sub !== undefined) return;                 // never rewrite a body proxy
   var e = elements[p.element]; if (!e || !e.breakInto) return;
   var t = e.breakInto; if (Array.isArray(t)) t = pick(t);
-  if (t && elements[t]) changePixel(p, t);
+  if (t && t !== p.element && elements[t]) changePixel(p, t);      // same material is a no-op, not a copy
 }
 function removeCell(b, k, debris){
   var cell = b.cells.get(k); if (!cell) return;
   b.cells.delete(k); b.dirty = true;
   if (debris && chance(0.55)){
     var w = toWorld(b, cell.x, cell.y), d = physOf(cell.e).debris;
+    /* a material may never produce itself, and debris must be a loose grain: anything else is
+       either self-replication (concrete!) or a fresh block appearing out of a shove */
+    if (d === cell.e || !isGrainEl(d)) return;
     if (d && isEmpty(Math.round(w.x), Math.round(w.y))) createPixel(d, Math.round(w.x), Math.round(w.y));
   }
+}
+function isGrainEl(id){
+  var e = elements[id]; if (!e) return false;
+  if (e.state !== undefined && e.state !== "solid") return true;
+  var bh = e.behavior;
+  return !!(e.movable === true || (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));
 }
 function hurt(b, x, y, s, tH){
   if (!b || b.dead) return;
@@ -855,6 +872,32 @@ function fluidInfo(b, R){
 /* ------------------------------------------------ falling: support detection */
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
 var INPROXY = false;
+var MAT_BASE = {}, MAT_PLACED = {}, MAT_LAST = -999;
+function auditMaterials(){
+  if (typeof currentPixels === "undefined" || !currentPixels) return;
+  var cnt = {}, free = {}, i, p, id;
+  for (i = 0; i < currentPixels.length; i++){
+    p = currentPixels[i]; if (!p || p.del) continue;
+    id = p.element; if (!id) continue;
+    cnt[id] = (cnt[id] || 0) + 1;
+    if (p.sub === undefined && !p.slOwn) (free[id] || (free[id] = [])).push(p);
+  }
+  for (id in cnt){
+    var prev = MAT_BASE[id], placed = MAT_PLACED[id] || 0;
+    MAT_BASE[id] = cnt[id];
+    if (prev === undefined) continue;
+    var growth = cnt[id] - prev - placed;
+    if (growth <= 40) continue;
+    if (!(fallEl(id) || isSoftSolid(id))) continue;               // only physics materials: sand/water spawners stay
+    var arr = free[id] || [], kill = Math.min(growth, arr.length);
+    for (i = arr.length - 1; i >= 0 && kill > 0; i--, kill--){
+      var q = arr[i];
+      if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); }
+    }
+    if (typeof logMessage === "function" && kill > 0) logMessage("Sublevel Physics: deleted " + kill + " self-created " + id + " pixels");
+  }
+  MAT_PLACED = {};
+}
 var PIXDIRTY = false;
 /* a pixel the mod removed must leave Sandboxels' currentPixels as well, or it gets ticked and
    writes itself back into the map (= material cloning itself, one extra physics object each time) */
@@ -1083,7 +1126,7 @@ function hookAll(){
       a.desc = "Anchored " + id.replace(/_/g, " ") + ": identical, but never falls.";
       if (!elements["anchored_" + id]){ elements["anchored_" + id] = a; econ++; }
     }
-    e.onPlace = function(p){ if (prevP) prevP(p); if (!NOJOIN && p.sub === undefined){ p.pa = pixelTicks; mark(p.x, p.y); } };
+    e.onPlace = function(p){ if (prevP) prevP(p); if (!NOJOIN && p.sub === undefined){ p.pa = pixelTicks; p.slOwn = true; MAT_PLACED[p.element] = (MAT_PLACED[p.element] || 0) + 1; mark(p.x, p.y); } };
     e.onDelete = function(p){ if (prevD) prevD(p); onDeleteProxy(p); };
     var an = animOf(id);
     if (an.anim && an.pure && typeof e.tick === "function"){      // grid-based animations run in the BODY's own grid
@@ -1365,6 +1408,7 @@ runEveryTick(function(){
   if (PL && !world) initWorld();
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
+  if (pixelTicks > 40 && pixelTicks % 60 === 0) auditMaterials();
   if (!sweepQ && pixelTicks > 30 && pixelTicks % 300 === 0) startSweep();   // rolling audit: nothing stays airborne
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
@@ -1550,8 +1594,8 @@ globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
-    hookAll: hookAll };
+    hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v21 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v22 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
