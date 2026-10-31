@@ -1,7 +1,22 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v13 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v15 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v15 - no more creeping spin in sand. the support/buoyancy force was applied at the fluid
+         contact centroid, which sits off the body's centre whenever sand touches one side
+         more than the other: a permanent off-centre force = permanent torque = it slowly
+         rotates forever. In powder the force is now applied through the centre of mass
+         (zero lever arm), angular damping in powder is stronger, and a body only latches
+         "settled" when it has stopped turning too.
+   v14 - fixes the v12/v13 regressions:
+         - sprite rendering REMOVED: element renderers baked into an offscreen canvas at a
+           fixed scale is what made bodies look shaded/broken. Pixels draw live again.
+         - proxy placement can no longer write into an occupied cell. When a grain could not
+           be shoved aside, createPixel() was called on top of it: the old pixel got orphaned
+           (kept ticking, re-appeared elsewhere = "it clones itself") and the next bookkeeping
+           pass wiped the slot (= "it randomly deletes"). Both are gone.
+         - body creation from a support scan is budgeted per tick, so a save loading with many
+           free chunks cannot spend the whole frame building bodies
    v13 - body creation made unconditional instead of "try it and put it back":
          - no velocity clamp (bodies were never actually launched off-screen)
          - every pixelMap touch in proxy placement is bounds-checked, which was the real
@@ -76,6 +91,7 @@ var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedC
 var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
 var MAXFIX = 260;              // collider budget per body
 var PROXYCAP = 400;            // proxies looked at per body per scan
+var bodyBudget = 6;            // new bodies allowed per tick (keeps a save load smooth)
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
 /* evenly-sampled proxies: cost of a scan no longer grows with body size */
 function sampleProxies(b, cap){
@@ -399,10 +415,12 @@ function placeNear(p, gx, gy){
       if (!outOfBounds(x,y) && pixelMap[x][y] === undefined){ p.x = x; p.y = y; pixelMap[x][y] = p; return true; }
     }
   }
+  if (!p.del && pixelMap[gx] && pixelMap[gx][gy] === undefined){ p.x = gx; p.y = gy; pixelMap[gx][gy] = p; return true; }
   p.del = true; return false;
 }
 function mkProxy(b, cell, gx, gy, spareBy){
   if (outOfBounds(gx, gy) || !pixelMap[gx]) return null;      // outside the sandbox: no proxy needed
+  if (pixelMap[gx][gy] !== undefined) return null;            // cell taken: never overwrite a live pixel
   var list = spareBy[cell.e], pix;
   if (list && list.length){ pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix; }
   else {
@@ -473,6 +491,7 @@ function syncProxies(b, R0){
       var ox = o.x, oy = o.y;
       relocate(o, gx, gy, want, rr, b.x, b.y);
       if (gone && !o.del){ o.pvx = (o.x - ox)*0.4 + (Math.random()-0.5)*0.2; o.pvy = (o.y - oy)*0.4 - 0.1; }
+      if (pixelMap[gx][gy] !== undefined) return;            // grain would not move: leave the cell alone
     }
     var pix = mkProxy(b, cell, gx, gy, spareBy);
     if (!pix) return;
@@ -768,6 +787,8 @@ function fluidInfo(b, R){
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
 function bodyFromPixels(list){
   if (!list || !list.length) return null;
+  if (bodyBudget <= 0) return null;                                 // try again next tick, pixels left as-is
+  bodyBudget--;
   var ax = list[0].x, ay = list[0].y, cells = new Map();
   list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
   list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; q.del = true; } });
@@ -842,6 +863,7 @@ function startSweep(){
   return true;
 }
 function processSupport(){
+  bodyBudget = 6;
   GC = new Set();
   var checked = sweepChecked || new Set(), n = 0, i;
   scanNodes = 0;
@@ -1257,21 +1279,27 @@ runEveryTick(function(){
     if (pfr > 0 && b.gf > 0){
       var dragK = PDRAG*pfr*(1 + Math.min(1.4, sp*1.2));      // faster = thicker, roughly a squared drag law
       if (dragK > lin) lin = dragK;
-      var angK = 0.7*pfr; if (angK > ang) ang = angK;
+      var angK = 1.2*pfr; if (angK > ang) ang = angK;
+      var wNow = b.pb.getAngularVelocity();
+      if (pfr > 0.25 && Math.abs(wNow) < 0.06){ b.pb.setAngularVelocity(0); wNow = 0; }   // kill the slow creep
       if (b.settled && (sp > SETTLE_SP || b.dirty)){ b.settled = false; b.stT = 0; }
       if (b.settled){
         lin = Math.max(lin, 8); ang = Math.max(ang, 6);
         Fb += m*G*b.gf;                                        // the grains carry it: exact counter-gravity, no creeping
         var sv = b.pb.getLinearVelocity();
-        if (Math.abs(sv.x) + Math.abs(sv.y) < 0.02){ b.pb.setLinearVelocity(PL.Vec2(0, 0)); b.pb.setAngularVelocity(0); }
-      } else if (sp < SETTLE_SP){
+        if (Math.abs(sv.x) + Math.abs(sv.y) < 0.02){ b.pb.setLinearVelocity(PL.Vec2(0, 0)); }
+        if (Math.abs(b.pb.getAngularVelocity()) < 0.08) b.pb.setAngularVelocity(0);
+      } else if (sp < SETTLE_SP && Math.abs(b.pb.getAngularVelocity()) < 0.08){
         b.stT = (b.stT || 0) + 1;
         if (b.stT >= SETTLE_N){ b.settled = true; b.stT = 0; b.pb.setLinearVelocity(PL.Vec2(0, 0)); b.pb.setAngularVelocity(0); }
       } else b.stT = 0;
     } else { b.settled = false; b.stT = 0; }
     if (GRAB && GRAB.b === b){ ang = Math.max(ang, 0.25); lin = Math.max(lin, 0.02); b.pb.setAwake(true); maxSp = 1; b.settled = false; b.stT = 0; }
     b.pb.setLinearDamping(lin); b.pb.setAngularDamping(ang);
-    forces.push({ b: b, F: Fb, x: fl.cx, y: fl.cy });
+    /* in powder the support pushes through the centre of mass: applied at the contact
+       centroid it would be a permanent off-centre force, i.e. an endless slow spin */
+    if (pfr > 0){ var wc0 = b.pb.getWorldCenter(); forces.push({ b: b, F: Fb, x: wc0.x, y: wc0.y }); }
+    else forces.push({ b: b, F: Fb, x: fl.cx, y: fl.cy });
   }
   if (pixelTicks % 20 === 0) TERRAIN_DIRTY = 1;               // safety net for changes no hook sees (acid, fire, saves)
   if (TERRAIN_DIRTY){ TERRAIN_DIRTY = 0; TE++; refreshTerrain(); }
@@ -1340,7 +1368,6 @@ runAfterReset(function(){
   sweepQ = null; sweepChecked = null; sweepAt = 3; sweepTries = 0;   // a save load fills the map right after this: sweep it once it is there
   if (world){ world = null; terrain = null; }
 });
-var SPRITE_EVERY = 8;                                  // rebuild a body's sprite at most every 8 frames
 function drawCells(b, ctx, ps, bord){
   var size = ps + 0.7;
   b.cells.forEach(function(c){
@@ -1364,22 +1391,6 @@ function drawCells(b, ctx, ps, bord){
     }
   });
 }
-/* one drawImage per body per frame instead of one fillRect per cell. Giant bodies are cached
-   at a reduced resolution so the canvas never gets silly big. */
-function spriteFor(b, ps, bord){
-  if (typeof document === "undefined" || !document.createElement) return null;
-  var W = Math.max(4, Math.ceil((b.rad*2 + 4)*ps));
-  var sc = W > 2048 ? 2048/W : 1, CW = Math.max(4, Math.round(W*sc));
-  if (b.spr && b.sprPs === ps && b.sprSc === sc && b.spr.width === CW && b.sprT !== undefined && (pixelTicks - b.sprT) < SPRITE_EVERY) return b.spr;
-  var cv = b.spr;
-  if (!cv){ cv = document.createElement("canvas"); b.spr = cv; }
-  cv.width = CW; cv.height = CW;
-  var c2 = cv.getContext("2d"); if (!c2) return null;
-  c2.clearRect(0, 0, CW, CW);
-  c2.save(); c2.translate(CW/2, CW/2); drawCells(b, c2, ps*sc, bord); c2.restore();
-  b.sprPs = ps; b.sprSc = sc; b.sprT = pixelTicks;
-  return cv;
-}
 renderPostPixel(function(ctx){
   var ps = pixelSize, keys = Object.keys(BODIES);
   var bord = (typeof renderPresets !== "undefined") ? renderPresets.BORDER : null;
@@ -1387,9 +1398,7 @@ renderPostPixel(function(ctx){
     var b = BODIES[keys[i]]; if (!b) continue;
     ctx.save();
     ctx.translate((b.x + 0.5)*ps, (b.y + 0.5)*ps); ctx.rotate(b.a);
-    var spr = (b.cells.size > 48) ? spriteFor(b, ps, bord) : null;
-    if (spr){ var dw = spr.width/(b.sprSc || 1); ctx.drawImage(spr, -dw/2, -dw/2, dw, dw); }
-    else drawCells(b, ctx, ps, bord);
+    drawCells(b, ctx, ps, bord);
     if (b.frozen){ ctx.strokeStyle = "rgba(123,220,255,0.9)"; ctx.lineWidth = 1; ctx.strokeRect(-ps*b.rad, -ps*b.rad, ps*2*b.rad, ps*2*b.rad); }
     ctx.restore();
   }
@@ -1408,6 +1417,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v13 loaded (Planck.js). Load it LAST in the mod list. FPS pass + unconditional body creation.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v15 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
