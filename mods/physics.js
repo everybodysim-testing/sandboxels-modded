@@ -1,7 +1,18 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v30 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v31 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v31 - the pixel renderers were being lied to. A body cell ran its element's renderer with the
+         cell's LOCAL grid coordinates instead of its world position, so any renderer that reads
+         pixel.x / pixel.y (stained glass picks its shade from where it sits) drew something
+         different from the pixel it represents, and on a rotated body it drew in a rotated frame
+         as well. Cells now hand the renderer real world coordinates and undo the body rotation
+         for that one cell (translate to the cell, rotate back, translate by -world), so the
+         renderer's own absolute drawing lands exactly on the cell. Body rotation therefore no
+         longer changes what a pixel looks like.
+         Cell colour also follows its placeholder every frame instead of being frozen at
+         conversion, so animated materials (anything the engine ticks, stained glass included)
+         keep their live state instead of drifting out of sync.
    v30 - support materials are enforced at ONE choke point now, not two guesses:
          - movesItself(id) decides once: M1/M2 in the behaviour grid, behaviours.SUPPORT by
            identity, a behaviour function, movable:true, or the named support materials
@@ -1614,10 +1625,15 @@ function drawCells(b, ctx, ps, bord){
     ctx.globalAlpha = (c.al === undefined || c.al === null) ? 1 : clamp(c.al, 0, 1);
     ctx.fillStyle = c.c || "#999999"; ctx.fillRect(X, Y, size, size);
     ctx.globalAlpha = 1;
+    if (c.px && !c.px.del && c.px.sub === b.id && c.px.color) c.c = c.px.color;   // colour follows the live placeholder
     if (rn && rn.__orig && !rn.__bord && !rn.__unsafe && c.px && !c.px.del && c.px.sub === b.id){
-      var px = c.px, ox = px.x, oy = px.y;                  // run the element's own renderer, in the body's grid
-      ctx.save(); ctx.translate(-0.5*ps, -0.5*ps);
-      try { px.x = c.x; px.y = c.y; rn.__orig(px, ctx); } catch (err) {}
+      var px = c.px, ox = px.x, oy = px.y, w = toWorld(b, c.x, c.y);
+      ctx.save();
+      ctx.translate((c.x - 0.5)*ps, (c.y - 0.5)*ps);        // to this cell
+      ctx.rotate(-b.a);                                      // undo the body's rotation for this one pixel
+      ctx.translate(-w.x*ps, -w.y*ps);                        // absolute drawing now lands on the cell
+      px.x = w.x; px.y = w.y;
+      try { rn.__orig(px, ctx); } catch (err) {}
       px.x = ox; px.y = oy;
       ctx.restore();
     }
@@ -1655,7 +1671,7 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
     hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials,
-    enforceMap: enforceMap, movesItself: movesItself };
+    enforceMap: enforceMap, movesItself: movesItself, drawCells: drawCells, toWorld: toWorld };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v30 loaded (Planck.js). Load it LAST in the mod list.");
 
