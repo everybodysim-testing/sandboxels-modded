@@ -151,25 +151,58 @@ function liq(x,y){
 function mark(x,y){ if (INPROXY) return; var gk = GK(x,y); TERRAIN_DIRTY = 1; if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
 
 /* ------------------------------------------------ which blocks get physics */
-/* anything that does not actively move on its own */
-function selfMoving(e){
-  var bh = e.behavior, i, j, s;
-  if (typeof bh === "function") return true;
+/* BEHAVIOUR GRID CLASSIFICATION (the tic tac toe rules).
+   A definition can carry a behaviour grid, three rows of three cells:
+
+       behavior: [
+         "XX|XX|XX",
+         "XX|XX|XX",
+         "XX|XX|XX"          <- all XX = a SOLID. it gets physics.
+
+   A cell that is exactly XX is solid. Any other token in a cell (M1 M2 M3, SP, CH, SW, DB,
+   DL, CF, SA, CL, EX, ...) describes pixel movement or a reaction, so a material carrying one
+   is NOT a solid and never gets physics. That is also where the duplication came from: a
+   material with a movement code was turned into a body, then its own code walked it out of the
+   cell and wrote a second pixel there. Non-solid-like materials never become a body and never
+   become a placeholder now. */
+var BHC = {};
+function behTokens(bh){
   if (Array.isArray(bh)){
-    if (bh.length === 3){
-      for (i = 0; i < 3; i++){
-        var row = bh[i]; if (typeof row === "string") row = row.split("|");
-        if (!Array.isArray(row)) continue;
-        for (j = 0; j < row.length; j++){
-          s = String(row[j]);
-          if (/M2/.test(s)) return true;                            // powders
-          if (/M1/.test(s) && !(i === 2 && j === 1)) return true;   // a straight fall (sturdy/support solids) is fine: they are static until unsupported
-        }
+    if (bh.length === 3 && (typeof bh[0] === "string" || Array.isArray(bh[0])) &&
+        (typeof bh[1] === "string" || Array.isArray(bh[1])) &&
+        (typeof bh[2] === "string" || Array.isArray(bh[2]))){
+      var out = [];
+      for (var i = 0; i < 3; i++){
+        var row = typeof bh[i] === "string" ? bh[i].split("|") : bh[i];
+        if (!Array.isArray(row)) return null;
+        for (var j = 0; j < row.length; j++) out.push(String(row[j]).trim().toUpperCase());
       }
-    } else if (/M[12]/.test(JSON.stringify(bh))) return true;
-  } else if (bh !== undefined) return true;
-  if (typeof e.tick === "function" && /tryMove|movePixel|swapPixels|moveTo\(/.test(String(e.tick))) return true;
-  return false;
+      return out;
+    }
+    return null;
+  }
+  if (typeof bh === "string") return bh.split("|").map(function(s){ return String(s).trim().toUpperCase(); });
+  return null;
+}
+function isSolidLike(id){
+  if (BHC[id] !== undefined) return BHC[id];
+  var e = elements[id], r = true;
+  if (!e){ BHC[id] = false; return false; }
+  var toks = behTokens(e.behavior);
+  if (toks){
+    for (var i = 0; i < toks.length; i++){
+      var t = toks[i].replace(/%[0-9.]+/g, "");    // "XX%2" is still a solid cell
+      if (t === "" || t === "XX") continue;        // empty cell = no behaviour, XX = solid
+      r = false; break;                            // anything else moves or reacts
+    }
+  } else if (typeof e.behavior === "function"){
+    r = !/M[123]|tryMove|movePixel|swapPixels|moveTo\(/.test(String(e.behavior));
+  } else if (toks === null && e.behavior !== undefined && e.behavior !== null){
+    var flat = JSON.stringify(e.behavior).toUpperCase();
+    r = !/M[123]|SP|CH|SW|DB|DL|CF|CL|EX/.test(flat);
+  }
+  if (e.movable === true) r = false;               // grains and liquids move themselves
+  BHC[id] = r; return r;
 }
 /* materials that must get physics even though the normal test skips them.
    rock_wall carries a tool function (sun/light handling), which made it look like a tool. */
@@ -179,7 +212,7 @@ function calcFall(id, e){
   if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
-  if (selfMoving(e)) return false;
+  if (!isSolidLike(id)) return false;
   return true;
 }
 Object.keys(PHYS_WHITELIST).forEach(function(id){ delete FC[id]; });
@@ -517,6 +550,7 @@ function syncProxies(b, R0){
     if (outOfBounds(gx, gy) || !pixelMap[gx]) return;          // cell hangs outside the sandbox
     var o = pixelMap[gx][gy];
     var cell = b.cells.get(R.ck[idx]); if (!cell) return;
+    if (!isSolidLike(cell.e)){ b.cells.delete(R.ck[idx]); return; }   // moved material never gets a placeholder
     if (o){
       if (occState(o) === 1) return;                        // overlap with a real solid: tolerated
       var gone = elements[o.element] && elements[o.element].state === "solid";
@@ -848,9 +882,7 @@ function isSoftSolid(id){
   if (e && (e.state === undefined || e.state === "solid")){
     if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys ||
           id === "wall" || /^anchored_/.test(id))){
-      var bh = e.behavior;
-      r = !(e.movable === true || typeof bh === "function" ||
-            (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));
+      r = isSolidLike(id);
     }
   }
   SSC[id] = r; return r;
@@ -1509,6 +1541,10 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function" && typeof elements !== "undefined"){
+  var _sl = 0, _mv = 0;
+  for (var _id in elements){ try { if (isSolidLike(_id)) _sl++; else _mv++; } catch(e){} }
+  logMessage("Sublevel Physics v38 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
+}
 
 })();
