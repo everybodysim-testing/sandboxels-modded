@@ -1,7 +1,19 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v22 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v24 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v24 - NEW ARCHITECTURE: body proxies are inert placeholders (sl_proxy), not real material.
+         Before this, every body pixel WAS the material, so the game kept running that material's
+         own tick and reactions on it: powders/heated/reacting materials (concrete, quicklime...)
+         rewrote or moved their placeholder, the mod then had to build a new one for the same
+         cell, and the old one stayed behind as extra material. That is the duplication, and it
+         only ever hit materials that do something on their own tick. Now a cell's placeholder
+         cannot tick, cannot react, cannot move and cannot change material, so one cell can never
+         put a second copy of anything into the world.
+         Also: anchored_* twins are body material too (the laboratory shelf was built from
+         anchored blocks, which were excluded, so it could never become an object), and a body
+         frozen/held at creation now switches back to dynamic by itself instead of staying static
+         forever (floating chunks in big saves).
    v22 - concrete specifically, three independent nets:
          1. debris may never be the material that broke (concrete's breakInto IS concrete in
             some element tables, and that alone is self-replication) and must be a grain
@@ -212,7 +224,8 @@ function selfMoving(e){
 var PHYS_WHITELIST = { rock_wall: 1 };
 function calcFall(id, e){
   if (PHYS_WHITELIST[id]) return !!(e && (e.state === undefined || e.state === "solid") && !e.anchored);
-  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall") return false;
+  if (!e || (e.tool && !e.canPlace) || e.slNoPhys || id === "wall" || id === "sl_proxy") return false;
+  if (e.anchored && !/^anchored_/.test(id)) return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
   if (selfMoving(e)) return false;
@@ -419,7 +432,15 @@ function rebuildFixtures(b){
   pb.resetMassData();
 }
 function ensurePB(b){
-  if (b.pb || !world) return;
+  if (!world) return;
+  if (b.pb){
+    var want = (b.frozen || pixelTicks < b.hold) ? "static" : "dynamic";
+    if (typeof b.pb.getType === "function" && typeof b.pb.setType === "function" && b.pb.getType() !== want){
+      b.pb.setType(want);                                        /* held or frozen at birth: it must be able to fall later */
+      if (want === "dynamic" && b.pb.setAwake) b.pb.setAwake(true);
+    }
+    return;
+  }
   b.pb = world.createBody({ type: (b.frozen || pixelTicks < b.hold) ? "static" : "dynamic",
     position: PL.Vec2(b.x, b.y), angle: b.a });
   b.pb.setGravityScale(b.gf);
@@ -487,19 +508,23 @@ function placeNear(p, gx, gy){
 function mkProxy(b, cell, gx, gy, spareBy){
   if (outOfBounds(gx, gy) || !pixelMap[gx]) return null;      // outside the sandbox: no proxy needed
   if (pixelMap[gx][gy] !== undefined) return null;            // cell taken: never overwrite a live pixel
-  var list = spareBy[cell.e], pix;
+  var list = spareBy[elements.sl_proxy ? "sl_proxy" : cell.e], pix;
   if (list && list.length){
     pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix;
     if (!pix.inPx && typeof currentPixels !== "undefined" && currentPixels){ currentPixels.push(pix); pix.inPx = true; }
   }
   else {
     var prev = NOJOIN, prevPx = INPROXY; NOJOIN = true; INPROXY = true;
-    try { createPixel(cell.e, gx, gy); } finally { NOJOIN = prev; INPROXY = prevPx; }
+    try { createPixel(elements.sl_proxy ? "sl_proxy" : cell.e, gx, gy); } finally { NOJOIN = prev; INPROXY = prevPx; }
     pix = pixelMap[gx][gy]; if (!pix || pix.del) return null;
     pix.inPx = true;
     pix.temp = cell.t !== undefined ? cell.t : 20;
   }
-  if (cell.c) pix.color = cell.c; else cell.c = pix.color;
+  if (!cell.c){
+    var ce = elements[cell.e], cc = ce && ce.color;
+    cell.c = Array.isArray(cc) ? pick(cc) : (typeof cc === "string" ? cc : "#8f979f");
+  }
+  pix.color = cell.c;
   return pix;
 }
 /* powder sitting on top of a body rides with it */
@@ -543,7 +568,7 @@ function syncProxies(b, R0){
     if (!valid){ b.proxies.delete(gk); return; }
     if (want.has(gk)){
       var nk = R.ck[want.get(gk)], nc = b.cells.get(nk);
-      if (nc && nc.e === pix.element){ pix.ck = nk; nc.px = pix; want.delete(gk); return; }
+      if (nc && (pix.element === "sl_proxy" || nc.e === pix.element)){ pix.ck = nk; nc.px = pix; want.delete(gk); return; }
     }
     b.proxies.delete(gk);
     pixelMap[pix.x][pix.y] = undefined;
@@ -605,8 +630,12 @@ function watchProxies(b){
       b.proxies.delete(gk); b.needSync = true; return;
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
-    if (pix.element !== cell.e){
-      cell.e = pix.element; b.dirty = true;              // adopt the new material, never drop the cell
+    if (pix.element !== "sl_proxy" && pix.element !== cell.e){
+      if (fallEl(pix.element) || isSoftSolid(pix.element)){ cell.e = pix.element; b.dirty = true; }   // real material: adopt it
+      else {                                             // the engine turned the placeholder into something fluid/gas
+        if (pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
+        dropPix(pix); b.proxies.delete(gk); b.needSync = true; return;
+      }
     }
     var an = animOf(cell.e); if (an.col) cell.c = pix.color; if (an.alp) cell.al = pix.alpha; cell.px = pix;
     sum[pix.ck] = (sum[pix.ck] || 0) + pix.temp; cnt[pix.ck] = (cnt[pix.ck] || 0) + 1; if (pix.charge) chg[pix.ck] = 1;
@@ -923,8 +952,10 @@ var SSC = {};
 function isSoftSolid(id){
   if (SSC[id] !== undefined) return SSC[id];
   var e = elements[id], r = false;
+  var twin = /^anchored_/.test(id);
   if (e && (e.state === undefined || e.state === "solid")){
-    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys || id === "wall")){
+    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.slNoPhys || id === "wall" ||
+          (!twin && (e.anchored || e.category === "anchored")))){
       var bh = e.behavior;
       r = !(e.movable === true || (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));   // only grains are left out
     }
@@ -1109,6 +1140,14 @@ function cloneReactions(r){
   return o;
 }
 var TWINCAP = 12000;
+if (typeof elements === "object" && elements && !elements.sl_proxy){
+  elements.sl_proxy = {                                            // inert stand-in for a body cell
+    color: ["#8f979f"], behavior: [], state: "solid", movable: false, category: "solids",
+    density: 2000, temp: 20, hidden: true, slNoPhys: true, noMix: true,
+    desc: "Internal: placeholder pixel for a Sublevel Physics body cell.",
+    renderer: function(){ return; }
+  };
+}
 function hookAll(){
   var econ = Object.keys(elements).length;
   Object.keys(elements).forEach(function(id){
@@ -1596,6 +1635,6 @@ if (globalThis.__SUBLEVEL_TEST__){
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
     hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v22 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v24 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
