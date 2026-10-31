@@ -1,7 +1,13 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v20 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v21 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v21 - the runaway element factory. Since v20 anchored blocks are physics material, so the
+         "make an anchored twin of every falling element" pass started minting twins OF ITS OWN
+         TWINS (anchored_concrete -> anchored_anchored_concrete -> ...) every time it re-ran. The
+         element table grew without limit, every copy a new material the picker and the physics
+         lookups have to walk: that is what looked like materials cloning themselves and where
+         the framerate went. Twins are never made of twins now, and the table has a hard cap.
    v20 - every duplication path closed at once:
          - bodies NEVER split. A body used to be torn into one new body per disconnected
            piece whenever a proxy died, which is where the army of extra physics objects and
@@ -1059,19 +1065,23 @@ function cloneReactions(r){
   Object.keys(r).forEach(function(k){ o[k] = (r[k] && typeof r[k] === "object") ? Object.assign({}, r[k]) : r[k]; });
   return o;
 }
+var TWINCAP = 12000;
 function hookAll(){
+  var econ = Object.keys(elements).length;
   Object.keys(elements).forEach(function(id){
     var e = elements[id]; if (!e || e.__slh || !calcFall(id, e)) return;
     e.__slh = true;
     var prevP = e.onPlace, prevD = e.onDelete, prevR = e.renderer;
-    if (id !== "physics_wall" && !e.hidden){                         // anchored twin (copied BEFORE hooking so it keeps its own animation hooks)
+    /* NEVER twin a twin, and never let the element table run away: a twin of a twin of a twin
+       is a fresh material every 90 ticks, which is both "cloning" and a framerate killer */
+    if (id !== "physics_wall" && !e.hidden && !/^anchored_/.test(id) && econ < TWINCAP){   // anchored twin (copied BEFORE hooking so it keeps its own animation hooks)
       var a = Object.assign({}, e);
       if (Array.isArray(a.color)) a.color = a.color.slice();
       if (Array.isArray(a.behavior)) a.behavior = a.behavior.slice();
       if (a.reactions) a.reactions = cloneReactions(a.reactions);
       a.category = "anchored"; a.anchored = true; delete a.hidden; delete a.__slh;
       a.desc = "Anchored " + id.replace(/_/g, " ") + ": identical, but never falls.";
-      if (!elements["anchored_" + id]) elements["anchored_" + id] = a;
+      if (!elements["anchored_" + id]){ elements["anchored_" + id] = a; econ++; }
     }
     e.onPlace = function(p){ if (prevP) prevP(p); if (!NOJOIN && p.sub === undefined){ p.pa = pixelTicks; mark(p.x, p.y); } };
     e.onDelete = function(p){ if (prevD) prevD(p); onDeleteProxy(p); };
@@ -1539,8 +1549,9 @@ globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
-    processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
+    processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
+    hookAll: hookAll };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v20 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v21 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
