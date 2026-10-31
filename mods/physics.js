@@ -1,7 +1,19 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v26 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v27 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v27 - packed sand's own description is the answer: it is a SUPPORT material, and support
+         materials carry a move rule in their behaviour grid (they fall straight down until
+         something holds them up). That single shared property is what concrete, quicklime and
+         packed sand have in common, and it is the only thing the duplication ever needed: such a
+         pixel keeps obeying its own move rule after it becomes a body's placeholder, so the game
+         walks it out of the body. The body then needs a fresh placeholder for that cell and the
+         walked-away pixel stays in the world as free material.
+         So support materials are no longer taken over at all: they stay exactly as Sandboxels
+         ships them, supporting themselves, never converted, never duplicated. Everything with no
+         move rule of its own (plain solids, rock, glass, metal, wood...) keeps getting physics.
+         Also: a placeholder that no longer matches its cell is now deleted on the spot instead of
+         being left loose, and ALL of the debug output is gone.
    v26 - three things, each one measured instead of guessed:
          1. anchored blocks are anchors again, never physics material (as ordered)
          2. ONE PIXEL, ONE CELL, enforced: every 30 ticks the map is swept and any cell whose
@@ -221,8 +233,8 @@ function selfMoving(e){
         if (!Array.isArray(row)) continue;
         for (j = 0; j < row.length; j++){
           s = String(row[j]);
-          if (/M2/.test(s)) return true;                            // powders
-          if (/M1/.test(s) && !(i === 2 && j === 1)) return true;   // a straight fall (sturdy/support solids) is fine: they are static until unsupported
+          if (/M2/.test(s)) return true;                            // powders slide
+          if (/M1/.test(s)) return true;                            // SUPPORT materials: they move themselves
         }
       }
     } else if (/M[12]/.test(JSON.stringify(bh))) return true;
@@ -636,7 +648,13 @@ function watchProxies(b){
       b.proxies.delete(gk); if (b.cells.delete(pix.ck)) b.dirty = true; return;
     }
     if (pix.sub !== b.id || !pixelMap[pix.x] || pixelMap[pix.x][pix.y] !== pix || GK(pix.x, pix.y) !== gk){
-      b.proxies.delete(gk); b.needSync = true; return;
+      var ours = (pix.sub === b.id);
+      b.proxies.delete(gk); b.needSync = true;
+      if (ours && !pix.del){                      /* our placeholder went walkabout: the cell is the truth */
+        if (pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
+        dropPix(pix);
+      }
+      return;
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
@@ -944,11 +962,11 @@ function auditBodies(){
              Math.abs(b.pb.getLinearVelocity ? b.pb.getLinearVelocity().y : 0) < 0.05){ b.frozen = true; ensurePB(b); }
   }
   SL_STATS.bodies = n; SL_STATS.cells = c; SL_STATS.proxies = p; SL_STATS.repairs += reps;
-  if (reps && typeof logMessage === "function") logMessage("Sublevel Physics: repaired " + reps + " cell/proxy mismatch(es)");
+  /* silent: repairs are recorded in SL_STATS */
 }
 function healthLine(){
-  try { globalThis.SL_STATS = SL_STATS; } catch (err){}
-  if (typeof logMessage === "function") logMessage("Sublevel Physics " + SL_STATS.version + ": bodies=" + SL_STATS.bodies + " cells=" + SL_STATS.cells + " proxies=" + SL_STATS.proxies + " lawFixes=" + SL_STATS.lawFixes + " repairs=" + SL_STATS.repairs + " debrisWatchdog=" + SL_STATS.wdKills);
+  try { globalThis.SL_STATS = SL_STATS; } catch (err){}   /* no logging: readable from the console */
+  return SL_STATS;
 }
 function enforceMap(){                                          /* ONE PIXEL, ONE CELL: a cell whose pixel
                                                                    reports another position is a stale duplicate */
@@ -962,7 +980,7 @@ function enforceMap(){                                          /* ONE PIXEL, ON
       if (p.x !== x || p.y !== y){ col[y] = undefined; fixed++; }
     }
   }
-  if (fixed){ SL_STATS.lawFixes += fixed; if (typeof logMessage === "function") logMessage("Sublevel Physics: cleared " + fixed + " duplicate pixel reference(s)"); }
+  if (fixed) SL_STATS.lawFixes += fixed;
 }
 var MAT_BASE = {}, MAT_PLACED = {}, MAT_LAST = -999;
 function auditMaterials(){
@@ -986,7 +1004,7 @@ function auditMaterials(){
       var q = arr[i];
       if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); SL_STATS.wdKills++; }
     }
-    if (typeof logMessage === "function" && kill > 0) logMessage("Sublevel Physics: deleted " + kill + " self-created " + id + " pixels");
+    if (kill > 0) SL_STATS.wdKills += kill;
   }
   MAT_PLACED = {};
 }
@@ -1012,6 +1030,26 @@ function dropPix(p){ p.del = true; p.sub = undefined; p.inPx = false; PIXDIRTY =
 var SSC = {};
 /* a solid that is neither a grain nor an anchor: it must get physics if its region is unsupported,
    even if the "does it fall" heuristic says no. this is what makes coverage exhaustive. */
+/* ------------------------------------------------------------------ element policy, one place
+   Every material resolves to exactly one policy. Nothing else in the file decides on its own
+   whether a material may become a body, which is what keeps a material from being half-taken. */
+var POLICY_CACHE = {};
+function policyOf(id){
+  var C = POLICY_CACHE[id]; if (C) return C;
+  var e = elements[id], p = { id: id, body: false, why: "missing" };
+  if (!e){ POLICY_CACHE[id] = p; return p; }
+  if (e.tool && !e.canPlace){ p.why = "tool"; POLICY_CACHE[id] = p; return p; }
+  if (e.category === "tools" || e.category === "energy"){ p.why = "tool category"; POLICY_CACHE[id] = p; return p; }
+  if (e.anchored || e.category === "anchored" || /^anchored_/.test(id)){ p.why = "anchored"; POLICY_CACHE[id] = p; return p; }
+  if (e.slNoPhys || id === "wall"){ p.why = "static material"; POLICY_CACHE[id] = p; return p; }
+  if (e.state !== undefined && e.state !== "solid"){ p.why = "not solid"; POLICY_CACHE[id] = p; return p; }
+  if (e.movable === true){ p.why = "grain"; POLICY_CACHE[id] = p; return p; }
+  var bh = e.behavior;
+  if (Array.isArray(bh) && /M[12]/.test(JSON.stringify(bh))){ p.why = "moves itself (support/powder)"; POLICY_CACHE[id] = p; return p; }
+  if (typeof bh === "function"){ p.why = "has behaviour of its own"; POLICY_CACHE[id] = p; return p; }
+  p.body = true; p.why = "plain solid";
+  POLICY_CACHE[id] = p; return p;
+}
 function isSoftSolid(id){
   if (SSC[id] !== undefined) return SSC[id];
   var e = elements[id], r = false;
@@ -1019,7 +1057,9 @@ function isSoftSolid(id){
     if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.category === "anchored" ||
           e.slNoPhys || id === "wall" || /^anchored_/.test(id))){
       var bh = e.behavior;
-      r = !(e.movable === true || (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));   // only grains are left out
+      /* grains, powders and SUPPORT materials are left entirely to the engine. A support material
+         carries its own move rule and would walk its placeholder out of any body we built. */
+      r = policyOf(id).body;
     }
   }
   SSC[id] = r; return r;
@@ -1705,6 +1745,6 @@ if (globalThis.__SUBLEVEL_TEST__){
     hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials,
     auditBodies: auditBodies, enforceMap: enforceMap, stats: function(){ return SL_STATS; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v26 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v27 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
