@@ -112,6 +112,14 @@
 (function () {
 
 var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB;
+var WELL_REF = 10;             // cells: at this distance strength 1 pulls exactly like normal gravity
+var WELL_REACH = 70;           // cells: beyond this a well is ignored
+var WELL_MINR = 1.5;           // cells: floor so a body resting on the well never gets an infinite pull
+var WELL_MAXA = 30;            // cap in units of G
+var WELL_STR = { gravity_well: 1, antigravity_well: 1 };
+var WELL_CATS = { gravity_well: 1, antigravity_well: 1 };
+var WELLS = [];                // live well pixels: {x, y}
+var WELL_SCAN = 0;
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
 var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
@@ -1318,6 +1326,103 @@ wrap("drawCursor", function(o){ return function(){
 }; });
 
 /* --------------------------------------------------------------- hooks */
+/* ============================================================ PHYSICS MATERIALS TAB
+   Two placeable wells. They are attractors, never bodies (slNoPhys), so they cannot be swept into a
+   shape, cannot clone and never fall: they just bend gravity for every physics object around them. */
+function askWellStrength(id){
+  var name = id === "antigravity_well" ? "Reverse Gravity Well" : "Gravity Well";
+  var cur = WELL_STR[id] === undefined ? 1 : WELL_STR[id];
+  if (typeof promptInput !== "function") return;
+  promptInput(
+    "Pick how strong this " + name.toLowerCase() + " is. 1 is normal gravity, 0.5 is half as strong, 2 is twice as strong. " +
+    "The pull fades with distance (like real gravity) and affects every physics object in reach. " +
+    "Applies to all " + name.toLowerCase() + "s you place.",
+    function(value){
+      if (value === null || value === undefined || value === "") return;
+      var v = parseFloat(value);
+      if (!isFinite(v) || v <= 0){ logMessage("Sublevel Physics: that is not a strength, keeping " + cur + "."); return; }
+      v = Math.max(0.05, Math.min(20, v));
+      WELL_STR[id] = v;
+      logMessage("Sublevel Physics: " + name + " strength set to " + v + (id === "gravity_well" ? " (pulls)" : " (pushes)") + ".");
+    },
+    "Sublevel Physics is asking you.",
+    String(cur)
+  );
+}
+/* declared the way the game's own mods do it: a plain element literal with a 3x3 behavior grid, a
+   category and a color. color/colorObject are given the exact shape the game's finalizeColor builds,
+   so the element panel can draw them no matter when this file loads. */
+var WELL_BEHAVIOR = (typeof behaviors !== "undefined" && behaviors && behaviors.WALL) ? behaviors.WALL : "XX|XX|XX";
+elements.gravity_well = {
+  behavior: WELL_BEHAVIOR,
+  color: "rgb(125,92,255)",
+  colorObject: { r: 125, g: 92, b: 255 },
+  category: "physics",
+  state: "solid",
+  density: 3200,
+  slNoPhys: true,
+  desc: "Pulls every physics object toward itself. Select it to set the strength (1 = normal gravity at 10 cells).",
+  onSelect: function(){ try { askWellStrength("gravity_well"); } catch(e){} },
+  onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} }
+};
+elements.antigravity_well = {
+  behavior: WELL_BEHAVIOR,
+  color: "rgb(255,92,224)",
+  colorObject: { r: 255, g: 92, b: 224 },
+  category: "physics",
+  state: "solid",
+  density: 3200,
+  slNoPhys: true,
+  desc: "Pushes every physics object away from itself. Select it to set the strength (1 = normal gravity at 10 cells).",
+  onSelect: function(){ try { askWellStrength("antigravity_well"); } catch(e){} },
+  onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} }
+};
+/* find every well pixel in the map (placement, save load, paste) */
+function scanWells(){
+  WELLS.length = 0; WELL_SCAN = 1;
+  if (typeof pixelMap !== "object" || !pixelMap) return;
+  for (var x = 0; x < width; x++){
+    var col = pixelMap[x]; if (!col) continue;
+    for (var y = 0; y < height; y++){
+      var p = col[y]; if (!p || p.del || p.sub !== undefined) continue;
+      if (WELL_CATS[p.element]) WELLS.push({ x: x, y: y });
+    }
+  }
+}
+function pruneWells(){
+  for (var i = WELLS.length - 1; i >= 0; i--){
+    var wv = WELLS[i], p = (typeof pixelMap !== "undefined" && pixelMap[wv.x]) ? pixelMap[wv.x][wv.y] : null;
+    if (!p || p.del || !WELL_CATS[p.element]) WELLS.splice(i, 1);
+  }
+}
+function applyWells(){
+  if (!WELLS.length) return 0;
+  var ids = Object.keys(BODIES), i, j, b, W = WELLS, nr = 0;
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]];
+    if (!b || b.dead || !b.pb || b.frozen || pixelTicks < b.hold) continue;
+    var c = b.pb.getWorldCenter(), fx = 0, fy = 0, hit = 0;
+    for (j = 0; j < W.length; j++){
+      var wv = W[j], dx = wv.x + 0.5 - c.x, dy = wv.y + 0.5 - c.y, r2 = dx*dx + dy*dy;
+      if (r2 > WELL_REACH*WELL_REACH) continue;
+      var p = pixelMap[wv.x] && pixelMap[wv.x][wv.y];
+      if (!p || p.del || !WELL_CATS[p.element]) continue;
+      var str = WELL_STR[p.element] === undefined ? 1 : WELL_STR[p.element];
+      if (str <= 0) continue;
+      var r = Math.sqrt(r2); if (r < WELL_MINR) r = WELL_MINR;
+      var a = G * str * (WELL_REF*WELL_REF) / (r*r);
+      if (a > G*WELL_MAXA) a = G*WELL_MAXA;
+      if (p.element === "antigravity_well") a = -a;
+      fx += a * dx / r; fy += a * dy / r; hit++;
+    }
+    if (!hit) continue;
+    var m = b.pb.getMass();
+    b.pb.applyForce(PL.Vec2(fx*m, fy*m), c, true);          /* mass cancels: acceleration, like gravity */
+    if (b.pb.isAwake && !b.pb.isAwake()) b.pb.setAwake(true);  /* a well must never leave a body asleep in mid air */
+    nr++;
+  }
+  return nr;
+}
 runEveryTick(function(){
   if (!PL) loadPlanck();
   if (PL && !world) initWorld();
@@ -1429,8 +1534,10 @@ runEveryTick(function(){
       }
     }
   }
+  if (!WELL_SCAN || (pixelTicks % 600) === 0) scanWells(); else if ((pixelTicks & 31) === 0) pruneWells();
   for (var s = 0; s < SUB; s++){
     for (i = 0; i < forces.length; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
+    try { applyWells(); } catch(e){ WELL_SCAN = 0; }
     if (GRAB && GRAB.b.pb && GRAB.b.pb.getType() === "dynamic"){
       var gb = GRAB.b, pb = gb.pb, pt = pb.getWorldPoint(PL.Vec2(GRAB.lx, GRAB.ly)), gv = pb.getLinearVelocityFromWorldPoint(pt);
       var gm = pb.getMass(), ax = 0.05*(mousePos.x - pt.x) - 0.45*gv.x, ay = 0.05*(mousePos.y - pt.y) - 0.45*gv.y;
@@ -1506,9 +1613,30 @@ loadPlanck();
 globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
-  globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
+  globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport, wells: function(){ return WELLS; }, applyWells: applyWells, setStrength: function(id, v){ WELL_STR[id] = v; },
+    scanWells: scanWells,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
 
+})();
+
+/* The element panel reads colorObject for every element it draws, and the game only fills that in
+   for elements that exist before its own finalize pass. Fill the exact shape here too, so a late
+   load can never hand the panel an undefined colorObject and break page setup. */
+(function(){
+  var mine = ["physgrab", "physkick", "physicsspin", "physicsfreeze", "physicsunfreeze", "physicsflip",
+              "physicssnap", "physicsalignedsnap", "gravity_well", "antigravity_well"];
+  for (var i = 0; i < mine.length; i++){
+    var e = elements[mine[i]];
+    if (!e) continue;
+    try {
+      if (e.colorObject && (e.colorObject.r !== undefined || Array.isArray(e.colorObject))) continue;
+      var c = e.color;
+      if (typeof c === "string" && c.charAt(0) === "#" && c.length >= 7){
+        var r = parseInt(c.substr(1, 2), 16), g = parseInt(c.substr(3, 2), 16), b = parseInt(c.substr(5, 2), 16);
+        if (r === r && g === g && b === b){ e.color = "rgb(" + r + "," + g + "," + b + ")"; e.colorObject = { r: r, g: g, b: b }; }
+      }
+    } catch(err){}
+  }
 })();
