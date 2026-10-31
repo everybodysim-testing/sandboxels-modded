@@ -1,7 +1,16 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v9  -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v10 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v10 - powder drag instead of the sink limiter. Solids falling into sand/gravel
+         now lose speed to DRAG that scales with the number of grains UNDER the
+         body (nothing above it counts, so cups full of sand are untouched), and
+         once the speed drops to a crawl for a few ticks the body SETTLES where it
+         is and the grains hold it up (gravity cancelled) instead of creeping down
+         forever. Fast/heavy bodies punch in deep, light ones stop on top. Dug out
+         from under it, or hit by a tool/other body, it starts moving again.
+         rock_wall is whitelisted to get physics (it is a tool element, so the
+         normal test used to skip it).
    v9  - sand/solid interaction MERGED BACK FROM v5. v7/v8 turned every powder
          surface into a real (non-sensor) collider so solids stopped sinking into
          sand; that made sand feel like concrete. This version keeps the v6-v8
@@ -34,6 +43,7 @@
 (function () {
 
 var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB;
+var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
 var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
@@ -78,13 +88,18 @@ function selfMoving(e){
   if (typeof e.tick === "function" && /tryMove|movePixel|swapPixels|moveTo\(/.test(String(e.tick))) return true;
   return false;
 }
+/* materials that must get physics even though the normal test skips them.
+   rock_wall carries a tool function (sun/light handling), which made it look like a tool. */
+var PHYS_WHITELIST = { rock_wall: 1 };
 function calcFall(id, e){
+  if (PHYS_WHITELIST[id]) return !!(e && (e.state === undefined || e.state === "solid") && !e.anchored);
   if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
   if (selfMoving(e)) return false;
   return true;
 }
+Object.keys(PHYS_WHITELIST).forEach(function(id){ delete FC[id]; });
 function fallEl(id){
   var c = FC[id]; if (c !== undefined) return c;
   return (FC[id] = calcFall(id, elements[id]));
@@ -96,6 +111,24 @@ function isPowderPix(p){
   if (!p || p.del || p.sub !== undefined) return false;
   var e = elements[p.element]; if (!e || (e.state !== "solid" && e.state !== undefined)) return false;
   return e.movable === true && !e.anchored && !fallEl(p.element);
+}
+
+/* how much powder is holding a body up: grains directly UNDER its footprint. nothing above
+   counts (that is a rider, e.g. sand in a cup). bot = open underside cells, hit = those on powder */
+function powderUnder(b){
+  var hit = 0, bot = 0, n = 0;
+  b.proxies.forEach(function(pix){
+    if (n++ > 4000) return;
+    var q = pxAt(pix.x, pix.y + 1);
+    if (!q){ bot++; return; }
+    if (q.del) return;
+    if (q.sub !== undefined) return;                      // another physics body below: not powder
+    if (isPowderPix(q)){ bot++; hit++; return; }
+    var e = elements[q.element]; if (!e) return;
+    if (e.state === "liquid" || e.state === "gas"){ bot++; return; }
+    /* solid ground below: the collider already handles it */
+  });
+  return { hit: hit, bot: bot };
 }
 
 /* animated elements: only those whose tick rewrites colour/alpha are treated specially */
@@ -1097,7 +1130,26 @@ runEveryTick(function(){
       lin = Math.min(0.7, frac*(0.14 + 0.16*sp + Math.min(0.3, 0.02*fl.rho/Math.max(30, avgD))));
       ang = Math.min(0.5, 0.28*frac);
     }
-    if (GRAB && GRAB.b === b){ ang = Math.max(ang, 0.25); lin = Math.max(lin, 0.02); b.pb.setAwake(true); maxSp = 1; }
+    /* powder drag: only the grains UNDER the body hold it back, and more contact = more drag.
+       Slowed to a crawl for a few ticks, it settles where it is instead of creeping down forever. */
+    var pu = powderUnder(b); b.pf = pu.hit; b.pfb = pu.bot;
+    var pfr = pu.bot > 0 ? Math.min(1, pu.hit/pu.bot) : 0;
+    if (pfr > 0 && b.gf > 0){
+      var dragK = PDRAG*pfr*(1 + Math.min(1.4, sp*1.2));      // faster = thicker, roughly a squared drag law
+      if (dragK > lin) lin = dragK;
+      var angK = 0.7*pfr; if (angK > ang) ang = angK;
+      if (b.settled && (sp > SETTLE_SP || b.dirty)){ b.settled = false; b.stT = 0; }
+      if (b.settled){
+        lin = Math.max(lin, 8); ang = Math.max(ang, 6);
+        Fb += m*G*b.gf;                                        // the grains carry it: exact counter-gravity, no creeping
+        var sv = b.pb.getLinearVelocity();
+        if (Math.abs(sv.x) + Math.abs(sv.y) < 0.02){ b.pb.setLinearVelocity(PL.Vec2(0, 0)); b.pb.setAngularVelocity(0); }
+      } else if (sp < SETTLE_SP){
+        b.stT = (b.stT || 0) + 1;
+        if (b.stT >= SETTLE_N){ b.settled = true; b.stT = 0; b.pb.setLinearVelocity(PL.Vec2(0, 0)); b.pb.setAngularVelocity(0); }
+      } else b.stT = 0;
+    } else { b.settled = false; b.stT = 0; }
+    if (GRAB && GRAB.b === b){ ang = Math.max(ang, 0.25); lin = Math.max(lin, 0.02); b.pb.setAwake(true); maxSp = 1; b.settled = false; b.stT = 0; }
     b.pb.setLinearDamping(lin); b.pb.setAngularDamping(ang);
     forces.push({ b: b, F: Fb, x: fl.cx, y: fl.cy });
   }
@@ -1134,11 +1186,6 @@ runEveryTick(function(){
         var frac = Math.min(1, (vn - 0.05) * 0.4 * mass * 0.01);
         if (frac <= 0) continue;
         if (!chance(Math.min(0.9, frac))) continue;
-        /* sinking budget: at most ~4 pixels */
-        if (D4[d][1] > 0){                                                // downward push = sinking
-          b.sref = b.sref !== undefined ? b.sref : b.y; b.sT = pixelTicks;
-          if (b.y - b.sref > 4) continue;
-        }
         if (relocate(g, nx, ny, null, null)){
           g.pvx = D4[d][0] * Math.min(1.4, vn * 0.6 + (Math.random() - 0.5) * 0.3);
           g.pvy = D4[d][1] * Math.min(1.4, vn * 0.5) - 0.1;
@@ -1220,6 +1267,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v9 loaded (Planck.js). Load it LAST in the mod list. v5 sand/solid shoving restored.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v10 loaded (Planck.js). Load it LAST in the mod list. Powder drag + settle, rock_wall has physics.");
 
 })();
