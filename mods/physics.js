@@ -1,16 +1,7 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v39 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v18 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
-   v39 - FRAME COST. Same behaviour, less work per tick:
-         - terrain is rebuilt on a dirty flag only (it used to rebuild every 3rd tick and on every
-           fast-moving frame): a body that has not moved reuses last pass's fixtures and riders.
-         - powder under a body is sampled once per pose per terrain version instead of every frame.
-         - proxy sampling writes into one shared scratch buffer: no array and no closure per call.
-         - the force list is a reusable pool: two objects per body per frame became zero.
-         - Object.keys(BODIES) was built twice a frame; it is cached until a body is created/killed.
-         - watchProxies iterates without closures over the live map.
-         - the solver is skipped entirely on frames with no dynamic body.
    v18 - THE clone fix. When a pixel became part of a body it was cleared out of the map and
          flagged dead, but it was never taken out of Sandboxels' own currentPixels list. A dead
          pixel that is still in that list gets ticked, and when its old cell is empty again it
@@ -243,10 +234,7 @@ function isPowderPix(p){
 
 /* how much powder is holding a body up: grains directly UNDER its footprint. nothing above
    counts (that is a rider, e.g. sand in a cup). bot = open underside cells, hit = those on powder */
-var PUR = { hit: 0, bot: 0 };
 function powderUnder(b){
-  if (b.pwT === pixelTicks && b.pwE === TE && Math.abs(b.x - b.pwX) < 0.08 && Math.abs(b.y - b.pwY) < 0.08) return PUR;
-  b.pwT = pixelTicks; b.pwE = TE; b.pwX = b.x; b.pwY = b.y;
   var hit = 0, bot = 0;
   var smp = sampleProxies(b, PROXYCAP), sn = SPN;
   for (var si = 0; si < sn; si++){
@@ -260,7 +248,7 @@ function powderUnder(b){
     if (e.state === "liquid" || e.state === "gas"){ bot++; continue; }
     /* solid ground below: the collider already handles it */
   }
-  PUR.hit = hit; PUR.bot = bot; return PUR;
+  return { hit: hit, bot: bot };
 }
 
 /* animated elements: only those whose tick rewrites colour/alpha are treated specially */
@@ -371,9 +359,7 @@ function calc(b){
   b.cells.forEach(function(c){ rad = Math.max(rad, Math.sqrt(c.x*c.x + c.y*c.y) + 0.75); });
   b.rad = rad;
 }
-var bodiesVer = 0, idsCache = null, idsVer = -1;
 function makeBody(cells, ang){
-  bodiesVer++;
   var b = { id: baseId + (idc++), cells: cells, x: 0, y: 0, a: ang || 0, gf: 1, proxies: new Map(),
     dirty: false, needSync: false, dead: false, hold: 0, frozen: false, pb: null, sx: 1e9, sy: 1e9, sa: 1e9,
     pend: null, wet: 0, pbud: 0, pbT: -999, slI: (idc % 3) };
@@ -618,9 +604,9 @@ function fpush(b, F, x, y){
 function watchProxies(b){
   var sum = {}, cnt = {}, chg = {};
   if (!b.proxies.size) return;
-  var it = b.proxies.entries(), e2;
-  while (!(e2 = it.next()).done){
-    var gk = e2.value[0], pix = e2.value[1];
+  var _it = b.proxies.entries(), _e;
+  while ((_e = _it.next()) && !_e.done){
+    var gk = _e.value[0], pix = _e.value[1];
     if (pix.del && pix.sub === b.id){
       b.proxies.delete(gk); if (b.cells.delete(pix.ck)) b.dirty = true; continue;
     }
@@ -1390,8 +1376,7 @@ runEveryTick(function(){
     }
   }
   processSupport();
-  if (idsVer !== bodiesVer){ idsCache = Object.keys(BODIES); idsVer = bodiesVer; }
-  var ids = idsCache, i, b;
+  var ids = Object.keys(BODIES), i, b;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead) continue;
     if (b.proxies.size <= 220 || ((pixelTicks + (b.slI || 0)) % 3) === 0) watchProxies(b);   // big bodies: every 3rd tick
@@ -1401,19 +1386,17 @@ runEveryTick(function(){
 
   if (GRAB && (!mouseIsDown || currentElement !== "physgrab" || GRAB.b.dead || !GRAB.b.pb)) GRAB = null;
 
-  var forces = FRCP; FRN = 0; var maxSp = 0, dynN = 0, idleN = 0;
+  var forces = FRCP; FRN = 0; var maxSp = 0;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var stat = b.frozen || pixelTicks < b.hold, want = stat ? "static" : "dynamic";
     if (b.pb.getType() !== want){ b.pb.setType(want); if (!stat){ b.pb.setGravityScale(b.gf); b.pb.setAwake(true); } }
     if (stat) continue;
-    dynN++;
     var R;
     if (b.Rtick && Math.abs(b.x - b.Rx) < 0.02 && Math.abs(b.y - b.Ry) < 0.02 && Math.abs(b.a - b.Ra) < 0.005) R = b.Rtick;
     else R = raster(b, b.x, b.y, b.a);                 // geometry only: surrounding pixels are read live
     var fl = fluidInfo(b, R); b.wet = fl.n;
     var m = b.pb.getMass(), lin = 0.002, ang = 0.02, Fb = 0, v = b.pb.getLinearVelocity();
-    if (Math.abs(v.x) + Math.abs(v.y) < 0.03 && Math.abs(b.pb.getAngularVelocity()) < 0.06) idleN++;
     var sp = Math.sqrt(v.x*v.x + v.y*v.y);
     b.Rt = pixelTicks; b.Rx = b.x; b.Ry = b.y; b.Ra = b.a; b.Rtick = R;
     maxSp = Math.max(maxSp, sp + Math.abs(b.pb.getAngularVelocity())*b.rad*0.5);
@@ -1454,8 +1437,8 @@ runEveryTick(function(){
     else fpush(b, Fb, fl.cx, fl.cy);
   }
   if (pixelTicks % 20 === 0) TERRAIN_DIRTY = 1;               // safety net for changes no hook sees (acid, fire, saves)
-  if (maxSp > 0.6) TERRAIN_DIRTY = 1;                         /* moving fast: refresh next tick, not every tick */
   if (TERRAIN_DIRTY){ TERRAIN_DIRTY = 0; TE++; refreshTerrain(); }
+  else if (pixelTicks % 3 === 0 || maxSp > 0.6) refreshTerrain();
   /* direct powder push: scan the surface of each body's proxy footprint (uses live velocity pre-step) */
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic") continue;
@@ -1489,14 +1472,7 @@ runEveryTick(function(){
       }
     }
   }
-  if (!dynN && !(GRAB && GRAB.b.pb)) {                            /* nothing is simulating: skip the solver */
-    if (TERRAIN_DIRTY){ TERRAIN_DIRTY = 0; TE++; refreshTerrain(); }
-    return;
-  }
-  /* every dynamic body is motionless and the terrain is stable: integrating cannot change anything,
-     so the four solver passes are skipped this tick (a single moving pixel or body resumes them) */
-  var idleSkip = dynN > 0 && idleN === dynN && !TERRAIN_DIRTY && !(GRAB && GRAB.b.pb);
-  for (var s = 0; s < SUB && !idleSkip; s++){
+  for (var s = 0; s < SUB; s++){
     for (i = 0; i < FRN; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
     if (GRAB && GRAB.b.pb && GRAB.b.pb.getType() === "dynamic"){
       var gb = GRAB.b, pb = gb.pb, pt = pb.getWorldPoint(PL.Vec2(GRAB.lx, GRAB.ly)), gv = pb.getLinearVelocityFromWorldPoint(pt);
@@ -1579,7 +1555,7 @@ if (globalThis.__SUBLEVEL_TEST__){
 if (typeof logMessage === "function" && typeof elements !== "undefined"){
   var _sl = 0, _mv = 0;
   for (var _id in elements){ try { if (isSolidLike(_id)) _sl++; else _mv++; } catch(e){} }
-  logMessage("Sublevel Physics v39 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
+  logMessage("Sublevel Physics v38 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
 }
 
 })();
