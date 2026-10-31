@@ -1,5 +1,5 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v48 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v49 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
    v46 - PHYSICS MATERIALS TAB + more speed under load:
@@ -1200,64 +1200,34 @@ function hookWellButton(id){
   btn.__slWell = 1;
   btn.addEventListener("click", function(){ askWellStrength(id); });
 }
-function wellDef(color, rgb, desc){
-  var wall = (typeof behaviors === "object" && behaviors && behaviors.WALL) ? behaviors.WALL : [["XX","XX","XX"],["XX","XX","XX"],["XX","XX","XX"]];
-  return { color: color, colorObject: [rgb], behavior: wall,
-    category: "physics", state: "solid", density: 3200, desc: desc,
-    slNoPhys: true, hidden: false,
-    onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} } };
-}
-function wellButtonDOM(id){
-  /* the panel is built once, before this file runs, so a well gets its own button built here.
-     plain DOM only: no game helper is assumed to be reachable from a mod's scope. */
-  try {
-    if (typeof document === "undefined" || !document.getElementById || typeof elements !== "object" || !elements[id]) return;
-    if (document.getElementById("elementButton-" + id)) return;
-    var ec = document.getElementById("elementControls"), cc = document.getElementById("categoryControls");
-    if (!ec || !cc) return;
-    if (!document.getElementById("categoryButton-physics")){
-      var cb = document.createElement("button");
-      cb.id = "categoryButton-physics"; cb.className = "categoryButton"; cb.innerText = "Physics";
-      cb.setAttribute("category", "physics");
-      cb.onclick = function(){ if (typeof selectCategory === "function") selectCategory("physics"); };
-      cc.appendChild(cb);
-    }
-    var div = document.getElementById("category-physics");
-    if (!div){
-      div = document.createElement("div"); div.id = "category-physics";
-      div.setAttribute("category", "physics"); div.className = "category"; div.style.display = "none";
-      ec.appendChild(div);
-    }
-    var btn = document.createElement("button");
-    btn.id = "elementButton-" + id; btn.className = "elementButton";
-    btn.innerText = elements[id].name || id.replace(/_/g, " ");
-    btn.setAttribute("element", id); btn.setAttribute("current", "false");
-    btn.style.background = elements[id].color;
-    btn.onclick = function(){ currentElement = id; if (typeof selectCategory === "function") selectCategory("physics"); askWellStrength(id); };
-    btn.oncontextmenu = function(e){ if (e && e.preventDefault) e.preventDefault(); };
-    div.appendChild(btn);
-  } catch(e){}
-}
-function ensureWellUI(){
-  wellButtonDOM("gravity_well"); wellButtonDOM("antigravity_well");
-  hookWellButton("gravity_well"); hookWellButton("antigravity_well");
-}
-function addWellElements(){
-  if (typeof elements !== "object" || !elements || elements.gravity_well) return;
-  var gw = wellDef("#7d5cff", [125, 92, 255], "Pulls every physics object toward itself. Click it to set the strength (1 = normal gravity).");
-  var aw = wellDef("#ff5ce0", [255, 92, 224], "Pushes every physics object away from itself. Click it to set the strength (1 = normal gravity).");
-  [["gravity_well", gw], ["antigravity_well", aw]].forEach(function(pair){
-    var id = pair[0], def = pair[1];
-    try {
-      if (typeof addElement === "function") addElement(id, def);          /* the game's own path: keeps counts and the panel right */
-      else {
-        elements[id] = def;
-        if (typeof finalizeElement === "function") finalizeElement(id, def);
-      }
-    } catch(e){ elements[id] = elements[id] || def; }
-  });
-  if (typeof runAfterLoad === "function") runAfterLoad(function(){ try { ensureWellUI(); } catch(e){} });
-}
+/* Wells are declared the way the game's own mods do it: a plain element literal with a 3x3
+   behavior grid, a hex color and a category. The element panel builds the tab and both buttons
+   from these, so this file touches no DOM and registers nothing by hand. */
+var WELL_BEHAVIOR = (typeof behaviors !== "undefined" && behaviors && behaviors.WALL) ? behaviors.WALL : "XX|XX|XX";
+elements.gravity_well = {
+  behavior: WELL_BEHAVIOR,
+  color: "rgb(125,92,255)",
+  colorObject: { r: 125, g: 92, b: 255 },
+  category: "physics",
+  state: "solid",
+  density: 3200,
+  desc: "Pulls every physics object toward itself. Select it to set the strength (1 = normal gravity at 10 cells).",
+  slNoPhys: true,
+  onSelect: function(){ try { askWellStrength("gravity_well"); } catch(e){} },
+  onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} }
+};
+elements.antigravity_well = {
+  behavior: WELL_BEHAVIOR,
+  color: "rgb(255,92,224)",
+  colorObject: { r: 255, g: 92, b: 224 },
+  category: "physics",
+  state: "solid",
+  density: 3200,
+  desc: "Pushes every physics object away from itself. Select it to set the strength (1 = normal gravity at 10 cells).",
+  slNoPhys: true,
+  onSelect: function(){ try { askWellStrength("antigravity_well"); } catch(e){} },
+  onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} }
+};
 /* find every well pixel in the map (placement, save load, paste) */
 function scanWells(){
   WELLS.length = 0; WELL_SCAN = 1;
@@ -1623,8 +1593,6 @@ runEveryTick(function(){
   if (GRAB && GRAB.b.pb && GRAB.b.pb.setAwake) GRAB.b.pb.setAwake(true);
 
   if (!WELL_SCAN || (pixelTicks % 600) === 0) scanWells(); else if ((pixelTicks & 31) === 0) pruneWells();
-  if (typeof WELL_UI_T === "undefined") { var WELL_UI_T = 0; }
-  if (WELL_UI_T <= 0){ WELL_UI_T = 180; try { ensureWellUI(); } catch(e){} } else WELL_UI_T--;
   try { applyWells(); } catch(e){ WELL_SCAN = 0; }
   var forces = FRCP; FRN = 0; var maxSp = 0;
   for (i = 0; i < ids.length; i++){
@@ -1799,7 +1767,7 @@ renderPostPixel(function(ctx){
   }
 });
 
-try { addWellElements(); } catch(e){}
+
 loadPlanck();
 globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
@@ -1815,4 +1783,28 @@ if (typeof logMessage === "function" && typeof elements !== "undefined"){
   logMessage("Sublevel Physics v46 loaded. " + _sl + " solid-like materials get physics, " + _mv + " moving/anchored materials stay native. Load it LAST in the mod list.");
 }
 
+})();
+
+/* The element panel reads colorObject for every element it draws, and the game only fills that in
+   for elements that exist before its finalize pass. A mod that loads after that pass would hand the
+   panel an undefined colorObject, which throws inside the loop and stops page setup. Fill in exactly
+   the shape finalizeColor produces, so the panel can always draw these. */
+(function(){
+  var mine = ["physgrab","physkick","physicsspin","physicsfreeze","physicsunfreeze","physicsflip",
+              "physicssnap","physicsalignedsnap","gravity_well","antigravity_well"];
+  for (var i = 0; i < mine.length; i++){
+    var e = elements[mine[i]];
+    if (!e) continue;
+    try {
+      if (e.colorObject && (e.colorObject.r !== undefined || Array.isArray(e.colorObject))) continue;
+      var c = e.color;
+      if (typeof c === "string" && c.charAt(0) === "#" && c.length >= 7){
+        var r = parseInt(c.substr(1, 2), 16), g = parseInt(c.substr(3, 2), 16), b = parseInt(c.substr(5, 2), 16);
+        if (r === r && g === g && b === b){
+          e.color = "rgb(" + r + "," + g + "," + b + ")";
+          e.colorObject = { r: r, g: g, b: b };
+        }
+      }
+    } catch(err){}
+  }
 })();
