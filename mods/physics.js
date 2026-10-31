@@ -1,12 +1,21 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v8  -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v9  -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v9  - sand/solid interaction MERGED BACK FROM v5. v7/v8 turned every powder
+         surface into a real (non-sensor) collider so solids stopped sinking into
+         sand; that made sand feel like concrete. This version keeps the v6-v8
+         work (physgrab, riders, support check, editor remap, animated colours)
+         but the powder interaction is the v5 one again:
+         - powders stay SOFT sensors, so bodies move through them in any direction
+         - the v5 pre-step scan shoves and FLINGS grains aside with real velocity
+           (grains on top of a body ride along, cups still carry sand)
+         - v5 impulse-vs-resistance powder push restored (heavy/fast wins, a light
+           body just sits on top)
+         - the v8 depth-limited "sink 5 px then act like ground" limiter and the
+           v8 impact splash are removed (they were the unnatural part)
    v6 (written against the real 1.13 source: mouse1Action / mouse2Action /
    drawCursor / lineCoords / erase tool)
-   - Solids can no longer plow through powder. Powder surfaces are colliders;
-     a heavy body may displace grains only until it has sunk ~5 px, then it
-     rests. Light bodies rest on top. Displaced grains are flung with velocity.
    - Powder lying on a body rides along with it (cups carry sand, you can lift
      a pile, kicking never drops grains through the bottom).
    - Support check: only things connected (through solids/powders) to the world
@@ -24,7 +33,7 @@
    ========================================================================== */
 (function () {
 
-var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB, SINKMAX = 5;
+var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB;
 var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
@@ -475,7 +484,9 @@ function refreshTerrain(){
       var gk = GK(x, y); if (seen.has(gk)) continue; seen.add(gk);
       var p = pxAt(x, y); if (!p || p.sub !== undefined || RIDERS.has(p)) continue;
       var e = elements[p.element]; if (!e || e.state === "liquid" || e.state === "gas") continue;
-      var kind = (e.movable === true && !e.anchored && !fallEl(p.element)) ? 2 : 1;
+      /* v5 rule: every movable material (powder/sand/gravel) is a SOFT sensor, so bodies can
+         push through it in any direction instead of resting on it like rock */
+      var kind = (e.movable === true) ? 2 : 1;
       var surf = false;
       for (var d = 0; d < 4; d++){
         var n = pxAt(x + D4[d][0], y + D4[d][1]);
@@ -502,7 +513,7 @@ function refreshTerrain(){
     if (tfix.has(key)) return;
     var len = r.x1 - r.x0 + 1;
     tfix.set(key, terrain.createFixture(PL.Box(len/2, 0.5, PL.Vec2((r.x0 + r.x1)/2, r.y)),
-      { friction: r.kind === 2 ? 0.5 : 0.8, restitution: 0, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1 } }));
+      { friction: r.kind === 2 ? 0.25 : 0.8, restitution: 0, isSensor: r.kind === 2, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1 } }));
   });
 }
 
@@ -547,63 +558,33 @@ function processImpacts(){
           if (hard < 0.95 && chance(Math.min(0.7, (im.s - 1.0)*0.2*Math.min(3, mass/6)*(1 - hard)))) smash(p);
         }
       }
-      if (kind.kind === 2 && im.s > 0.7) splash(im.x, im.y, im.s, mine);
       hurt(mine, im.x, im.y, im.s, tH);
     } else { hurt(A, im.x, im.y, im.s, 0.6); hurt(B, im.x, im.y, im.s, 0.6); }
   });
   impacts.length = 0;
 }
-/* Powder is neither rock nor water: heavy bodies sink into it a LITTLE (depth-limited to ~SINKMAX px per contact episode),
-   shoving and flinging grains aside, then rest on it. Light bodies just rest on top. */
-function sinkHv(b, grainDens){
-  var avgD = b.pb.getMass()/Math.max(1, b.cells.size)*1000;
-  return clamp((avgD/Math.max(300, grainDens || 1500) - 0.35)/0.5, 0, 1);
-}
 function processPushes(){
-  var done = new Set(), count = 0;
+  var done = new Set();
   pushes.forEach(function(ps){
-    var bb = ps.b; if (!bb || bb.dead || !bb.pb) return;
-    var run = ps.run, cx0 = clamp(Math.round(ps.x), run.x0, run.x1);
-    var p0 = pxAt(cx0, run.y); if (!p0 || p0.sub !== undefined) return;
-    var e0 = elements[p0.element]; if (!e0) return;
-    if (pixelTicks - bb.pbT > 25){                                   // new contact episode
-      bb.pbhv = sinkHv(bb, e0.density);
-      bb.pbY0 = bb.y;
-      bb.pbud = bb.pbhv*SINKMAX*clamp(bb.rad*1.6, 4, 28)*1.5;
-    }
-    bb.pbT = pixelTicks;
-    var depth = (bb.y - bb.pbY0)*bb.gf;
-    if (bb.pbud < 1 || depth >= SINKMAX*bb.pbhv || count > 150) return;   // deep enough: powder now acts as solid ground
-    var v = bb.pb.getLinearVelocity(), spd = Math.sqrt(v.x*v.x + v.y*v.y);
-    var tries = 2 + Math.floor(bb.pbhv*3 + spd*2);
-    for (var t = 0; t < tries && bb.pbud >= 1; t++){
-      if (!chance(0.85)) continue;
-      var gx = clamp(cx0 + Math.floor(Math.random()*5) - 2, run.x0, run.x1), gk = GK(gx, run.y);
-      if (done.has(gk)) continue;
-      var p = pxAt(gx, run.y); if (!p || p.sub !== undefined || !isPowderPix(p)) continue;
-      done.add(gk); count++; bb.pbud -= 1;
-      var dx = gx - bb.x, dy = run.y - bb.y, l = Math.sqrt(dx*dx + dy*dy) || 1;
-      if (relocate(p, p.x, p.y, null, null, bb.x, bb.y)){
-        var sp = Math.min(1.6, 0.35 + spd*0.5);
-        if (dy/l > 0.6){ p.pvx = (chance(0.5) ? -1 : 1)*(0.4 + Math.random()*0.6)*sp; p.pvy = -0.25 - Math.random()*0.2; }
-        else { p.pvx = dx/l*sp + (Math.random() - 0.5)*0.3; p.pvy = dy/l*sp - 0.2; }
-      }
+    var run = ps.run, gx = Math.max(run.x0, Math.min(run.x1, Math.round(ps.x))), gy = run.y, gk = GK(gx, gy);
+    if (done.has(gk)) return;
+    var p = pxAt(gx, gy); if (!p || p.sub !== undefined) return;
+    var e = elements[p.element]; if (!e) return;
+    var resist = (e.density || 1500)/1000 * G * 15;                    // grains hold up a light body but yield to a heavy/fast one
+    if (ps.f < resist) return;
+    var bb = ps.b;
+    if (bb.sref === undefined || pixelTicks - bb.sT > 30) bb.sref = bb.y;      // sinking budget: ~4 pixels, then it rests
+    bb.sT = pixelTicks;
+    if (bb.y - bb.sref > 4) return;
+    done.add(gk);
+    var dx = gx - ps.b.x, dy = gy - ps.b.y, l = Math.sqrt(dx*dx + dy*dy) || 1;
+    var ox = p.x, oy = p.y;
+    if (relocate(p, p.x, p.y, null, null)){
+      var sp = Math.min(1.6, 0.3 + ps.f/(resist*3));
+      p.pvx = dx/l*sp + (Math.random() - 0.5)*0.3; p.pvy = dy/l*sp - 0.15;
     }
   });
   pushes.length = 0;
-}
-/* impact splash: a hard landing kicks some grains up and out */
-function splash(x, y, s, b){
-  if (!b.pb) return;
-  var n = Math.min(10, Math.floor(s*b.pb.getMass()/6)), cx = Math.round(x), cy = Math.round(y);
-  for (var i = 0; i < n; i++){
-    var p = pxAt(cx + Math.floor(Math.random()*5) - 2, cy + Math.floor(Math.random()*5) - 2);
-    if (!p || !isPowderPix(p) || RIDERS.has(p)) continue;
-    var px = p.x, py = p.y;
-    if (relocate(p, px, py, null, null, x, y)){
-      p.pvx = (p.x - x)*0.35 + (Math.random() - 0.5)*0.4; p.pvy = -(0.3 + Math.random()*0.4)*Math.min(2, 0.6 + s*0.5);
-    }
-  }
 }
 function flyGrain(p){
   p.pvy = (p.pvy || 0) + G*0.7;
@@ -1121,6 +1102,51 @@ runEveryTick(function(){
     forces.push({ b: b, F: Fb, x: fl.cx, y: fl.cy });
   }
   if (maxSp > 0.03 || pixelTicks % 5 === 0) refreshTerrain();
+  /* direct powder push: scan the surface of each body's proxy footprint (uses live velocity pre-step) */
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic") continue;
+    var bvp = b.pb.getLinearVelocity(), bsp = Math.sqrt(bvp.x*bvp.x + bvp.y*bvp.y);
+    if (bsp < 0.08) continue;
+    var bv = { x: bvp.x, y: bvp.y };
+    /* also probe up to ceil(speed)+1 cells ahead in the velocity direction */
+    var predX = Math.round(bv.x * 1.2), predY = Math.round(bv.y * 1.2);
+    var extraProxies = [];
+    b.proxies.forEach(function(pix){ extraProxies.push(pix); });
+    var bvLen = Math.sqrt(bv.x*bv.x+bv.y*bv.y)||1, bdx=bv.x/bvLen, bdy=bv.y/bvLen;
+    b.proxies.forEach(function(pix){
+      for (var step = 1; step <= Math.ceil(bvLen)+1; step++){
+        var fx=Math.round(pix.x+bdx*step), fy=Math.round(pix.y+bdy*step);
+        if (!b.proxies.has(GK(fx,fy))) extraProxies.push({x:fx,y:fy,ck:pix.ck});
+      }
+    });
+    extraProxies.forEach(function(pix){
+      for (var d = 0; d < 4; d++){
+        var nx = pix.x + D4[d][0], ny = pix.y + D4[d][1];
+        if (outOfBounds(nx, ny)) continue;
+        var g = pixelMap[nx][ny]; if (!g || g.del || g.sub !== undefined) continue;
+        var ge = elements[g.element]; if (!ge) continue;
+        if (ge.state !== "solid" || ge.movable !== true) continue;        // only powders
+        var vn = bv.x * D4[d][0] + bv.y * D4[d][1];                     // body velocity towards the grain
+        if (vn <= 0) continue;
+        var resist = (ge.density || 1000)/1000 * G * 2.5;             // lower threshold: more grains flung
+        var mass = b.pb.getMass();
+        if (mass < (ge.density || 1000)/1000 * 1.0) continue;            // only very-light bodies rest on powder
+        var frac = Math.min(1, (vn - 0.05) * 0.4 * mass * 0.01);
+        if (frac <= 0) continue;
+        if (!chance(Math.min(0.9, frac))) continue;
+        /* sinking budget: at most ~4 pixels */
+        if (D4[d][1] > 0){                                                // downward push = sinking
+          b.sref = b.sref !== undefined ? b.sref : b.y; b.sT = pixelTicks;
+          if (b.y - b.sref > 4) continue;
+        }
+        if (relocate(g, nx, ny, null, null)){
+          g.pvx = D4[d][0] * Math.min(1.4, vn * 0.6 + (Math.random() - 0.5) * 0.3);
+          g.pvy = D4[d][1] * Math.min(1.4, vn * 0.5) - 0.1;
+        }
+      }
+    });
+    extraProxies = null;
+  }
   for (var s = 0; s < SUB; s++){
     for (i = 0; i < forces.length; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
     if (GRAB && GRAB.b.pb && GRAB.b.pb.getType() === "dynamic"){
@@ -1194,6 +1220,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v6 loaded (Planck.js). Load it LAST in the mod list. New tool: physgrab.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v9 loaded (Planck.js). Load it LAST in the mod list. v5 sand/solid shoving restored.");
 
 })();
