@@ -120,6 +120,12 @@ var WELL_STR = { gravity_well: 1, antigravity_well: 1 };
 var WELL_CATS = { gravity_well: 1, antigravity_well: 1 };
 var WELLS = [];                // live well pixels: {x, y}
 var WELL_SCAN = 0;
+var GRAV_ON = 1, GRAV_SET = -1;   // physics gravity switch, driven by the Gravity setting
+var GRAV_SETTING = "sl_gravity";
+var WELL_PIX_REACH = 24;         // cells: powders and liquids only feel a well this close
+var WELL_PIX_ROWS = 6;           // rows scanned per well per tick (rotating, so the box clears fast)
+var WELL_PIX_MOVES = 220;        // hard cap on pixel nudges per tick
+var WELL_PIX_CURSOR = 0;
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
 var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
@@ -1085,7 +1091,7 @@ function hideFootprints(){
     }
   });
 }
-if (typeof runAfterLoad === "function") runAfterLoad(function(){ hookAll(); hideFootprints(); }); else hideFootprints();
+if (typeof runAfterLoad === "function") runAfterLoad(function(){ hookAll(); hideFootprints(); try { applyGravitySetting(); addGravitySetting(); } catch(e){} }); else hideFootprints();
 
 /* ---------------------------------------------------------------- tools */
 function bodyOf(p){ return (p.sub !== undefined) ? (BODIES[p.sub] || null) : null; }
@@ -1377,6 +1383,104 @@ elements.antigravity_well = {
   onSelect: function(){ try { askWellStrength("antigravity_well"); } catch(e){} },
   onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} }
 };
+/* ---------------------------------------------------------------- gravity setting */
+function applyGravitySetting(){
+  var v = (typeof settings === "object" && settings) ? settings[GRAV_SETTING] : undefined;
+  var on = (v === 0 || v === "0" || v === false || v === "false") ? 0 : 1;
+  if (on === GRAV_SET) return GRAV_ON;
+  GRAV_SET = on; GRAV_ON = on;
+  if (world && typeof world.setGravity === "function" && PL) world.setGravity(PL.Vec2(0, on ? G : 0));
+  return GRAV_ON;
+}
+function addGravitySetting(){
+  if (typeof document === "undefined" || !document.getElementById) return;
+  if (document.getElementById("sl-setting-gravity")) return;
+  var host = null;
+  try { host = document.querySelector("#settingsMenu .menuText"); } catch(e){}
+  if (!host) return;
+  var on = (typeof settings === "object" && settings && (settings[GRAV_SETTING] === 0 || settings[GRAV_SETTING] === "0")) ? 0 : 1;
+  var wrap = document.createElement("span");
+  wrap.className = "setting-span multisetting";
+  wrap.setAttribute("setting", GRAV_SETTING);
+  wrap.title = "Gravity for Sublevel Physics objects. Turn it off and they float; the wells keep working.";
+  var label = document.createElement("span");
+  label.id = "settingLabel-" + GRAV_SETTING;
+  label.textContent = "Gravity";
+  var btn = document.createElement("input");
+  btn.type = "button";
+  btn.className = "toggleInput";
+  btn.id = "sl-setting-gravity";
+  btn.setAttribute("state", on ? "1" : "0");
+  btn.value = on ? "ON" : "OFF";
+  btn.addEventListener("click", function(){
+    try {
+      if (typeof toggleInput === "function") toggleInput(btn, GRAV_SETTING);
+      else {
+        var now = btn.getAttribute("state") === "1" ? 0 : 1;
+        btn.setAttribute("state", now ? "1" : "0"); btn.value = now ? "ON" : "OFF";
+        if (typeof settings === "object" && settings) settings[GRAV_SETTING] = now;
+      }
+    } catch(e){}
+    try { applyGravitySetting(); } catch(e){}
+    try { logMessage("Sublevel Physics: gravity " + (GRAV_ON ? "on" : "off") + "."); } catch(e){}
+  });
+  wrap.appendChild(label);
+  wrap.appendChild(document.createTextNode(" "));
+  wrap.appendChild(btn);
+  wrap.appendChild(document.createTextNode("\u00a0"));
+  host.appendChild(document.createTextNode(" "));
+  host.appendChild(wrap);
+}
+/* ------------------------------------------------- powders and liquids in a well */
+function isLoosePixel(p){
+  if (!p || p.del || p.sub !== undefined) return false;
+  var e = elements[p.element]; if (!e) return false;
+  var st = e.state;
+  return st === "powder" || st === "liquid" || st === "superfluid";
+}
+function applyWellsPixels(){
+  if (!WELLS.length || typeof pixelMap !== "object" || !pixelMap) return 0;
+  if (typeof movePixel !== "function" || typeof isEmpty !== "function") return 0;
+  var moved = 0, R = WELL_PIX_REACH, span = 2*R + 1;
+  WELL_PIX_CURSOR = (WELL_PIX_CURSOR + WELL_PIX_ROWS) % span;
+  for (var wi = 0; wi < WELLS.length && moved < WELL_PIX_MOVES; wi++){
+    var wv = WELLS[wi];
+    var wp = pixelMap[wv.x] && pixelMap[wv.x][wv.y];
+    if (!wp || wp.del || !WELL_CATS[wp.element]) continue;
+    var str = WELL_STR[wp.element]; if (str === undefined) str = 1;
+    if (str <= 0) continue;
+    var anti = wp.element === "antigravity_well" ? -1 : 1;
+    for (var k = 0; k < WELL_PIX_ROWS; k++){
+      var yy = wv.y - R + ((WELL_PIX_CURSOR + k) % span);
+      if (yy < 0 || yy >= height) continue;
+      for (var xx = Math.max(0, wv.x - R), xe = Math.min(width - 1, wv.x + R); xx <= xe; xx++){
+        if (moved >= WELL_PIX_MOVES) break;
+        var p = pixelMap[xx] && pixelMap[xx][yy];
+        if (!isLoosePixel(p)) continue;
+        var dx = wv.x + 0.5 - (xx + 0.5), dy = wv.y + 0.5 - (yy + 0.5);
+        var r2 = dx*dx + dy*dy;
+        if (r2 > R*R || r2 < 0.4) continue;
+        var fall = (WELL_REF*WELL_REF) / (r2 + 1); if (fall > 1.5) fall = 1.5;
+        var pr = str * fall * 0.55; if (pr > 0.9) pr = 0.9;
+        if (Math.random() > pr) continue;
+        var ax = Math.abs(dx), ay = Math.abs(dy);
+        var sx = 0, sy = 0;
+        if (ax >= ay) sx = dx > 0 ? 1 : -1; else sy = dy > 0 ? 1 : -1;
+        sx *= anti; sy *= anti;
+        var nx = xx + sx, ny = yy + sy;
+        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+        if (!isEmpty(nx, ny)){                                   /* slide along the blocked axis */
+          if (sx !== 0){ sx = 0; ny = yy + (dy > 0 ? anti : -anti); nx = xx; }
+          else { sy = 0; nx = xx + (dx > 0 ? anti : -anti); ny = yy; }
+          if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+          if (!isEmpty(nx, ny)) continue;
+        }
+        try { movePixel(p, nx, ny); moved++; } catch(e){}
+      }
+    }
+  }
+  return moved;
+}
 /* find every well pixel in the map (placement, save load, paste) */
 function scanWells(){
   WELLS.length = 0; WELL_SCAN = 1;
@@ -1463,7 +1567,7 @@ runEveryTick(function(){
     b.Rt = pixelTicks; b.Rx = b.x; b.Ry = b.y; b.Ra = b.a; b.Rtick = R;
     maxSp = Math.max(maxSp, sp + Math.abs(b.pb.getAngularVelocity())*b.rad*0.5);
     if (fl.n > 0){
-      Fb = fl.rho/1000 * fl.n * G;
+      Fb = fl.rho/1000 * fl.n * G * GRAV_ON;
       var capUp = G * 1.8 * m; if (Fb > capUp) Fb = capUp;
       var frac = Math.min(1, fl.n/b.cells.size), avgD = m / b.cells.size * 1000;
       lin = Math.min(0.7, frac*(0.14 + 0.16*sp + Math.min(0.3, 0.02*fl.rho/Math.max(30, avgD))));
@@ -1535,6 +1639,8 @@ runEveryTick(function(){
     }
   }
   if (!WELL_SCAN || (pixelTicks % 600) === 0) scanWells(); else if ((pixelTicks & 31) === 0) pruneWells();
+  try { applyGravitySetting(); } catch(e){}
+  try { applyWellsPixels(); } catch(e){}
   for (var s = 0; s < SUB; s++){
     for (i = 0; i < forces.length; i++) if (forces[i].F > 0) forces[i].b.pb.applyForce(PL.Vec2(0, -forces[i].F), PL.Vec2(forces[i].x, forces[i].y), true);
     try { applyWells(); } catch(e){ WELL_SCAN = 0; }
@@ -1614,7 +1720,8 @@ globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport, wells: function(){ return WELLS; }, applyWells: applyWells, setStrength: function(id, v){ WELL_STR[id] = v; },
-    scanWells: scanWells,
+    scanWells: scanWells, applyWellsPixels: applyWellsPixels, applyGravitySetting: applyGravitySetting, addGravitySetting: addGravitySetting,
+    gravity: function(){ return GRAV_ON; },
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
