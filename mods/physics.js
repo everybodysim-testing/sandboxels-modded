@@ -1,5 +1,5 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v46 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v48 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
    v46 - PHYSICS MATERIALS TAB + more speed under load:
@@ -1200,28 +1200,63 @@ function hookWellButton(id){
   btn.__slWell = 1;
   btn.addEventListener("click", function(){ askWellStrength(id); });
 }
+function wellDef(color, rgb, desc){
+  var wall = (typeof behaviors === "object" && behaviors && behaviors.WALL) ? behaviors.WALL : [["XX","XX","XX"],["XX","XX","XX"],["XX","XX","XX"]];
+  return { color: color, colorObject: [rgb], behavior: wall,
+    category: "physics", state: "solid", density: 3200, desc: desc,
+    slNoPhys: true, hidden: false,
+    onPlace: function(pixel){ try { WELLS.push({ x: pixel.x, y: pixel.y }); } catch(e){} } };
+}
+function wellButtonDOM(id){
+  /* the panel is built once, before this file runs, so a well gets its own button built here.
+     plain DOM only: no game helper is assumed to be reachable from a mod's scope. */
+  try {
+    if (typeof document === "undefined" || !document.getElementById || typeof elements !== "object" || !elements[id]) return;
+    if (document.getElementById("elementButton-" + id)) return;
+    var ec = document.getElementById("elementControls"), cc = document.getElementById("categoryControls");
+    if (!ec || !cc) return;
+    if (!document.getElementById("categoryButton-physics")){
+      var cb = document.createElement("button");
+      cb.id = "categoryButton-physics"; cb.className = "categoryButton"; cb.innerText = "Physics";
+      cb.setAttribute("category", "physics");
+      cb.onclick = function(){ if (typeof selectCategory === "function") selectCategory("physics"); };
+      cc.appendChild(cb);
+    }
+    var div = document.getElementById("category-physics");
+    if (!div){
+      div = document.createElement("div"); div.id = "category-physics";
+      div.setAttribute("category", "physics"); div.className = "category"; div.style.display = "none";
+      ec.appendChild(div);
+    }
+    var btn = document.createElement("button");
+    btn.id = "elementButton-" + id; btn.className = "elementButton";
+    btn.innerText = elements[id].name || id.replace(/_/g, " ");
+    btn.setAttribute("element", id); btn.setAttribute("current", "false");
+    btn.style.background = elements[id].color;
+    btn.onclick = function(){ currentElement = id; if (typeof selectCategory === "function") selectCategory("physics"); askWellStrength(id); };
+    btn.oncontextmenu = function(e){ if (e && e.preventDefault) e.preventDefault(); };
+    div.appendChild(btn);
+  } catch(e){}
+}
+function ensureWellUI(){
+  wellButtonDOM("gravity_well"); wellButtonDOM("antigravity_well");
+  hookWellButton("gravity_well"); hookWellButton("antigravity_well");
+}
 function addWellElements(){
-  if (typeof elements !== "object" || elements.gravity_well) return;
-  elements.gravity_well = {
-    color: "#7d5cff", colorObject: [125, 92, 255],
-    behavior: "XX|XX|XX", category: "physics", state: "solid",
-    density: 3200, desc: "Pulls every physics object toward itself. Click it to set the strength (1 = normal gravity).",
-    slNoPhys: true, hidden: false,
-    onPlace: function(pixel){ WELLS.push({ x: pixel.x, y: pixel.y }); }
-  };
-  elements.antigravity_well = {
-    color: "#ff5ce0", colorObject: [255, 92, 224],
-    behavior: "XX|XX|XX", category: "physics", state: "solid",
-    density: 3200, desc: "Pushes every physics object away from itself. Click it to set the strength (1 = normal gravity).",
-    slNoPhys: true, hidden: false,
-    onPlace: function(pixel){ WELLS.push({ x: pixel.x, y: pixel.y }); }
-  };
-  if (typeof lang === "object" && lang) lang.physics = "Physics";
-  ["gravity_well", "antigravity_well"].forEach(function(id){
-    if (typeof createElementButton === "function"){ try { createElementButton(id); } catch(e){} }
-    hookWellButton(id);
+  if (typeof elements !== "object" || !elements || elements.gravity_well) return;
+  var gw = wellDef("#7d5cff", [125, 92, 255], "Pulls every physics object toward itself. Click it to set the strength (1 = normal gravity).");
+  var aw = wellDef("#ff5ce0", [255, 92, 224], "Pushes every physics object away from itself. Click it to set the strength (1 = normal gravity).");
+  [["gravity_well", gw], ["antigravity_well", aw]].forEach(function(pair){
+    var id = pair[0], def = pair[1];
+    try {
+      if (typeof addElement === "function") addElement(id, def);          /* the game's own path: keeps counts and the panel right */
+      else {
+        elements[id] = def;
+        if (typeof finalizeElement === "function") finalizeElement(id, def);
+      }
+    } catch(e){ elements[id] = elements[id] || def; }
   });
-  if (typeof runAfterLoad === "function") runAfterLoad(function(){ WELL_SCAN = 0; [ "gravity_well", "antigravity_well" ].forEach(hookWellButton); });
+  if (typeof runAfterLoad === "function") runAfterLoad(function(){ try { ensureWellUI(); } catch(e){} });
 }
 /* find every well pixel in the map (placement, save load, paste) */
 function scanWells(){
@@ -1588,7 +1623,9 @@ runEveryTick(function(){
   if (GRAB && GRAB.b.pb && GRAB.b.pb.setAwake) GRAB.b.pb.setAwake(true);
 
   if (!WELL_SCAN || (pixelTicks % 600) === 0) scanWells(); else if ((pixelTicks & 31) === 0) pruneWells();
-  applyWells();
+  if (typeof WELL_UI_T === "undefined") { var WELL_UI_T = 0; }
+  if (WELL_UI_T <= 0){ WELL_UI_T = 180; try { ensureWellUI(); } catch(e){} } else WELL_UI_T--;
+  try { applyWells(); } catch(e){ WELL_SCAN = 0; }
   var forces = FRCP; FRN = 0; var maxSp = 0;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
@@ -1762,7 +1799,7 @@ renderPostPixel(function(ctx){
   }
 });
 
-addWellElements();
+try { addWellElements(); } catch(e){}
 loadPlanck();
 globalThis.__SUBLEVEL_BODIES__ = function(){ return BODIES; };
 globalThis.__SL_HOOK__ = hookAll;
