@@ -1,7 +1,15 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v10 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v11 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v11 - support detection rewritten to match the rule "stable only if TOUCHING pixels lead
+         to the world wall or an anchored block":
+         - the old 4000-pixel bail-out that declared any big floating chunk "supported" is
+           gone (that is why moon-save chunks hung in the air)
+         - unknown elements no longer count as support
+         - a full-map support sweep runs after a load/reset (and on the first ticks after
+           boot), spread over ticks with a node budget, so a loaded save is not left with
+           every solid frozen in place; live edits still use the incremental dirty queue
    v10 - powder drag instead of the sink limiter. Solids falling into sand/gravel
          now lose speed to DRAG that scales with the number of grains UNDER the
          body (nothing above it counts, so cups full of sand are untouched), and
@@ -48,6 +56,7 @@ var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedCount = 0;
+var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
 var D4 = [[1,0],[-1,0],[0,1],[0,-1]];
 
 function chance(p){ return Math.random() < p; }
@@ -711,14 +720,14 @@ function checkSupport(p, checked){
       if (n.sub !== undefined){ if (!host && BODIES[n.sub]) host = BODIES[n.sub]; continue; }
       if (seen.has(n)) continue;
       if (GC.has(n)){ supported = true; break; }
+      scanNodes++;
       var e = elements[n.element];
-      if (!e){ supported = true; break; }
+      if (!e) continue;                        // unknown material: never counts as support
       if (fallEl(n.element)){ seen.add(n); fall.push(n); stack.push(n); continue; }
       if (e.state === "liquid" || e.state === "gas") continue;
       if (isAnchoredEl(n)){ supported = true; break; }
       seen.add(n); stack.push(n);                                     // powder / other static stuff conducts support
     }
-    if (seen.size > 4000) supported = true;
   }
   fall.forEach(function(x){ checked.add(x); });
   if (supported){ seen.forEach(function(x){ GC.add(x); }); return; }
@@ -744,9 +753,34 @@ function checkSupport(p, checked){
     bodyFromPixels(grp);
   });
 }
+/* queue every falling pixel on the map for one full support pass. Used after a load/reset,
+   where whole chunks of a save can sit in mid-air without ever being edited. */
+function startSweep(){
+  sweepQ = []; sweepChecked = new Set();
+  if (!pixelMap || !pixelMap.length){ sweepQ = null; sweepChecked = null; return false; }
+  var found = 0;
+  for (var x = 0; x < pixelMap.length; x++){
+    var col = pixelMap[x]; if (!col) continue;
+    for (var y = 0; y < col.length; y++){
+      var p = col[y];
+      if (p && !p.del && p.sub === undefined && isFaller(p)){ sweepQ.push(p); found++; }
+    }
+  }
+  if (!found){ sweepQ = null; sweepChecked = null; return false; }
+  return true;
+}
 function processSupport(){
   GC = new Set();
-  var checked = new Set(), n = 0, i;
+  var checked = sweepChecked || new Set(), n = 0, i;
+  scanNodes = 0;
+  if (sweepQ){                                   // full-map pass, budgeted so a big save cannot stall a frame
+    while (sweepQ.length && scanNodes < 120000){
+      var sp = sweepQ.pop();
+      if (!sp || sp.del || sp.sub !== undefined || !isFaller(sp) || checked.has(sp)) continue;
+      checkSupport(sp, checked);
+    }
+    if (!sweepQ.length){ sweepQ = null; sweepChecked = null; }
+  }
   while (n < 60 && dirtyA.length){
     var gk = dirtyA.pop(); dirtyS.delete(gk); n++;
     var x = Math.floor(gk/4096), y = gk % 4096;
@@ -1104,6 +1138,13 @@ runEveryTick(function(){
   if (PL && !world) initWorld();
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
+  if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
+    sweepAt = -1;
+    if (!sweepQ){
+      if (startSweep()) sweepTries = 0;
+      else if (sweepTries < 5){ sweepTries++; sweepAt = pixelTicks + 60; }   // map not filled yet (slow save load): retry
+    }
+  }
   processSupport();
   var ids = Object.keys(BODIES), i, b;
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead) watchProxies(b); }
@@ -1219,6 +1260,7 @@ runPerPixel(function(p){
 });
 runAfterReset(function(){
   BODIES = {}; dirtyA.length = 0; dirtyS.clear(); impacts.length = 0; pushes.length = 0; tfix.clear(); RIDERS.clear(); GC = new Set(); GRAB = null;
+  sweepQ = null; sweepChecked = null; sweepAt = 3; sweepTries = 0;   // a save load fills the map right after this: sweep it once it is there
   if (world){ world = null; terrain = null; }
 });
 renderPostPixel(function(ctx){
@@ -1267,6 +1309,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v10 loaded (Planck.js). Load it LAST in the mod list. Powder drag + settle, rock_wall has physics.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v11 loaded (Planck.js). Load it LAST in the mod list. Powder drag, rock_wall physics, full support sweep on load.");
 
 })();
