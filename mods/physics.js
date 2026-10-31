@@ -1,18 +1,15 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v31 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v33 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
-   v31 - the pixel renderers were being lied to. A body cell ran its element's renderer with the
-         cell's LOCAL grid coordinates instead of its world position, so any renderer that reads
-         pixel.x / pixel.y (stained glass picks its shade from where it sits) drew something
-         different from the pixel it represents, and on a rotated body it drew in a rotated frame
-         as well. Cells now hand the renderer real world coordinates and undo the body rotation
-         for that one cell (translate to the cell, rotate back, translate by -world), so the
-         renderer's own absolute drawing lands exactly on the cell. Body rotation therefore no
-         longer changes what a pixel looks like.
-         Cell colour also follows its placeholder every frame instead of being frozen at
-         conversion, so animated materials (anything the engine ticks, stained glass included)
-         keep their live state instead of drifting out of sync.
+   v33 - the two regressions are out:
+         - a material whose behaviour is a FUNCTION was counted as "moves itself", so it was
+           excluded from physics completely. That is why some solids stopped falling. Only
+           M1/M2, behaviours.SUPPORT, movable:true and the named support materials count now.
+         - a cell whose colour was an ARRAY put that array into fillStyle, where it is ignored,
+           so the cell kept whatever colour happened to be set last: broken textures. Colours are
+           resolved to one string, and an array resolves to a stable shade per cell.
+         - cutting a body apart really separates it now.
    v30 - support materials are enforced at ONE choke point now, not two guesses:
          - movesItself(id) decides once: M1/M2 in the behaviour grid, behaviours.SUPPORT by
            identity, a behaviour function, movable:true, or the named support materials
@@ -676,31 +673,10 @@ function components(b){
 function fixBody(b){
   b.dirty = false;
   if (!b.cells.size){ killBody(b); return; }
-  /* never split: disconnected pieces stay on ONE body (it takes many fixtures). splitting a
-     body re-created its material as new pixels and multiplied the physics object count. */
   calc(b);
   if (b.pb) rebuildFixtures(b);
-  if (b.needSync){ b.needSync = false; }
+  b.needSync = false;
   syncProxies(b);
-  return;
-  var comps = components(b);
-  if (comps.length === 1){ calc(b); if (b.pb) rebuildFixtures(b); syncProxies(b); return; }
-  var old = b.pb, lv = null, av = 0, wc = null;
-  if (old){ lv = old.getLinearVelocity(); av = old.getAngularVelocity(); wc = old.getWorldCenter(); lv = { x: lv.x, y: lv.y }; wc = { x: wc.x, y: wc.y }; syncPose(b); }
-  var created = [];
-  comps.forEach(function(keys){
-    var cells = new Map();
-    keys.forEach(function(k){ cells.set(k, b.cells.get(k)); });
-    var nb = makeBody(cells, b.a);
-    nb.x = b.x; nb.y = b.y; nb.gf = b.gf; nb.frozen = b.frozen; nb.hold = b.hold;
-    if (old) nb.pend = function(pb){
-      var c = pb.getWorldCenter(), dx = c.x - wc.x, dy = c.y - wc.y;
-      pb.setLinearVelocity(PL.Vec2(lv.x - av*dy, lv.y + av*dx)); pb.setAngularVelocity(av);
-    };
-    created.push(nb);
-  });
-  killBody(b);
-  created.forEach(function(n){ ensurePB(n); syncProxies(n); });
 }
 
 /* ------------------------------------------------------ terrain colliders */
@@ -984,8 +960,7 @@ function movesItself(id){
   else if (e.movable === true) r = true;
   else {
     var bh = e.behavior;
-    if (typeof bh === "function") r = true;
-    else if (Array.isArray(bh) && /M[12]/.test(JSON.stringify(bh))) r = true;
+    if (Array.isArray(bh) && /M[12]/.test(JSON.stringify(bh))) r = true;
     else if (typeof behaviors !== "undefined" && behaviors && behaviors.SUPPORT && bh === behaviors.SUPPORT) r = true;
   }
   MOVES_CACHE[id] = r; return r;
@@ -1623,20 +1598,19 @@ function drawCells(b, ctx, ps, bord){
     var X = (c.x - 0.5)*ps - 0.35, Y = (c.y - 0.5)*ps - 0.35;
     var el = elements[c.e], rn = el && el.renderer;
     ctx.globalAlpha = (c.al === undefined || c.al === null) ? 1 : clamp(c.al, 0, 1);
-    ctx.fillStyle = c.c || "#999999"; ctx.fillRect(X, Y, size, size);
+    var fc = c.c;
+    if (Array.isArray(fc)) fc = fc[(c.x*7 + c.y*13 + fc.length) % fc.length];
+    ctx.fillStyle = (typeof fc === "string" && fc) ? fc : "#999999";
+    ctx.fillRect(X, Y, size, size);
     ctx.globalAlpha = 1;
-    if (c.px && !c.px.del && c.px.sub === b.id && c.px.color) c.c = c.px.color;   // colour follows the live placeholder
     if (rn && rn.__orig && !rn.__bord && !rn.__unsafe && c.px && !c.px.del && c.px.sub === b.id){
-      var px = c.px, ox = px.x, oy = px.y, w = toWorld(b, c.x, c.y);
-      ctx.save();
-      ctx.translate((c.x - 0.5)*ps, (c.y - 0.5)*ps);        // to this cell
-      ctx.rotate(-b.a);                                      // undo the body's rotation for this one pixel
-      ctx.translate(-w.x*ps, -w.y*ps);                        // absolute drawing now lands on the cell
-      px.x = w.x; px.y = w.y;
-      try { rn.__orig(px, ctx); } catch (err) {}
+      var px = c.px, ox = px.x, oy = px.y;                  // run the element's own renderer, in the body's grid
+      ctx.save(); ctx.translate(-0.5*ps, -0.5*ps);
+      try { px.x = c.x; px.y = c.y; rn.__orig(px, ctx); } catch (err) {}
       px.x = ox; px.y = oy;
       ctx.restore();
     }
+    if (c.px && !c.px.del && c.px.sub === b.id && typeof c.px.color === "string") c.c = c.px.color;
     /* no debug tint */
     if (bord && rn && rn.__bord){
       var edge = false;
@@ -1671,8 +1645,9 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
     hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials,
-    enforceMap: enforceMap, movesItself: movesItself, drawCells: drawCells, toWorld: toWorld };
+    fixBody: fixBody, components: components, drawCells: drawCells, toWorld: toWorld,
+    enforceMap: enforceMap, movesItself: movesItself };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v30 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v33 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
