@@ -1,7 +1,19 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v15 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v16 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v16 - nothing floats, guaranteed:
+         - a body that could not be built because the per-tick budget was spent is now
+           RE-QUEUED instead of being marked done (that budget was silently eating
+           conversions, which is why freshly placed floating solids just sat there)
+         - user edits are processed before the background sweep instead of after it, so a
+           shape you just placed is handled on the tick you place it
+         - a rolling full-map audit re-checks every falling pixel every ~8 s, so nothing can
+           stay airborne no matter which hook missed it
+         - anything that is not a solid state (liquid, gas, odd mod states) is explicitly
+           non-conductive in the support walk, and pixels already proven supported this tick
+           are skipped (this was also most of the post-load lag: every marked pixel kicked
+           off its own region walk)
    v15 - no more creeping spin in sand. the support/buoyancy force was applied at the fluid
          contact centroid, which sits off the body's centre whenever sand touches one side
          more than the other: a permanent off-centre force = permanent torque = it slowly
@@ -119,7 +131,7 @@ function liq(x,y){
   var p = pixelMap[x][y]; if (!p || p.sub !== undefined) return null;
   var e = elements[p.element]; return (e && e.state === "liquid") ? p : null;
 }
-function mark(x,y){ var gk = GK(x,y); TERRAIN_DIRTY = 1; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
+function mark(x,y){ var gk = GK(x,y); TERRAIN_DIRTY = 1; if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
 
 /* ------------------------------------------------ which blocks get physics */
 /* anything that does not actively move on its own */
@@ -817,7 +829,7 @@ function checkSupport(p, checked){
       var e = elements[n.element];
       if (!e) continue;                        // unknown material: never counts as support
       if (fallEl(n.element)){ seen.add(n); fall.push(n); stack.push(n); continue; }
-      if (e.state === "liquid" || e.state === "gas") continue;
+      if (e.state && e.state !== "solid") continue;        // liquid, gas, molten, any odd mod state: never a surface
       if (isAnchoredEl(n)){ supported = true; break; }
       seen.add(n); stack.push(n);                                     // powder / other static stuff conducts support
     }
@@ -825,13 +837,16 @@ function checkSupport(p, checked){
   fall.forEach(function(x){ checked.add(x); });
   if (supported){ seen.forEach(function(x){ GC.add(x); }); return; }
   if (host){                                       // pixels the user JUST placed beside a body join it
-    var joined = false;
+    var rest = [];
     fall.forEach(function(px){
-      if (!px.del && px.sub === undefined && px.pa !== undefined && pixelTicks - px.pa <= 2){ joinPixel(host, px); joined = true; }
+      if (px.del || px.sub !== undefined) return;
+      if (px.pa !== undefined && pixelTicks - px.pa <= 2) joinPixel(host, px);
+      else rest.push(px);
     });
-    if (joined) return;
+    fall = rest;
+    if (!fall.length) return;
   }
-  var byPos = new Map(), done = new Set();                      // every faller group in the floating region becomes a body
+  var byPos = new Map(), done = new Set(), lost = false;        // every faller group in the floating region becomes a body
   fall.forEach(function(q){ byPos.set(GK(q.x, q.y), q); });
   fall.forEach(function(q){
     if (done.has(q) || q.del) return;
@@ -843,8 +858,13 @@ function checkSupport(p, checked){
         if (m && !done.has(m)){ done.add(m); st.push(m); }
       }
     }
-    bodyFromPixels(grp);
+    if (!bodyFromPixels(grp)) lost = true;
   });
+  if (lost){                                       // out of body budget: put these back in the queue, never drop them
+    fall.forEach(function(px){
+      if (!px.del && px.sub === undefined && isFaller(px)){ checked.delete(px); GC.delete(px); mark(px.x, px.y); }
+    });
+  }
 }
 /* queue every falling pixel on the map for one full support pass. Used after a load/reset,
    where whole chunks of a save can sit in mid-air without ever being edited. */
@@ -863,30 +883,31 @@ function startSweep(){
   return true;
 }
 function processSupport(){
-  bodyBudget = 6;
+  bodyBudget = 24;
   GC = new Set();
   var checked = sweepChecked || new Set(), n = 0, i;
   scanNodes = 0;
-  if (sweepQ){                                   // full-map pass, budgeted so a big save cannot stall a frame
-    while (sweepQ.length && scanNodes < 120000){
-      var sp = sweepQ.pop();
-      if (!sp || sp.del || sp.sub !== undefined || !isFaller(sp) || checked.has(sp)) continue;
-      checkSupport(sp, checked);
-    }
-    if (!sweepQ.length){ sweepQ = null; sweepChecked = null; }
-  }
-  while (n < 60 && dirtyA.length){
+  /* edits first: a shape you just placed gets looked at on the tick you place it */
+  while (n < 200 && dirtyA.length){
     var gk = dirtyA.pop(); dirtyS.delete(gk); n++;
     var x = Math.floor(gk/4096), y = gk % 4096;
     for (var dx = -1; dx <= 1; dx++) for (var dy = -1; dy <= 1; dy++){
       var p = pxAt(x + dx, y + dy);
-      if (p && !checked.has(p) && isFaller(p)) checkSupport(p, checked);
+      if (p && !checked.has(p) && !GC.has(p) && isFaller(p)) checkSupport(p, checked);
     }
+  }
+  if (sweepQ){                                   // full-map / audit pass, budgeted so a big save cannot stall a frame
+    while (sweepQ.length && scanNodes < 90000){
+      var sp = sweepQ.pop();
+      if (!sp || sp.del || sp.sub !== undefined || !isFaller(sp) || checked.has(sp) || GC.has(sp)) continue;
+      checkSupport(sp, checked);
+    }
+    if (!sweepQ.length){ sweepQ = null; sweepChecked = null; }
   }
   if (typeof currentPixels !== "undefined" && currentPixels.length){
     for (i = 0; i < 8; i++){
       var r = currentPixels[Math.floor(Math.random()*currentPixels.length)];
-      if (r && !checked.has(r) && isFaller(r) && pixelMap[r.x] && pixelMap[r.x][r.y] === r) checkSupport(r, checked);
+      if (r && !checked.has(r) && !GC.has(r) && isFaller(r) && pixelMap[r.x] && pixelMap[r.x][r.y] === r) checkSupport(r, checked);
     }
   }
 }
@@ -1232,6 +1253,7 @@ runEveryTick(function(){
   if (PL && !world) initWorld();
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
+  if (!sweepQ && pixelTicks > 30 && pixelTicks % 240 === 0) startSweep();   // rolling audit: nothing stays airborne
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
     if (!sweepQ){
@@ -1417,6 +1439,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v15 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v16 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
