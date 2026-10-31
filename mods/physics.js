@@ -122,10 +122,9 @@ var WELLS = [];                // live well pixels: {x, y}
 var WELL_SCAN = 0;
 var GRAV_ON = 1, GRAV_SET = -1;   // physics gravity switch, driven by the Gravity setting
 var GRAV_SETTING = "sl_gravity";
-var WELL_PIX_REACH = 24;         // cells: powders and liquids only feel a well this close
-var WELL_PIX_ROWS = 6;           // rows scanned per well per tick (rotating, so the box clears fast)
-var WELL_PIX_MOVES = 220;        // hard cap on pixel nudges per tick
-var WELL_PIX_CURSOR = 0;
+var WELL_PIX_REACH = 16;         // cells: powders and liquids only feel a well this close
+var WELL_PIX_CELLS = 4200;       // cells looked at per tick across all wells
+var WELL_PIX_MOVES = 500;        // hard cap on pixel nudges per tick
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
 var BODIES = {}, FC = {}, PC = {}, PL = null, world = null, terrain = null;
 var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Set(), GRAB = null;
@@ -1435,47 +1434,62 @@ function addGravitySetting(){
 function isLoosePixel(p){
   if (!p || p.del || p.sub !== undefined) return false;
   var e = elements[p.element]; if (!e) return false;
-  var st = e.state;
-  return st === "powder" || st === "liquid" || st === "superfluid";
+  if (e.state === "gas" || e.state === "energy") return false;         // gases and energy are not powders or liquids
+  if (e.tool || e.anchored || e.slNoPhys || e.canPlace === false) return false;
+  if (e.state === "liquid" || e.state === "superfluid") return true;
+  /* this engine files sand, dirt and gravel under state "solid": what makes them loose is movable */
+  return e.movable === true;
+}
+function wellStepTo(xx, yy, dx, dy, anti){
+  /* one cell toward the well (or away from it): dominant axis first, then the other, then sideways */
+  var ax = Math.abs(dx), ay = Math.abs(dy);
+  var cand = [];
+  if (ax >= ay){ cand.push([dx > 0 ? 1 : -1, 0], [0, dy > 0 ? 1 : -1]); }
+  else { cand.push([0, dy > 0 ? 1 : -1], [dx > 0 ? 1 : -1, 0]); }
+  cand.push([dy > 0 ? 1 : -1, 0], [0, dx > 0 ? -1 : 1]);
+  for (var i = 0; i < cand.length; i++){
+    var nx = xx + cand[i][0]*anti, ny = yy + cand[i][1]*anti;
+    if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
+    if (isEmpty(nx, ny)) return [nx, ny];
+  }
+  return null;
 }
 function applyWellsPixels(){
   if (!WELLS.length || typeof pixelMap !== "object" || !pixelMap) return 0;
   if (typeof movePixel !== "function" || typeof isEmpty !== "function") return 0;
-  var moved = 0, R = WELL_PIX_REACH, span = 2*R + 1;
-  WELL_PIX_CURSOR = (WELL_PIX_CURSOR + WELL_PIX_ROWS) % span;
-  for (var wi = 0; wi < WELLS.length && moved < WELL_PIX_MOVES; wi++){
+  var moved = 0, cells = 0, R = WELL_PIX_REACH;
+  for (var wi = 0; wi < WELLS.length && moved < WELL_PIX_MOVES && cells < WELL_PIX_CELLS; wi++){
     var wv = WELLS[wi];
     var wp = pixelMap[wv.x] && pixelMap[wv.x][wv.y];
     if (!wp || wp.del || !WELL_CATS[wp.element]) continue;
     var str = WELL_STR[wp.element]; if (str === undefined) str = 1;
     if (str <= 0) continue;
     var anti = wp.element === "antigravity_well" ? -1 : 1;
-    for (var k = 0; k < WELL_PIX_ROWS; k++){
-      var yy = wv.y - R + ((WELL_PIX_CURSOR + k) % span);
-      if (yy < 0 || yy >= height) continue;
-      for (var xx = Math.max(0, wv.x - R), xe = Math.min(width - 1, wv.x + R); xx <= xe; xx++){
-        if (moved >= WELL_PIX_MOVES) break;
+    var x0 = Math.max(0, wv.x - R), x1 = Math.min(width - 1, wv.x + R);
+    var y0 = Math.max(0, wv.y - R), y1 = Math.min(height - 1, wv.y + R);
+    for (var yy = y0; yy <= y1 && moved < WELL_PIX_MOVES && cells < WELL_PIX_CELLS; yy++){
+      for (var xx = x0; xx <= x1; xx++){
+        cells++;
         var p = pixelMap[xx] && pixelMap[xx][yy];
         if (!isLoosePixel(p)) continue;
-        var dx = wv.x + 0.5 - (xx + 0.5), dy = wv.y + 0.5 - (yy + 0.5);
+        var dx = wv.x - xx, dy = wv.y - yy;
         var r2 = dx*dx + dy*dy;
-        if (r2 > R*R || r2 < 0.4) continue;
+        if (r2 > R*R || r2 === 0) continue;
         var fall = (WELL_REF*WELL_REF) / (r2 + 1); if (fall > 1.5) fall = 1.5;
-        var pr = str * fall * 0.55; if (pr > 0.9) pr = 0.9;
+        /* close in, the pull acts every tick: that is what holds a pixel against falling */
+        var pr = str * fall * 1.6; if (pr > 1) pr = 1;   /* close in it acts every tick, so it can hold a pixel up */
         if (Math.random() > pr) continue;
-        var ax = Math.abs(dx), ay = Math.abs(dy);
-        var sx = 0, sy = 0;
-        if (ax >= ay) sx = dx > 0 ? 1 : -1; else sy = dy > 0 ? 1 : -1;
-        sx *= anti; sy *= anti;
-        var nx = xx + sx, ny = yy + sy;
-        if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-        if (!isEmpty(nx, ny)){                                   /* slide along the blocked axis */
-          if (sx !== 0){ sx = 0; ny = yy + (dy > 0 ? anti : -anti); nx = xx; }
-          else { sy = 0; nx = xx + (dx > 0 ? anti : -anti); ny = yy; }
-          if (nx < 0 || nx >= width || ny < 0 || ny >= height) continue;
-          if (!isEmpty(nx, ny)) continue;
+        /* a strong pull takes more than one cell a tick, so it climbs and closes instead of only holding */
+        var stepN = 1 + Math.floor(str * fall * 0.9); if (stepN > 3) stepN = 3;
+        var cx = xx, cy = yy, did = 0;
+        for (var sn = 0; sn < stepN && moved < WELL_PIX_MOVES; sn++){
+          var to = wellStepTo(cx, cy, wv.x - cx, wv.y - cy, anti);
+          if (!to) break;
+          try { movePixel(p, to[0], to[1]); moved++; did++; } catch(e){ break; }
+          cx = to[0]; cy = to[1];
         }
-        try { movePixel(p, nx, ny); moved++; } catch(e){}
+        if (!did) continue;
+        if (moved >= WELL_PIX_MOVES) break;
       }
     }
   }
