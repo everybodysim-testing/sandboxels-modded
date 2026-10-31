@@ -1,7 +1,15 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v33 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v35 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v35 - the material gate is honest again:
+         - brick was listed as a self-support powder. it is a solid, and that entry is the whole
+           reason bricks never fell. the list is now only concrete / quicklime / packed_sand, which
+           stay NATIVE (powder-like, never physics).
+         - a solid was also excluded from physics if its behaviour was a function, or if its tick
+           merely mentioned moving. those clauses are gone: a solid with no M1/M2 powder movement
+           is a solid, so it falls.
+         - texture work reverted to the plain fill (no array resolution, no per-frame colour sync).
    v33 - the two regressions are out:
          - a material whose behaviour is a FUNCTION was counted as "moves itself", so it was
            excluded from physics completely. That is why some solids stopped falling. Only
@@ -222,7 +230,6 @@ function mark(x,y){ if (INPROXY) return; var gk = GK(x,y); TERRAIN_DIRTY = 1; if
 /* anything that does not actively move on its own */
 function selfMoving(e){
   var bh = e.behavior, i, j, s;
-  if (typeof bh === "function") return true;
   if (Array.isArray(bh)){
     if (bh.length === 3){
       for (i = 0; i < 3; i++){
@@ -234,8 +241,7 @@ function selfMoving(e){
         }
       }
     } else if (/M[12]/.test(JSON.stringify(bh))) return true;
-  } else if (bh !== undefined) return true;
-  if (typeof e.tick === "function" && /tryMove|movePixel|swapPixels|moveTo\(/.test(String(e.tick))) return true;
+  }
   return false;
 }
 /* materials that must get physics even though the normal test skips them.
@@ -950,7 +956,7 @@ function dropPix(p){ p.del = true; p.sub = undefined; p.inPx = false; PIXDIRTY =
 var SSC = {};
 /* a solid that is neither a grain nor an anchor: it must get physics if its region is unsupported,
    even if the "does it fall" heuristic says no. this is what makes coverage exhaustive. */
-var SELF_MOVE_NAMES = { concrete:1, quicklime:1, packed_sand:1, brick:1 };
+var SELF_MOVE_NAMES = { concrete:1, quicklime:1, packed_sand:1 };   /* powders that must stay native. brick is NOT one */
 var MOVES_CACHE = {};
 function movesItself(id){
   if (MOVES_CACHE[id] !== undefined) return MOVES_CACHE[id];
@@ -1598,9 +1604,7 @@ function drawCells(b, ctx, ps, bord){
     var X = (c.x - 0.5)*ps - 0.35, Y = (c.y - 0.5)*ps - 0.35;
     var el = elements[c.e], rn = el && el.renderer;
     ctx.globalAlpha = (c.al === undefined || c.al === null) ? 1 : clamp(c.al, 0, 1);
-    var fc = c.c;
-    if (Array.isArray(fc)) fc = fc[(c.x*7 + c.y*13 + fc.length) % fc.length];
-    ctx.fillStyle = (typeof fc === "string" && fc) ? fc : "#999999";
+    ctx.fillStyle = c.c || "#999999";
     ctx.fillRect(X, Y, size, size);
     ctx.globalAlpha = 1;
     if (rn && rn.__orig && !rn.__bord && !rn.__unsafe && c.px && !c.px.del && c.px.sub === b.id){
@@ -1610,7 +1614,6 @@ function drawCells(b, ctx, ps, bord){
       px.x = ox; px.y = oy;
       ctx.restore();
     }
-    if (c.px && !c.px.del && c.px.sub === b.id && typeof c.px.color === "string") c.c = c.px.color;
     /* no debug tint */
     if (bord && rn && rn.__bord){
       var edge = false;
@@ -1648,6 +1651,6 @@ if (globalThis.__SUBLEVEL_TEST__){
     fixBody: fixBody, components: components, drawCells: drawCells, toWorld: toWorld,
     enforceMap: enforceMap, movesItself: movesItself };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v33 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v35 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
