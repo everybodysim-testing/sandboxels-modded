@@ -1,7 +1,18 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v16 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v17 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v17 - coverage + leaks:
+         - the support scan no longer trusts the per-element "can this fall" guess for what
+           becomes a body. Anything solid that is not a grain (movable / powder behaviour),
+           not an anchor (wall / anchored / tool / energy) is now scanned and converted, so
+           solid blocks that used to be skipped as "does not fall" get physics too.
+         - relocate() no longer deletes a grain it cannot place (that was material vanishing)
+           and no longer clears a map slot it does not actually own (a stale position there
+           orphaned the real pixel, which then reappeared as a clone)
+         - joinPixel() refuses instead of eating a pixel whose cell is already taken
+         - proxy creation no longer fires the place hook, so a moving body cannot flood the
+           support queue with thousands of self-inflicted scans per tick (the lag)
    v16 - nothing floats, guaranteed:
          - a body that could not be built because the per-tick budget was spent is now
            RE-QUEUED instead of being marked done (that budget was silently eating
@@ -131,7 +142,7 @@ function liq(x,y){
   var p = pixelMap[x][y]; if (!p || p.sub !== undefined) return null;
   var e = elements[p.element]; return (e && e.state === "liquid") ? p : null;
 }
-function mark(x,y){ var gk = GK(x,y); TERRAIN_DIRTY = 1; if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
+function mark(x,y){ if (INPROXY) return; var gk = GK(x,y); TERRAIN_DIRTY = 1; if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
 
 /* ------------------------------------------------ which blocks get physics */
 /* anything that does not actively move on its own */
@@ -413,11 +424,11 @@ function relocate(o, gx, gy, want, rr, cx, cy){
           if (sc > best){ best = sc; t = q2; }
         }
       } else t = pick(cand);
+      if (!pixelMap[o.x] || pixelMap[o.x][o.y] !== o) return false;   // stale position: leave everything alone
       pixelMap[o.x][o.y] = undefined; o.x = t[0]; o.y = t[1]; pixelMap[t[0]][t[1]] = o; return true;
     }
   }
-  pixelMap[o.x][o.y] = undefined; o.del = true; mark(gx, gy);
-  return false;
+  return false;                                                 // nowhere to go: leave the grain where it is, do not delete it
 }
 function placeNear(p, gx, gy){
   for (var r = 0; r <= 8; r++){
@@ -436,9 +447,8 @@ function mkProxy(b, cell, gx, gy, spareBy){
   var list = spareBy[cell.e], pix;
   if (list && list.length){ pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix; }
   else {
-    var prev = NOJOIN; NOJOIN = true;
-    createPixel(cell.e, gx, gy);
-    NOJOIN = prev;
+    var prev = NOJOIN, prevPx = INPROXY; NOJOIN = true; INPROXY = true;
+    try { createPixel(cell.e, gx, gy); } finally { NOJOIN = prev; INPROXY = prevPx; }
     pix = pixelMap[gx][gy]; if (!pix || pix.del) return null;
     pix.temp = cell.t !== undefined ? cell.t : 20;
   }
@@ -797,6 +807,27 @@ function fluidInfo(b, R){
 
 /* ------------------------------------------------ falling: support detection */
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
+var INPROXY = false;
+var SSC = {};
+/* a solid that is neither a grain nor an anchor: it must get physics if its region is unsupported,
+   even if the "does it fall" heuristic says no. this is what makes coverage exhaustive. */
+function isSoftSolid(id){
+  if (SSC[id] !== undefined) return SSC[id];
+  var e = elements[id], r = false;
+  if (e && (e.state === undefined || e.state === "solid")){
+    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys ||
+          id === "wall" || /^anchored_/.test(id))){
+      var bh = e.behavior;
+      r = !(e.movable === true || typeof bh === "function" ||
+            (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));
+    }
+  }
+  SSC[id] = r; return r;
+}
+function scanWorthy(p){
+  if (!p || p.del || p.sub !== undefined) return false;
+  return fallEl(p.element) || isSoftSolid(p.element);
+}
 function bodyFromPixels(list){
   if (!list || !list.length) return null;
   if (bodyBudget <= 0) return null;                                 // try again next tick, pixels left as-is
@@ -814,6 +845,7 @@ var SDIR = [[0,-1],[-1,0],[1,0],[0,1]];             // down is explored first (i
 /* grounded = connected, through solids AND powders, to the world edge or an anchored block.
    liquids, gases and other physics bodies never hold anything up. */
 function checkSupport(p, checked){
+  if (!scanWorthy(p)) return;                                    // grains and anchors never seed a body
   var fall = [p], seen = new Set([p]), stack = [p], supported = false, host = null;
   while (stack.length && !supported){
     var c = stack.pop();
@@ -846,7 +878,11 @@ function checkSupport(p, checked){
     fall = rest;
     if (!fall.length) return;
   }
-  var byPos = new Map(), done = new Set(), lost = false;        // every faller group in the floating region becomes a body
+  var inFall = new Set(fall);
+  seen.forEach(function(px){                                    // non-grain solids count too: "it does not fall" is not an excuse
+    if (!inFall.has(px) && px.sub === undefined && !px.del && isSoftSolid(px.element)){ inFall.add(px); fall.push(px); }
+  });
+  var byPos = new Map(), done = new Set(), lost = false;        // every solid group in the floating region becomes a body
   fall.forEach(function(q){ byPos.set(GK(q.x, q.y), q); });
   fall.forEach(function(q){
     if (done.has(q) || q.del) return;
@@ -862,7 +898,7 @@ function checkSupport(p, checked){
   });
   if (lost){                                       // out of body budget: put these back in the queue, never drop them
     fall.forEach(function(px){
-      if (!px.del && px.sub === undefined && isFaller(px)){ checked.delete(px); GC.delete(px); mark(px.x, px.y); }
+      if (scanWorthy(px)){ checked.delete(px); GC.delete(px); mark(px.x, px.y); }
     });
   }
 }
@@ -876,7 +912,7 @@ function startSweep(){
     var col = pixelMap[x]; if (!col) continue;
     for (var y = 0; y < col.length; y++){
       var p = col[y];
-      if (p && !p.del && p.sub === undefined && isFaller(p)){ sweepQ.push(p); found++; }
+      if (scanWorthy(p)){ sweepQ.push(p); found++; }
     }
   }
   if (!found){ sweepQ = null; sweepChecked = null; return false; }
@@ -893,13 +929,13 @@ function processSupport(){
     var x = Math.floor(gk/4096), y = gk % 4096;
     for (var dx = -1; dx <= 1; dx++) for (var dy = -1; dy <= 1; dy++){
       var p = pxAt(x + dx, y + dy);
-      if (p && !checked.has(p) && !GC.has(p) && isFaller(p)) checkSupport(p, checked);
+      if (p && !checked.has(p) && !GC.has(p) && scanWorthy(p)) checkSupport(p, checked);
     }
   }
   if (sweepQ){                                   // full-map / audit pass, budgeted so a big save cannot stall a frame
     while (sweepQ.length && scanNodes < 90000){
       var sp = sweepQ.pop();
-      if (!sp || sp.del || sp.sub !== undefined || !isFaller(sp) || checked.has(sp) || GC.has(sp)) continue;
+      if (!scanWorthy(sp) || checked.has(sp) || GC.has(sp)) continue;
       checkSupport(sp, checked);
     }
     if (!sweepQ.length){ sweepQ = null; sweepChecked = null; }
@@ -907,7 +943,7 @@ function processSupport(){
   if (typeof currentPixels !== "undefined" && currentPixels.length){
     for (i = 0; i < 8; i++){
       var r = currentPixels[Math.floor(Math.random()*currentPixels.length)];
-      if (r && !checked.has(r) && !GC.has(r) && isFaller(r) && pixelMap[r.x] && pixelMap[r.x][r.y] === r) checkSupport(r, checked);
+      if (r && !checked.has(r) && !GC.has(r) && scanWorthy(r) && pixelMap[r.x] && pixelMap[r.x][r.y] === r) checkSupport(r, checked);
     }
   }
 }
@@ -915,8 +951,10 @@ function processSupport(){
 /* -------------------------------------------- joining / erasing / snapping */
 function joinPixel(b, p){
   var l = toLocal(b, p.x, p.y), lx = Math.round(l.x), ly = Math.round(l.y);
-  if (!b.cells.has(K(lx, ly))) b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
-  pixelMap[p.x][p.y] = undefined; p.del = true;
+  if (b.cells.has(K(lx, ly))) return false;                     // cell taken: refuse rather than eat the pixel
+  b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
+  if (pixelMap[p.x] && pixelMap[p.x][p.y] === p) pixelMap[p.x][p.y] = undefined;
+  p.del = true;
   b.dirty = true; b.hold = pixelTicks + HOLD;
   return true;
 }
@@ -1439,6 +1477,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v16 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v17 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
