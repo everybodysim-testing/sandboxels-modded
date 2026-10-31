@@ -1,7 +1,20 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v19 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v20 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v20 - every duplication path closed at once:
+         - bodies NEVER split. A body used to be torn into one new body per disconnected
+           piece whenever a proxy died, which is where the army of extra physics objects and
+           the re-created material came from. One body, many polygon fixtures, no split.
+         - an element change on a proxy now UPDATES the cell instead of deleting it, so a
+           reaction can no longer shred a shape into fragments
+         - relocate() refuses to touch a pixel that belongs to a body, so one body can no
+           longer shove another body's proxies around (which lost the material there)
+         - joinPixel() refuses body pixels outright
+         - anchored_* twins and function-behaviour solids are body material too: everything
+           solid that is not the world's own wall falls when unsupported
+         - a body is no longer destroyed and rebuilt on every dirty pass, so it keeps its
+           velocity and costs nothing to "fix"
    v19 - "everything solid falls" + hard anti-clone guards:
          - anchors (wall / anchored_*) no longer DECIDE that a region is supported. They only
            conduct the scan like any other solid, so the only absolute support is the world
@@ -186,7 +199,7 @@ function selfMoving(e){
 var PHYS_WHITELIST = { rock_wall: 1 };
 function calcFall(id, e){
   if (PHYS_WHITELIST[id]) return !!(e && (e.state === undefined || e.state === "solid") && !e.anchored);
-  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
+  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall") return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
   if (selfMoving(e)) return false;
@@ -412,6 +425,7 @@ function occState(o){                   // 0 = can be shoved aside (liquid, gas,
 }
 /* move pixel o (which sits in pixelMap) to a free cell nearby, preferring cells AWAY from (cx,cy) */
 function relocate(o, gx, gy, want, rr, cx, cy){
+  if (o.sub !== undefined) return false;                // a body's own pixel is not ours to move
   for (var r = 1; r <= 12; r++){
     var cand = [];
     for (var dx = -r; dx <= r; dx++) for (var dy = -r; dy <= r; dy++){
@@ -528,6 +542,7 @@ function syncProxies(b, R0){
     var o = pixelMap[gx][gy];
     var cell = b.cells.get(R.ck[idx]); if (!cell) return;
     if (o){
+      if (o.sub !== undefined) return;                      // another body's pixel: leave it alone
       if (occState(o) === 1) return;                        // overlap with a real solid: tolerated
       var gone = elements[o.element] && elements[o.element].state === "solid";
       var ox = o.x, oy = o.y;
@@ -578,9 +593,7 @@ function watchProxies(b){
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
-      var NE = pix.element;
-      if (fallEl(NE)){ cell.e = NE; b.dirty = true; }
-      else { b.cells.delete(pix.ck); b.proxies.delete(gk); pix.sub = undefined; b.dirty = true; mark(pix.x, pix.y); return; }
+      cell.e = pix.element; b.dirty = true;              // adopt the new material, never drop the cell
     }
     var an = animOf(cell.e); if (an.col) cell.c = pix.color; if (an.alp) cell.al = pix.alpha; cell.px = pix;
     sum[pix.ck] = (sum[pix.ck] || 0) + pix.temp; cnt[pix.ck] = (cnt[pix.ck] || 0) + 1; if (pix.charge) chg[pix.ck] = 1;
@@ -608,6 +621,13 @@ function components(b){
 function fixBody(b){
   b.dirty = false;
   if (!b.cells.size){ killBody(b); return; }
+  /* never split: disconnected pieces stay on ONE body (it takes many fixtures). splitting a
+     body re-created its material as new pixels and multiplied the physics object count. */
+  calc(b);
+  if (b.pb) rebuildFixtures(b);
+  if (b.needSync){ b.needSync = false; }
+  syncProxies(b);
+  return;
   var comps = components(b);
   if (comps.length === 1){ calc(b); if (b.pb) rebuildFixtures(b); syncProxies(b); return; }
   var old = b.pb, lv = null, av = 0, wc = null;
@@ -855,11 +875,9 @@ function isSoftSolid(id){
   if (SSC[id] !== undefined) return SSC[id];
   var e = elements[id], r = false;
   if (e && (e.state === undefined || e.state === "solid")){
-    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys ||
-          id === "wall" || /^anchored_/.test(id))){
+    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.slNoPhys || id === "wall")){
       var bh = e.behavior;
-      r = !(e.movable === true || typeof bh === "function" ||
-            (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));
+      r = !(e.movable === true || (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));   // only grains are left out
     }
   }
   SSC[id] = r; return r;
@@ -995,6 +1013,7 @@ function processSupport(){
 
 /* -------------------------------------------- joining / erasing / snapping */
 function joinPixel(b, p){
+  if (!p || p.del || p.sub !== undefined) return false;   // never absorb a body pixel
   var l = toLocal(b, p.x, p.y), lx = Math.round(l.x), ly = Math.round(l.y);
   if (b.cells.has(K(lx, ly))) return false;                     // cell taken: refuse rather than eat the pixel
   b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
@@ -1522,6 +1541,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v19 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v20 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
