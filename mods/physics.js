@@ -1,5 +1,5 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v34 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v33 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
    v33 - the two regressions are out:
@@ -673,56 +673,10 @@ function components(b){
 function fixBody(b){
   b.dirty = false;
   if (!b.cells.size){ killBody(b); return; }
-  var comps = components(b);
-  if (comps.length === 1){ calc(b); if (b.pb) rebuildFixtures(b); b.needSync = false; syncProxies(b); return; }
-  /* CUT = SEPARATE. one body per connected piece; every placeholder pixel is handed to the piece
-     that owns its cell (nothing is created, so nothing can be duplicated), and the old body dies. */
-  var old = b.pb, lv = null, av = 0, wc = null;
-  if (old){
-    var v = old.getLinearVelocity(), cw = old.getWorldCenter();
-    lv = { x: v.x, y: v.y }; av = old.getAngularVelocity(); wc = { x: cw.x, y: cw.y };
-  }
-  syncPose(b);
-  var pose = { x: b.x, y: b.y, a: b.a, sx: b.sx, sy: b.sy, sa: b.sa, gf: b.gf, frozen: b.frozen, hold: b.hold };
-  var pieces = comps.map(function(keys){
-    var cells = new Map(), prox = [];
-    keys.forEach(function(k){
-      var cell = b.cells.get(k); if (!cell) return;
-      cells.set(k, cell);
-      var pix = cell.px;
-      if (pix){
-        var gk = GK(pix.x, pix.y);
-        if (b.proxies.get(gk) === pix) b.proxies.delete(gk);
-        prox.push(pix); cell.px = undefined;
-      }
-    });
-    return { cells: cells, prox: prox };
-  });
-  pieces.forEach(function(g){
-    if (!g.cells.size) return;
-    var nb = makeBody(g.cells, pose.a);
-    nb.x = pose.x; nb.y = pose.y; nb.sx = pose.sx; nb.sy = pose.sy; nb.sa = pose.sa;
-    nb.gf = pose.gf; nb.frozen = pose.frozen; nb.hold = pose.hold;
-    nb.sx = 1e9; nb.sy = 1e9; nb.sa = 1e9;                    /* fresh pose: no interpolation wander */
-    calc(nb);
-    g.prox.forEach(function(pix){
-      var lc = toLocal(nb, pix.x, pix.y), k = K(Math.round(lc.x), Math.round(lc.y));
-      if (nb.cells.has(k) && !nb.cells.get(k).px){
-        pix.sub = nb.id; pix.ck = k; nb.cells.get(k).px = pix;
-        nb.proxies.set(GK(pix.x, pix.y), pix);
-      } else if (pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix){
-        pixelMap[pix.x][pix.y] = undefined; dropPix(pix);      /* never leave an orphan placeholder */
-      }
-    });
-    if (lv && old){
-      nb.pend = function(pb){
-        var c2 = pb.getWorldCenter(), dx = c2.x - wc.x, dy = c2.y - wc.y;
-        pb.setLinearVelocity(PL.Vec2(lv.x - av*dy, lv.y + av*dx)); pb.setAngularVelocity(av);
-      };
-    }
-    ensurePB(nb);
-  });
-  killBody(b);                                                 /* proxies map is empty: nothing to release */
+  calc(b);
+  if (b.pb) rebuildFixtures(b);
+  b.needSync = false;
+  syncProxies(b);
 }
 
 /* ------------------------------------------------------ terrain colliders */
@@ -1694,6 +1648,6 @@ if (globalThis.__SUBLEVEL_TEST__){
     fixBody: fixBody, components: components, drawCells: drawCells, toWorld: toWorld,
     enforceMap: enforceMap, movesItself: movesItself };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v34 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v33 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
