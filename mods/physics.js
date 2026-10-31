@@ -1,7 +1,12 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v12 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v13 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v13 - body creation made unconditional instead of "try it and put it back":
+         - no velocity clamp (bodies were never actually launched off-screen)
+         - every pixelMap touch in proxy placement is bounds-checked, which was the real
+           reason a body spawned near the map edge could abort half-way through and leave
+           cells without proxies. Creation now cannot throw and cannot lose the shape.
    v12 - FPS pass for big/awkward shapes (one complex body used to tank the frame):
          - colliders per body are budgeted (row runs, else coarse blocks) so a gnarly
            shape cannot spawn thousands of fixtures
@@ -70,7 +75,6 @@ var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedCount = 0;
 var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
 var MAXFIX = 260;              // collider budget per body
-var MAXSP = 7, MAXANG = 6;     // velocity clamps (stops bodies being flung off-screen)
 var PROXYCAP = 400;            // proxies looked at per body per scan
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
 /* evenly-sampled proxies: cost of a scan no longer grows with body size */
@@ -398,13 +402,14 @@ function placeNear(p, gx, gy){
   p.del = true; return false;
 }
 function mkProxy(b, cell, gx, gy, spareBy){
+  if (outOfBounds(gx, gy) || !pixelMap[gx]) return null;      // outside the sandbox: no proxy needed
   var list = spareBy[cell.e], pix;
   if (list && list.length){ pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix; }
   else {
     var prev = NOJOIN; NOJOIN = true;
     createPixel(cell.e, gx, gy);
     NOJOIN = prev;
-    pix = pixelMap[gx][gy]; if (!pix) return null;
+    pix = pixelMap[gx][gy]; if (!pix || pix.del) return null;
     pix.temp = cell.t !== undefined ? cell.t : 20;
   }
   if (cell.c) pix.color = cell.c; else cell.c = pix.color;
@@ -439,7 +444,7 @@ function syncProxies(b, R0){
       for (var st = 1; st < nst; st++){
         var tt = st/nst, qx = b.sx + mdx*tt, qy = b.sy + mdy*tt, SR = raster(b, qx, qy, b.sa + (b.a - b.sa)*tt);
         for (var si = 0; si < SR.gx.length; si++){
-          var so = pixelMap[SR.gx[si]][SR.gy[si]];
+          var so = pxAt(SR.gx[si], SR.gy[si]);
           if (so && so.sub === undefined && !so.del && occState(so) === 0) relocate(so, SR.gx[si], SR.gy[si], want, rr, qx, qy);
         }
       }
@@ -458,7 +463,9 @@ function syncProxies(b, R0){
     (spareBy[pix.element] = spareBy[pix.element] || []).push(pix);
   });
   want.forEach(function(idx, gk){
-    var gx = R.gx[idx], gy = R.gy[idx], o = pixelMap[gx][gy];
+    var gx = R.gx[idx], gy = R.gy[idx];
+    if (outOfBounds(gx, gy) || !pixelMap[gx]) return;          // cell hangs outside the sandbox
+    var o = pixelMap[gx][gy];
     var cell = b.cells.get(R.ck[idx]); if (!cell) return;
     if (o){
       if (occState(o) === 1) return;                        // overlap with a real solid: tolerated
@@ -761,19 +768,13 @@ function fluidInfo(b, R){
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
 function bodyFromPixels(list){
   if (!list || !list.length) return null;
-  var ax = list[0].x, ay = list[0].y, cells = new Map(), mine = [];
+  var ax = list[0].x, ay = list[0].y, cells = new Map();
   list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
-  list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; q.del = true; mine.push(q); } });
+  list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; q.del = true; } });
   var b = makeBody(cells, 0);
   b.x = ax; b.y = ay;
-  try { ensurePB(b); syncProxies(b); }
-  catch (err){
-    try { killBody(b); } catch (e2) {}
-    mine.forEach(function(q){                       // build failed: put the shape back, do not eat it
-      if (q.del !== false && pixelMap[q.x] && pixelMap[q.x][q.y] === undefined){ pixelMap[q.x][q.y] = q; q.del = false; q.sub = undefined; }
-    });
-    return null;
-  }
+  ensurePB(b);
+  syncProxies(b);
   return b;
 }
 var SDIR = [[0,-1],[-1,0],[1,0],[0,1]];             // down is explored first (it is popped last-pushed)
@@ -1240,11 +1241,6 @@ runEveryTick(function(){
     var fl = fluidInfo(b, R); b.wet = fl.n;
     var m = b.pb.getMass(), lin = 0.002, ang = 0.02, Fb = 0, v = b.pb.getLinearVelocity();
     var sp = Math.sqrt(v.x*v.x + v.y*v.y);
-    if (sp > MAXSP){                               // clamp: a body ejected by an overlap must not fly off-screen
-      var vk = MAXSP/sp; b.pb.setLinearVelocity(PL.Vec2(v.x*vk, v.y*vk)); v = b.pb.getLinearVelocity(); sp = MAXSP;
-    }
-    var av0 = b.pb.getAngularVelocity();
-    if (Math.abs(av0) > MAXANG) b.pb.setAngularVelocity(sign(av0)*MAXANG);
     b.Rt = pixelTicks; b.Rx = b.x; b.Ry = b.y; b.Ra = b.a; b.Rtick = R;
     maxSp = Math.max(maxSp, sp + Math.abs(b.pb.getAngularVelocity())*b.rad*0.5);
     if (fl.n > 0){
@@ -1412,6 +1408,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v12 loaded (Planck.js). Load it LAST in the mod list. FPS pass: budgeted colliders, sampled scans, cached terrain + body sprites.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v13 loaded (Planck.js). Load it LAST in the mod list. FPS pass + unconditional body creation.");
 
 })();
