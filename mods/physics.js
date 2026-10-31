@@ -1,7 +1,19 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v25 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v26 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v26 - three things, each one measured instead of guessed:
+         1. anchored blocks are anchors again, never physics material (as ordered)
+         2. ONE PIXEL, ONE CELL, enforced: every 30 ticks the map is swept and any cell whose
+            pixel reports a different x/y is a stale duplicate reference and is cleared. This is
+            the duplication law, and it does not care which code path broke it.
+         3. every solid block is a physics object, including supported ones: a supported region
+            becomes ONE static body (frozen) instead of staying loose pixels. A shelf is now an
+            object whether it floats or rests on a bracket. Every 300 ticks support is re-checked:
+            a frozen body that lost its support is unfrozen and falls, and a body that settles on
+            support again is frozen.
+         Every body also gets a cell/proxy parity repair, and there is a health line every 600
+         ticks plus window.SL_STATS so we can always read what the mod thinks is happening.
    v25 - the real common trait of concrete / quicklime / packed sand: they are the materials
          whose breakInto is a GRANULE (gravel / quicklime / sand), so the damage path was
          dropping a loose granule onto the block that was just hit. That granule then had to be
@@ -223,8 +235,7 @@ function selfMoving(e){
 var PHYS_WHITELIST = { rock_wall: 1 };
 function calcFall(id, e){
   if (PHYS_WHITELIST[id]) return !!(e && (e.state === undefined || e.state === "solid") && !e.anchored);
-  if (!e || (e.tool && !e.canPlace) || e.slNoPhys || id === "wall" || id === "sl_proxy") return false;
-  if (e.anchored && !/^anchored_/.test(id)) return false;
+  if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
   if (selfMoving(e)) return false;
@@ -897,6 +908,62 @@ function fluidInfo(b, R){
 /* ------------------------------------------------ falling: support detection */
 function isFaller(p){ return p && !p.del && p.sub === undefined && fallEl(p.element); }
 var INPROXY = false;
+var SL_STATS = { version: "v26", bodies: 0, cells: 0, proxies: 0, repairs: 0, lawFixes: 0, wdKills: 0 };
+function auditBodies(){
+  var n = 0, c = 0, p = 0, reps = 0;
+  for (var id in BODIES){
+    var b = BODIES[id]; if (!b || b.dead) continue;
+    n++; c += b.cells.size; p += b.proxies.size;
+    /* parity: a proxy with no cell is a leftover copy, a cell with no proxy is unbacked */
+    var drop = [];
+    b.proxies.forEach(function(pix, gk){
+      if (pix.del || !b.cells.has(pix.ck)) drop.push(gk);
+    });
+    drop.forEach(function(gk){
+      var pix = b.proxies.get(gk); if (!pix) return;
+      b.proxies.delete(gk); reps++;
+      if (!pix.del) dropPix(pix);
+    });
+    /* support: the lowest row of cells decides whether a frozen body stays frozen */
+    var low = null, cells = [];
+    b.cells.forEach(function(cell){ cells.push(cell); if (low === null || cell.y > low) low = cell.y; });   /* y grows downward: the bottom row is the LARGEST y */
+    var held = false;
+    for (var i = 0; i < cells.length && !held; i++){
+      var cell = cells[i]; if (cell.y !== low) continue;
+      var w = toWorld(b, cell.x, cell.y), wx = Math.round(w.x), wy = Math.round(w.y) + 1;
+      if (outOfBounds(wx, wy)) { held = true; break; }
+      var under = pixelMap[wx] ? pixelMap[wx][wy] : undefined;
+      if (!under || under.del) continue;
+      if (under.sub !== undefined) { held = true; break; }          // resting on another object
+      if (GC.has(under)) { held = true; break; }
+      var ue = elements[under.element];
+      if (ue && (ue.state === undefined || ue.state === "solid")) { held = true; break; }
+    }
+    if (b.frozen && !held){ b.frozen = false; ensurePB(b); if (b.pb && b.pb.setAwake) b.pb.setAwake(true); reps++; }
+    else if (!b.frozen && held && b.pb && Math.abs(b.pb.getLinearVelocity ? b.pb.getLinearVelocity().x : 0) < 0.05 &&
+             Math.abs(b.pb.getLinearVelocity ? b.pb.getLinearVelocity().y : 0) < 0.05){ b.frozen = true; ensurePB(b); }
+  }
+  SL_STATS.bodies = n; SL_STATS.cells = c; SL_STATS.proxies = p; SL_STATS.repairs += reps;
+  if (reps && typeof logMessage === "function") logMessage("Sublevel Physics: repaired " + reps + " cell/proxy mismatch(es)");
+}
+function healthLine(){
+  try { globalThis.SL_STATS = SL_STATS; } catch (err){}
+  if (typeof logMessage === "function") logMessage("Sublevel Physics " + SL_STATS.version + ": bodies=" + SL_STATS.bodies + " cells=" + SL_STATS.cells + " proxies=" + SL_STATS.proxies + " lawFixes=" + SL_STATS.lawFixes + " repairs=" + SL_STATS.repairs + " debrisWatchdog=" + SL_STATS.wdKills);
+}
+function enforceMap(){                                          /* ONE PIXEL, ONE CELL: a cell whose pixel
+                                                                   reports another position is a stale duplicate */
+  if (typeof pixelMap === "undefined" || !pixelMap) return;
+  var fixed = 0;
+  for (var x = 0; x < pixelMap.length; x++){
+    var col = pixelMap[x]; if (!col) continue;
+    for (var y = 0; y < col.length; y++){
+      var p = col[y];
+      if (!p || p.del) continue;
+      if (p.x !== x || p.y !== y){ col[y] = undefined; fixed++; }
+    }
+  }
+  if (fixed){ SL_STATS.lawFixes += fixed; if (typeof logMessage === "function") logMessage("Sublevel Physics: cleared " + fixed + " duplicate pixel reference(s)"); }
+}
 var MAT_BASE = {}, MAT_PLACED = {}, MAT_LAST = -999;
 function auditMaterials(){
   if (typeof currentPixels === "undefined" || !currentPixels) return;
@@ -917,7 +984,7 @@ function auditMaterials(){
     var arr = free[id] || [], kill = Math.min(growth, arr.length);
     for (i = arr.length - 1; i >= 0 && kill > 0; i--, kill--){
       var q = arr[i];
-      if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); }
+      if (q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); SL_STATS.wdKills++; }
     }
     if (typeof logMessage === "function" && kill > 0) logMessage("Sublevel Physics: deleted " + kill + " self-created " + id + " pixels");
   }
@@ -948,10 +1015,9 @@ var SSC = {};
 function isSoftSolid(id){
   if (SSC[id] !== undefined) return SSC[id];
   var e = elements[id], r = false;
-  var twin = /^anchored_/.test(id);
   if (e && (e.state === undefined || e.state === "solid")){
-    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.slNoPhys || id === "wall" ||
-          (!twin && (e.anchored || e.category === "anchored")))){
+    if (!(e.tool || e.category === "tools" || e.category === "energy" || e.anchored || e.category === "anchored" ||
+          e.slNoPhys || id === "wall" || /^anchored_/.test(id))){
       var bh = e.behavior;
       r = !(e.movable === true || (Array.isArray(bh) && /M2/.test(JSON.stringify(bh))));   // only grains are left out
     }
@@ -1003,7 +1069,19 @@ function checkSupport(p, checked){
     }
   }
   fall.forEach(function(x){ checked.add(x); });
-  if (supported){ seen.forEach(function(x){ GC.add(x); }); return; }
+  if (supported){
+    /* a supported region is still one physics object: frozen, so it does not move, but real */
+    var grp = [];
+    seen.forEach(function(px){
+      if (px && !px.del && px.sub === undefined && pixelMap[px.x] && pixelMap[px.x][px.y] === px && (fallEl(px.element) || isSoftSolid(px.element))) grp.push(px);
+    });
+    if (grp.length && grp.length <= 2000 && bodyBudget > 0){
+      var nb = bodyFromPixels(grp);
+      if (nb){ nb.frozen = true; ensurePB(nb); }
+    }
+    seen.forEach(function(x){ GC.add(x); });
+    return;
+  }
   if (host){                                       // pixels the user JUST placed beside a body join it
     var rest = [];
     fall.forEach(function(px){
@@ -1218,10 +1296,10 @@ elements.physicsspin = { color: "#7bdcff", category: "tools", canPlace: false,
   } };
 elements.physicsfreeze = { color: "#7bdcff", category: "tools", canPlace: false,
   desc: "Freezes a physics body in place (still rotated, still off-grid).",
-  tool: function(p){ var b = bodyOf(p); if (b) b.frozen = true; } };
+  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = true; ensurePB(b); } } };
 elements.physicsunfreeze = { color: "#ff9d7b", category: "tools", canPlace: false,
   desc: "Unfreezes a frozen physics body so it moves again.",
-  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = false; b.hold = 0; } } };
+  tool: function(p){ var b = bodyOf(p); if (b){ b.frozen = false; b.hold = 0; ensurePB(b); } } };
 elements.physicsflip = { color: "#c792ff", category: "tools", canPlace: false,
   desc: "Flips the gravity direction of a physics body.",
   tool: function(p){
@@ -1435,7 +1513,10 @@ runEveryTick(function(){
   if (PL && !world) initWorld();
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
+  if (pixelTicks % 30 === 0) enforceMap();
   if (pixelTicks > 40 && pixelTicks % 60 === 0) auditMaterials();
+  if (pixelTicks > 60 && pixelTicks % 300 === 0) auditBodies();
+  if (pixelTicks > 60 && pixelTicks % 600 === 0) healthLine();
   if (!sweepQ && pixelTicks > 30 && pixelTicks % 300 === 0) startSweep();   // rolling audit: nothing stays airborne
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
@@ -1621,8 +1702,9 @@ globalThis.__SL_HOOK__ = hookAll;
 if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
-    hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials };
+    hookAll: hookAll, hurt: hurt, removeCell: removeCell, syncProxies: syncProxies, auditMaterials: auditMaterials,
+    auditBodies: auditBodies, enforceMap: enforceMap, stats: function(){ return SL_STATS; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v25 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v26 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
