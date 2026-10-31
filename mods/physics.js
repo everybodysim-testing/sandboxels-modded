@@ -1,7 +1,17 @@
 /* ============================================================================
-   SUBLEVEL PHYSICS v18 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
+   SUBLEVEL PHYSICS v19 -  Sandboxels 1.13.x  -  powered by Planck.js (Box2D)
    LOAD THIS MOD LAST. Needs internet once per session (planck.js from a CDN).
 
+   v19 - "everything solid falls" + hard anti-clone guards:
+         - anchors (wall / anchored_*) no longer DECIDE that a region is supported. They only
+           conduct the scan like any other solid, so the only absolute support is the world
+           floor/edge. A floating wall platform with blocks sitting on it no longer props those
+           blocks up in the air forever (this is what made "some saves" never fall).
+         - a pixel can only become part of a body if it is still live AND still owns its map
+           cell, so a stale object can never be converted twice (second conversion = duplicate
+           material + duplicate body)
+         - currentPixels compaction now de-duplicates by identity and runs once per tick
+           instead of once per body
    v18 - THE clone fix. When a pixel became part of a body it was cleared out of the map and
          flagged dead, but it was never taken out of Sandboxels' own currentPixels list. A dead
          pixel that is still in that list gets ticked, and when its old cell is empty again it
@@ -541,7 +551,6 @@ function syncProxies(b, R0){
     });
   }
   b.sx = b.x; b.sy = b.y; b.sa = b.a;
-  compactPixels();
 }
 function releaseProxies(b){
   b.proxies.forEach(function(pix){
@@ -827,12 +836,12 @@ function compactPixels(){
   if (!PIXDIRTY) return;
   PIXDIRTY = false;
   if (typeof currentPixels === "undefined" || !currentPixels || !currentPixels.length) return;
-  var keep = [];
+  var keep = [], seen = new Set();
   for (var i = 0; i < currentPixels.length; i++){
     var p = currentPixels[i];
-    if (!p) continue;
-    if (p.del){ p.inPx = false; continue; }
-    p.inPx = true; keep.push(p);
+    if (!p || p.del){ if (p) p.inPx = false; continue; }
+    if (seen.has(p)) continue;                       // a double push would tick the same pixel twice
+    seen.add(p); p.inPx = true; keep.push(p);
   }
   if (keep.length === currentPixels.length) return;
   currentPixels.length = 0;
@@ -861,6 +870,8 @@ function scanWorthy(p){
 }
 function bodyFromPixels(list){
   if (!list || !list.length) return null;
+  list = list.filter(function(q){ return q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q; });
+  if (!list.length) return null;                                    // nothing live left to convert
   if (bodyBudget <= 0) return null;                                 // try again next tick, pixels left as-is
   bodyBudget--;
   var ax = list[0].x, ay = list[0].y, cells = new Map();
@@ -893,7 +904,7 @@ function checkSupport(p, checked){
       if (!e) continue;                        // unknown material: never counts as support
       if (fallEl(n.element)){ seen.add(n); fall.push(n); stack.push(n); continue; }
       if (e.state && e.state !== "solid") continue;        // liquid, gas, molten, any odd mod state: never a surface
-      if (isAnchoredEl(n)){ supported = true; break; }
+      if (isAnchoredEl(n)){ seen.add(n); stack.push(n); continue; }   // anchors conduct only: a floating anchor props nothing up
       seen.add(n); stack.push(n);                                     // powder / other static stuff conducts support
     }
   }
@@ -913,6 +924,8 @@ function checkSupport(p, checked){
   seen.forEach(function(px){                                    // non-grain solids count too: "it does not fall" is not an excuse
     if (!inFall.has(px) && px.sub === undefined && !px.del && isSoftSolid(px.element)){ inFall.add(px); fall.push(px); }
   });
+  fall = fall.filter(function(q){ return q && !q.del && pixelMap[q.x] && pixelMap[q.x][q.y] === q; });
+  if (!fall.length) return;
   var byPos = new Map(), done = new Set(), lost = false;        // every solid group in the floating region becomes a body
   fall.forEach(function(q){ byPos.set(GK(q.x, q.y), q); });
   fall.forEach(function(q){
@@ -964,7 +977,7 @@ function processSupport(){
     }
   }
   if (sweepQ){                                   // full-map / audit pass, budgeted so a big save cannot stall a frame
-    while (sweepQ.length && scanNodes < 90000){
+    while (sweepQ.length && scanNodes < 30000){
       var sp = sweepQ.pop();
       if (!scanWorthy(sp) || checked.has(sp) || GC.has(sp)) continue;
       checkSupport(sp, checked);
@@ -1323,7 +1336,7 @@ runEveryTick(function(){
   if (PL && !world) initWorld();
   if (pixelTicks % 90 === 0 && Object.keys(elements).length !== hookedCount) hookAll();
   if (!world) return;
-  if (!sweepQ && pixelTicks > 30 && pixelTicks % 240 === 0) startSweep();   // rolling audit: nothing stays airborne
+  if (!sweepQ && pixelTicks > 30 && pixelTicks % 300 === 0) startSweep();   // rolling audit: nothing stays airborne
   if (sweepAt >= 0 && pixelTicks >= sweepAt){                       // full-map pass on boot / load / reset
     sweepAt = -1;
     if (!sweepQ){
@@ -1509,6 +1522,6 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
 }
-if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
+if (typeof logMessage === "function") logMessage("Sublevel Physics v19 loaded (Planck.js). Load it LAST in the mod list.");
 
 })();
