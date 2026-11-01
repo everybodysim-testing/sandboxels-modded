@@ -742,6 +742,29 @@ function animateBodies(){
   return work;
 }
 /* the game works on the footprint pixels (acid, fire, heat, animation...). Pull results back into the body. */
+/* A body pixel changed material - by a reaction, a tool, a virus, an acid, anything. The change is
+   accepted the moment it happens: the cell becomes the new material when that material can be a physics
+   object, and otherwise the pixel leaves the body and lives on as a normal pixel of the new material.
+   Nothing about the material other than movement is disabled; its own tick and reactions keep running. */
+function acceptProxyElement(b, pix){
+  if (!b || !pix || pix.ck === undefined) return false;
+  var cell = b.cells.get(pix.ck);
+  if (!cell || pix.element === cell.e) return false;
+  var NE = pix.element, gk = GK(pix.x, pix.y);
+  if (fallEl(NE)){
+    cell.e = NE;
+    if (pix.color !== undefined) cell.c = pix.color;
+    if (pix.alpha !== undefined) cell.al = pix.alpha;
+    if (pix.start !== undefined) cell.s = pix.start;
+    if (pix.temp !== undefined) cell.t = pix.temp;
+    cell.px = pix; b.dirty = true;
+    return true;
+  }
+  b.cells.delete(pix.ck); b.proxies.delete(gk);
+  pix.sub = undefined; delete pix.ck;
+  b.dirty = true; mark(pix.x, pix.y);
+  return true;
+}
 function watchProxies(b){
   var sum = {}, cnt = {}, chg = {};
   b.proxies.forEach(function(pix, gk){
@@ -753,9 +776,8 @@ function watchProxies(b){
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
-      var NE = pix.element;
-      if (fallEl(NE)){ cell.e = NE; b.dirty = true; }
-      else { b.cells.delete(pix.ck); b.proxies.delete(gk); pix.sub = undefined; b.dirty = true; mark(pix.x, pix.y); return; }
+      acceptProxyElement(b, pix);
+      cell = b.cells.get(pix.ck); if (!cell) return;   /* it left the body: nothing left to watch here */
     }
     var an = animOf(cell.e); if (an.col) cell.c = pix.color; if (an.alp) cell.al = pix.alpha; cell.px = pix;
     sum[pix.ck] = (sum[pix.ck] || 0) + pix.temp; cnt[pix.ck] = (cnt[pix.ck] || 0) + 1; if (pix.charge) chg[pix.ck] = 1;
@@ -1345,7 +1367,11 @@ wrap("deletePixel", function(o){ return function(x, y){
   if (ERASEGUARD && p && p.sub !== undefined) return;
   var q = quiet(p); o(x, y); if (!q) mark(x, y); }; });
 wrap("changePixel", function(o){ return function(pixel){
-  var q = quiet(pixel); o.apply(this, arguments); if (!q || !quiet(pixel)) mark(pixel.x, pixel.y); }; });
+  var q = quiet(pixel), sub = pixel && pixel.sub, ck = pixel && pixel.ck;
+  o.apply(this, arguments);
+  /* a body pixel just changed material: accept it now, not after the next rebuild */
+  if (sub !== undefined && pixel && pixel.sub === sub && BODIES[sub]) acceptProxyElement(BODIES[sub], pixel);
+  if (!q || !quiet(pixel)) mark(pixel.x, pixel.y); }; });
 wrap("movePixel", function(o){ return function(pixel, x, y){
   var q = quiet(pixel), ox = pixel.x, oy = pixel.y; o.apply(this, arguments); if (!q) mark(ox, oy); }; });
 wrap("swapPixels", function(o){ return function(a, b){
