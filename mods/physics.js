@@ -403,15 +403,39 @@ function raster(b, x, y, a){
   var c = Math.cos(a), s = Math.sin(a), r = b.rad;
   var gx0 = Math.floor(x - r), gx1 = Math.ceil(x + r), gy0 = Math.floor(y - r), gy1 = Math.ceil(y + r);
   var out = { gx: [], gy: [], ck: [] };
-  var used = new Set();                 /* one grid point per cell, always: rounding at an angle used to
-                                           bend two grid points onto the same cell, so two proxies shared
-                                           one cell and animated from the same value */
+  var used = new Set(), placed = new Set();
+  /* Every cell gets exactly one pixel. When rounding sends two cells to the same spot the second one
+     takes the nearest free spot instead of being dropped - dropping it left HOLES in the shape, and a
+     hole in a still shape shows the background in a regular pattern on the sandbox grid. */
   for (var gx = gx0; gx <= gx1; gx++) for (var gy = gy0; gy <= gy1; gy++){
     var dx = gx - x, dy = gy - y;
     var k = K(Math.round(dx*c + dy*s), Math.round(-dx*s + dy*c));
     if (!b.cells.has(k) || used.has(k)) continue;
     used.add(k);
+    if (placed.has(GK(gx, gy))) continue;
+    placed.add(GK(gx, gy));
     out.gx.push(gx); out.gy.push(gy); out.ck.push(k);
+  }
+  /* second pass: cells that were squeezed out by rounding get the closest free grid point */
+  if (used.size < b.cells.size){
+    for (var kk in b.cells){ }
+    var miss = [];
+    b.cells.forEach(function(cell, ck){ if (!used.has(ck)) miss.push(ck); });
+    for (var mi = 0; mi < miss.length; mi++){
+      var mc = b.cells.get(miss[mi]);
+      var wxx = x + mc.x*c - mc.y*s, wyy = y + mc.x*s + mc.y*c;
+      var bx = Math.round(wxx), by = Math.round(wyy), found = false;
+      for (var rr2 = 0; rr2 <= 3 && !found; rr2++){
+        for (var oy2 = -rr2; oy2 <= rr2 && !found; oy2++) for (var ox2 = -rr2; ox2 <= rr2; ox2++){
+          if (Math.max(Math.abs(ox2), Math.abs(oy2)) !== rr2) continue;
+          var tx = bx + ox2, ty = by + oy2, gk2 = GK(tx, ty);
+          if (placed.has(gk2)) continue;
+          placed.add(gk2); used.add(miss[mi]);
+          out.gx.push(tx); out.gy.push(ty); out.ck.push(miss[mi]);
+          found = true; break;
+        }
+      }
+    }
   }
   return out;
 }
@@ -567,6 +591,18 @@ function collectRiders(b){
   }
   return out;
 }
+/* Rebuild every pixel of a body from scratch - the same thing that happens every frame while the body
+   is moving. A still body kept its pixels, so anything that went stale in one of them (position, cell,
+   colour, alpha) stayed wrong forever and showed up as scattered bad pixels. */
+function refreshProxies(b){
+  b.proxies.forEach(function(pix){
+    if (!pix || pix.del) return;
+    if (pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix) pixelMap[pix.x][pix.y] = undefined;
+    dropPix(pix);
+  });
+  b.proxies.clear();
+  syncProxies(b);
+}
 function syncProxies(b, R0){
   var riders = (b.sx < 1e8) ? collectRiders(b) : [], i;
   for (i = 0; i < riders.length; i++){ var rp = riders[i].p; if (pixelMap[rp.x] && pixelMap[rp.x][rp.y] === rp) pixelMap[rp.x][rp.y] = undefined; }
@@ -666,10 +702,12 @@ function killBody(b){
 /* animated materials on a body: colours and alpha advance from the shared pixelTicks timer and from
    the cell's own location, so every copy of an object animates identically and in step */
 function bodyIsAnimated(b){
-  if (b.animT !== undefined && pixelTicks - b.animT < 30) return b.anim;
+  /* the cached answer is dropped as soon as the body gains or loses cells: a body that was empty (or
+     plain) when we last looked must not be ignored for the next 30 ticks */
+  if (b.animT !== undefined && b.animSize === b.cells.size && pixelTicks - b.animT < 30) return b.anim;
   var out = false;
   b.cells.forEach(function(cell){ if (out) return; if (animOf(cell.e).anim) out = true; });   /* any cell, not just the first few */
-  b.anim = out; b.animT = pixelTicks;
+  b.anim = out; b.animT = pixelTicks; b.animSize = b.cells.size;
   return out;
 }
 var ANIM_BUDGET = 60000;   /* the game's own pixel loop also ticks proxies; if we skip any, the two writers disagree */
@@ -1554,7 +1592,18 @@ runEveryTick(function(){
     }
   }
   ids = Object.keys(BODIES);
-  for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead){ ensurePB(b); if (b.needSync){ b.needSync = false; syncProxies(b); } } }
+  for (i = 0; i < ids.length; i++){
+    b = BODIES[ids[i]];
+    if (!b || b.dead) continue;
+    ensurePB(b);
+    /* An animated object re-builds its pixels every frame, exactly the way a MOVING object does.
+       That is the only state in which every proxy is freshly created, and a fresh pixel is not ticked
+       by the game on the frame it appears, so the object's own colours/alpha are what get drawn. */
+    if (b.proxies && b.proxies.size && bodyIsAnimated(b)){
+      if (b.proxies.size <= 400 || (pixelTicks % 3) === 0){ refreshProxies(b); continue; }
+    }
+    if (b.needSync){ b.needSync = false; syncProxies(b); }
+  }
 
   if (GRAB && (!mouseIsDown || currentElement !== "physgrab" || GRAB.b.dead || !GRAB.b.pb)) GRAB = null;
 
