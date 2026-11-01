@@ -1115,7 +1115,12 @@ function checkSupport(p, checked){
       if (fallEl(n.element)){ seen.add(n); fall.push(n); stack.push(n); continue; }
       if (e.state && e.state !== "solid") continue;        // liquid, gas, molten, any odd mod state: never a surface
       if (isAnchoredEl(n)){ supported = true; break; }
-      seen.add(n); stack.push(n);                                     // powder / other static stuff conducts support
+      /* A powder is not ground. It flows out from under whatever is sitting on it, so support that
+         runs through powder is what turned a bowl of sand into a loop: the shell holds the sand up,
+         the sand held the shell up, and the pair of them hung in the air. Only stuff that stays put
+         conducts support now; powder holds nothing up and is never remembered as ground. */
+      if (selfMoving(n.element, e)) continue;
+      seen.add(n); stack.push(n);                                     // static solids conduct support
     }
   }
   fall.forEach(function(x){ checked.add(x); });
@@ -1830,7 +1835,8 @@ if (globalThis.__SUBLEVEL_TEST__){
   globalThis.__SUBLEVEL_TEST__ = { BODIES: function(){ return BODIES; }, fallEl: fallEl, snapBody: snapBody, physOf: physOf, checkSupport: checkSupport,
     applyGravitySetting: applyGravitySetting, addGravitySetting: addGravitySetting,
     gravity: function(){ return GRAV_ON; },
-    processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; } };
+    processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
+    GC: function(){ return GC; } };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
 
