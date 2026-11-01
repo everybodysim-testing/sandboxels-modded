@@ -284,9 +284,11 @@ function animStep(cell, gx, gy){
   var a = animOf(cell.e);
   if (!a.anim || !a.pure) return false;
   var e = elements[cell.e];
-  var s = { x: gx, y: gy, element: cell.e, start: 0, temp: cell.t === undefined ? 20 : cell.t,
+  /* the scratch pixel carries the tick the material was actually PLACED, so anything derived from it
+     (stained glass builds its hue from pixel.start) comes out exactly as it would on a normal pixel */
+  var st = cell.s === undefined ? pixelTicks : cell.s;
+  var s = { x: gx, y: gy, element: cell.e, start: st, colorstart: st, temp: cell.t === undefined ? 20 : cell.t,
             color: cell.c === undefined ? gx : cell.c, alpha: cell.al === undefined ? 1 : cell.al };
-  if (a.multi || a.usesStart) s.colorstart = hashXY(cell.x, cell.y) % 360;   // location seeds the hue
   try { (e.tick1 || e.tick).call(e, s); } catch(err){ return false; }
   var ch = false;
   if (a.col && s.color !== undefined && s.color !== cell.c){ cell.c = s.color; ch = true; }
@@ -534,12 +536,16 @@ function mkProxy(b, cell, gx, gy, spareBy){
   if (cell.c !== undefined) pix.color = cell.c;
   else if (pel && Array.isArray(pel.color)){
     /* multi-colour materials: pick from the palette by location, never by chance, so a rebuild keeps it */
-    cell.c = pel.color[hashXY(cell.x, cell.y) % pel.color.length];
+    var pickIx = (cell.s === undefined || !cell.s) ? hashXY(cell.x, cell.y) : (cell.s + cell.x*7 + cell.y*13);
+    cell.c = pel.color[Math.abs(pickIx) % pel.color.length];
     pix.color = cell.c;
   }
   else cell.c = pix.color;
-  if (cell.al !== undefined) pix.alpha = cell.al; else if (pix.alpha !== undefined && !(animOf(cell.e).alp)) delete pix.alpha;
-  if (animOf(cell.e).anim) animStep(cell, gx, gy);
+  var ca = animOf(cell.e);
+  if (ca.anim) animStep(cell, cell.x, cell.y);            /* animate first, then hand the values over */
+  if (cell.al !== undefined) pix.alpha = cell.al;
+  else if (pix.alpha !== undefined && !ca.alp) delete pix.alpha;
+  if (cell.c !== undefined && ca.col) pix.color = cell.c;
   return pix;
 }
 /* powder sitting on top of a body rides with it */
@@ -673,7 +679,7 @@ function animateBodies(){
       var cell = b.cells.get(pix.ck); if (!cell) return;
       budget--; work++;
       var a = animOf(cell.e); if (!a.anim) return;
-      if (animStep(cell, pix.x, pix.y)) ch = true;
+      if (animStep(cell, cell.x, cell.y)) ch = true;
       if (a.col && cell.c !== undefined && pix.color !== cell.c) pix.color = cell.c;
       if (a.alp && cell.al !== undefined && pix.alpha !== cell.al) pix.alpha = cell.al;
     });
@@ -980,7 +986,7 @@ function bodyFromPixels(list){
   if (bodyBudget <= 0) return null;                                 // try again next tick, pixels left as-is
   bodyBudget--;
   var ax = list[0].x, ay = list[0].y, cells = new Map();
-  list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20 }); });
+  list.forEach(function(q){ cells.set(K(q.x - ax, q.y - ay), { x: q.x - ax, y: q.y - ay, e: q.element, c: q.color, t: q.temp !== undefined ? q.temp : 20, s: q.start }); });
   list.forEach(function(q){ if (pixelMap[q.x] && pixelMap[q.x][q.y] === q){ pixelMap[q.x][q.y] = undefined; dropPix(q); } });
   var b = makeBody(cells, 0);
   b.x = ax; b.y = ay;
@@ -1127,7 +1133,7 @@ function processSupport(){
 function joinPixel(b, p){
   var l = toLocal(b, p.x, p.y), lx = Math.round(l.x), ly = Math.round(l.y);
   if (b.cells.has(K(lx, ly))) return false;                     // cell taken: refuse rather than eat the pixel
-  b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20 });
+  b.cells.set(K(lx, ly), { x: lx, y: ly, e: p.element, c: p.color, t: p.temp !== undefined ? p.temp : 20, s: p.start });
   if (pixelMap[p.x] && pixelMap[p.x][p.y] === p) pixelMap[p.x][p.y] = undefined;
   dropPix(p);
   b.dirty = true; b.hold = pixelTicks + HOLD;
@@ -1364,7 +1370,7 @@ function placeLocal(b, set, el, replace){
     if (outOfBounds(gx, gy)) return;
     var o = pixelMap[gx][gy];
     if (o && ((o.sub !== undefined && o.sub !== b.id) || (o.sub === undefined && occState(o) === 1))) return;
-    b.cells.set(k, { x: lx, y: ly, e: el, c: undefined, t: 20 }); added++;
+    b.cells.set(k, { x: lx, y: ly, e: el, c: undefined, t: 20, s: pixelTicks }); added++;
   });
   if (!added) return;
   b.hold = pixelTicks + HOLD;
@@ -1529,7 +1535,6 @@ runEveryTick(function(){
     if (b.proxies.size <= 220 || ((pixelTicks + (b.slI || 0)) % 3) === 0) watchProxies(b);   // big bodies: every 3rd tick
   }
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead && b.dirty) fixBody(b); }
-  try { animateBodies(); } catch(e){}
   if ((pixelTicks % 30) === 0){                        /* materials that turned out not to be solids lose their body */
     var pids = Object.keys(BODIES);
     for (i = 0; i < pids.length; i++){
@@ -1652,6 +1657,7 @@ runEveryTick(function(){
       syncProxies(b, R0);
     }
   }
+  try { animateBodies(); } catch(e){}   /* last word on animated colours/alpha, after every rebuild */
 });
 runPerPixel(function(p){
   if (p.sub !== undefined){
