@@ -280,6 +280,14 @@ function hashXY(lx, ly){
 }
 /* run an element's own animation tick on a scratch pixel seeded from the cell's location, so colours
    and alpha come out identical for every copy and advance with the shared pixelTicks timer */
+/* The position an animated cell is PHASED from. Never the rounded grid spot its pixel landed on:
+   an off-grid object rounds every cell by up to half a step in a pattern, and that pattern is exactly
+   what showed up as pixels animated at the wrong phase. The object's own lattice gives every cell its
+   own step, identical for the same object wherever it is placed. */
+function animPhase(b, cell){
+  var ox = Math.round(b && b.x !== undefined ? b.x : 0), oy = Math.round(b && b.y !== undefined ? b.y : 0);
+  return [ox + (cell.x | 0), oy + (cell.y | 0)];
+}
 function animStep(cell, gx, gy){
   var a = animOf(cell.e);
   if (!a.anim || !a.pure) return false;
@@ -571,7 +579,7 @@ function mkProxy(b, cell, gx, gy, spareBy){
   }
   else cell.c = pix.color;
   var ca = animOf(cell.e);
-  if (ca.anim) animStep(cell, gx, gy);                    /* animate first, then hand the values over */
+  if (ca.anim){ var ph = animPhase(b, cell); animStep(cell, ph[0], ph[1]); }   /* phase from the object, not the rounded spot */
   if (cell.al !== undefined) pix.alpha = cell.al;
   else if (pix.alpha !== undefined && !ca.alp) delete pix.alpha;
   if (ca.anim && cell.s !== undefined) pix.start = cell.s;   /* same start the game would have used: hues agree */
@@ -723,7 +731,8 @@ function animateBodies(){
       var cell = b.cells.get(pix.ck); if (!cell) return;
       budget--; work++;
       var a = animOf(cell.e); if (!a.anim) return;
-      if (animStep(cell, pix.x, pix.y)) ch = true;   /* vanilla coords: the game's own tick of this pixel must agree */
+      var ph2 = animPhase(b, cell);
+      if (animStep(cell, ph2[0], ph2[1])) ch = true;
       if (a.anim && cell.s !== undefined && pix.start !== cell.s) pix.start = cell.s;
       if (a.col && cell.c !== undefined && pix.color !== cell.c) pix.color = cell.c;
       if (a.alp && cell.al !== undefined && pix.alpha !== cell.al) pix.alpha = cell.al;
@@ -1719,6 +1728,26 @@ runPerPixel(function(p){
   if (p.sub !== undefined){
     var b = BODIES[p.sub];
     if (!b || b.proxies.get(GK(p.x, p.y)) !== p) p.sub = undefined;
+    else {
+      /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
+      var c0 = b.cells.get(p.ck);
+      if (c0){
+        var a0 = animOf(c0.e);
+        if (a0.anim && a0.pure){
+          var ph0 = animPhase(b, c0);
+          var s0 = { x: ph0[0], y: ph0[1], element: c0.e,
+                     start: c0.s === undefined ? pixelTicks : c0.s, colorstart: c0.s === undefined ? pixelTicks : c0.s,
+                     temp: c0.t === undefined ? 20 : c0.t, color: p.color, alpha: p.alpha === undefined ? 1 : p.alpha };
+          try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
+          if (s0){
+            if (a0.col && s0.color !== undefined) p.color = s0.color;
+            if (a0.alp && s0.alpha !== undefined) p.alpha = s0.alpha;
+            if (a0.col) c0.c = s0.color;
+            if (a0.alp) c0.al = s0.alpha;
+          }
+        }
+      }
+    }
   } else if (p.pvx !== undefined) flyGrain(p);
 });
 runAfterReset(function(){
