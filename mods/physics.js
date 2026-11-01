@@ -699,6 +699,16 @@ function killBody(b){
   if (GRAB && GRAB.b === b) GRAB = null;
   b.dead = true; delete BODIES[b.id];
 }
+/* the mod's animation, computed for a live pixel: identical maths to animStep, no cell bookkeeping */
+function animPixelValue(elId, st, gx, gy){
+  var a = animOf(elId);
+  if (!a.anim || !a.pure) return null;
+  var e = elements[elId];
+  if (!e || typeof e.tick !== "function") return null;
+  var s = { x: gx, y: gy, element: elId, start: st, colorstart: st, temp: 20, color: "#000000", alpha: 1 };
+  try { (e.tick1 || e.tick).call(e, s); } catch(err){ return null; }
+  return s;
+}
 /* animated materials on a body: colours and alpha advance from the shared pixelTicks timer and from
    the cell's own location, so every copy of an object animates identically and in step */
 function bodyIsAnimated(b){
@@ -1720,6 +1730,20 @@ runPerPixel(function(p){
     var b = BODIES[p.sub];
     if (!b || b.proxies.get(GK(p.x, p.y)) !== p) p.sub = undefined;
   } else if (p.pvx !== undefined) flyGrain(p);
+  /* animated materials: applied here, inside the engine's own pixel loop and after the material's tick,
+     so this value is the last one written for this pixel in the frame. Same maths as the body pass. */
+  var an = animOf(p.element);
+  if (an.anim && an.pure){
+    var v2 = animPixelValue(p.element, p.start === undefined ? pixelTicks : p.start, p.x, p.y);
+    if (v2){
+      if (an.col && v2.color !== undefined && p.color !== v2.color) p.color = v2.color;
+      if (an.alp && v2.alpha !== undefined && p.alpha !== v2.alpha) p.alpha = v2.alpha;
+      if (p.sub !== undefined){
+        var b2 = BODIES[p.sub], c2 = b2 && b2.cells.get(p.ck);
+        if (c2){ if (an.col) c2.c = v2.color; if (an.alp) c2.al = v2.alpha; }
+      }
+    }
+  }
 });
 runAfterReset(function(){
   BODIES = {}; dirtyA.length = 0; dirtyS.clear(); impacts.length = 0; pushes.length = 0; tfix.clear(); RIDERS.clear(); GC = new Set(); GRAB = null;
