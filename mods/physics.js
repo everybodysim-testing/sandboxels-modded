@@ -164,39 +164,53 @@ function behaviorGrid(bh){
   return null;
 }
 var MOVES_RE = /tryMove|movePixel|swapPixels|moveTo\(|slide|flow/i;
-/* A material acts on itself if its 3x3 grid holds ANY token other than XX: M1, M2, M3, SP, CH, SW,
-   DB, CF, anything. Those are not solids and never get physics. Only a plain all-XX grid qualifies. */
-function gridActs(grid){
+/* Movement is what bars a material, nothing else: M1, M2 or M3 anywhere in the 3x3 grid (bottom row
+   included), a tick that moves its own pixels, or a tick that copies itself. Other tokens (SP, CH, SW,
+   DB, CF...) are static behaviour, and machines and the like keep their physics. */
+var MOVE_TOKEN = /^M[1-9]/;
+function gridMoves(grid){
   if (!grid) return true;
-  if (grid.length !== 3) return true;
+  if (grid.length !== 3) return /(?:^|[^A-Z])M[1-9]/.test(JSON.stringify(grid).toUpperCase());
   for (var i = 0; i < 3; i++){
     var row = grid[i];
     if (typeof row === "string") row = row.split("|");
     if (!Array.isArray(row)) return true;
     for (var j = 0; j < row.length; j++){
       var t = String(row[j]).toUpperCase().replace(/%[0-9.]+/g, "").trim();
-      if (t === "" || t === "XX") continue;
-      return true;                                  // it moves or reacts with itself: not a solid
+      if (MOVE_TOKEN.test(t)) return true;              // it moves itself: never a physics object
     }
   }
   return false;
 }
-function selfMoving(e){
+function selfClones(id, e){
+  var src = "";
+  if (typeof e.tick === "function") src += String(e.tick);
+  if (typeof e.tick1 === "function") src += String(e.tick1);
+  if (typeof e.tick2 === "function") src += String(e.tick2);
+  if (typeof e.behavior === "function") src += String(e.behavior);
+  if (!src || src.indexOf("createPixel") === -1) return false;
+  var esc = String(id).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (new RegExp("createPixel\\s*\\(\\s*[\"']" + esc + "[\"']").test(src)) return true;   // copies its own material
+  return /createPixel\s*\(\s*(this|pixel)\.element/.test(src);                              // or copies "itself"
+}
+function selfMoving(id, e){
   if (!e) return true;
   if (e.movable === true) return true;                       // powders and liquids
   if (e.anchored || e.slNoPhys) return true;
   var bh = e.behavior;
   if (bh === undefined || bh === null){
     if (typeof e.tick === "function" && MOVES_RE.test(String(e.tick))) return true;
+    if (selfClones(id, e)) return true;
     return false;                                            // no grid and no moving tick: static
   }
   if (typeof bh === "function") return true;                 // JS behaviour: assume it moves
   var grid = behaviorGrid(bh);
   if (!grid) return true;                                    // unknown grid: never a physics object
-  if (gridActs(grid)) return true;
+  if (gridMoves(grid)) return true;
   if (typeof e.tick === "function" && MOVES_RE.test(String(e.tick))) return true;
   if (typeof e.tick1 === "function" && MOVES_RE.test(String(e.tick1))) return true;
   if (typeof e.tick2 === "function" && MOVES_RE.test(String(e.tick2))) return true;
+  if (selfClones(id, e)) return true;
   return false;
 }
 /* materials that must get physics even though the normal test skips them.
@@ -207,7 +221,7 @@ function calcFall(id, e){
   if (!e || (e.tool && !e.canPlace) || e.anchored || e.slNoPhys || id === "wall" || /^anchored_/.test(id)) return false;
   if (e.category === "tools" || e.category === "energy") return false;
   if (e.state !== undefined && e.state !== "solid") return false;
-  if (selfMoving(e)) return false;
+  if (selfMoving(id, e)) return false;
   return true;
 }
 Object.keys(PHYS_WHITELIST).forEach(function(id){ delete FC[id]; });
