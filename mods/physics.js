@@ -264,12 +264,34 @@ function powderUnder(b){
 /* animated elements: only those whose tick rewrites colour/alpha are treated specially */
 var AC = {};
 function animOf(id){
-  var a = AC[id]; if (a) return a;
-  var e = elements[id], s = (e && typeof e.tick === "function") ? String(e.tick) : "";
-  a = { col: /\.color\s*=[^=]/.test(s), alp: /\.alpha\s*=[^=]/.test(s),
+  var a = AC[id]; if (a && a.e === elements[id]) return a;
+  var e = elements[id] || {}, s = (e && typeof e.tick === "function") ? String(e.tick) : "";
+  a = { e: e, col: /\.color\s*=[^=]/.test(s), alp: /\.alpha\s*=[^=]/.test(s),
+        multi: Array.isArray(e.color), usesStart: /colorstart|\.start\b/.test(s),
         pure: !!s && !/pixelMap|isEmpty|tryMove|changePixel|createPixel|deletePixel|movePixel|swapPixels|explode|adjacentCoords|getNeighbor/.test(s) };
   a.anim = a.col || a.alp;
   return (AC[id] = a);
+}
+/* stable per-location hash: the same cell always animates the same way, in every copy of the object */
+function hashXY(lx, ly){
+  var h = Math.imul(lx | 0, 374761393) ^ Math.imul(ly | 0, 668265263);
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+/* run an element's own animation tick on a scratch pixel seeded from the cell's location, so colours
+   and alpha come out identical for every copy and advance with the shared pixelTicks timer */
+function animStep(cell, gx, gy){
+  var a = animOf(cell.e);
+  if (!a.anim || !a.pure) return false;
+  var e = elements[cell.e];
+  var s = { x: gx, y: gy, element: cell.e, start: 0, temp: cell.t === undefined ? 20 : cell.t,
+            color: cell.c === undefined ? gx : cell.c, alpha: cell.al === undefined ? 1 : cell.al };
+  if (a.multi || a.usesStart) s.colorstart = hashXY(cell.x, cell.y) % 360;   // location seeds the hue
+  try { (e.tick1 || e.tick).call(e, s); } catch(err){ return false; }
+  var ch = false;
+  if (a.col && s.color !== undefined && s.color !== cell.c){ cell.c = s.color; ch = true; }
+  if (a.alp && s.alpha !== cell.al){ cell.al = s.alpha; ch = true; }
+  return ch;
 }
 
 /* ------------------------------------- per-element physics characteristics */
@@ -508,7 +530,16 @@ function mkProxy(b, cell, gx, gy, spareBy){
     pix.inPx = true;
     pix.temp = cell.t !== undefined ? cell.t : 20;
   }
-  if (cell.c) pix.color = cell.c; else cell.c = pix.color;
+  var pel = elements[cell.e];
+  if (cell.c !== undefined) pix.color = cell.c;
+  else if (pel && Array.isArray(pel.color)){
+    /* multi-colour materials: pick from the palette by location, never by chance, so a rebuild keeps it */
+    cell.c = pel.color[hashXY(cell.x, cell.y) % pel.color.length];
+    pix.color = cell.c;
+  }
+  else cell.c = pix.color;
+  if (cell.al !== undefined) pix.alpha = cell.al; else if (pix.alpha !== undefined && !(animOf(cell.e).alp)) delete pix.alpha;
+  if (animOf(cell.e).anim) animStep(cell, gx, gy);
   return pix;
 }
 /* powder sitting on top of a body rides with it */
@@ -619,6 +650,36 @@ function killBody(b){
   if (b.pb && world){ world.destroyBody(b.pb); b.pb = null; }
   if (GRAB && GRAB.b === b) GRAB = null;
   b.dead = true; delete BODIES[b.id];
+}
+/* animated materials on a body: colours and alpha advance from the shared pixelTicks timer and from
+   the cell's own location, so every copy of an object animates identically and in step */
+function bodyIsAnimated(b){
+  if (b.animT !== undefined && pixelTicks - b.animT < 30) return b.anim;
+  var n = 0, out = false;
+  b.cells.forEach(function(cell){ if (out || n++ > 12) return; if (animOf(cell.e).anim) out = true; });
+  b.anim = out; b.animT = pixelTicks;
+  return out;
+}
+var ANIM_BUDGET = 4000;
+function animateBodies(){
+  var ids = Object.keys(BODIES), budget = ANIM_BUDGET, work = 0;
+  for (var i = 0; i < ids.length && budget > 0; i++){
+    var b = BODIES[ids[i]];
+    if (!b || b.dead || !b.proxies || !b.proxies.size) continue;
+    if (!bodyIsAnimated(b)) continue;
+    var ch = false;
+    b.proxies.forEach(function(pix, gk){
+      if (budget <= 0 || !pix || pix.del || pix.sub !== b.id) return;
+      var cell = b.cells.get(pix.ck); if (!cell) return;
+      budget--; work++;
+      var a = animOf(cell.e); if (!a.anim) return;
+      if (animStep(cell, pix.x, pix.y)) ch = true;
+      if (a.col && cell.c !== undefined && pix.color !== cell.c) pix.color = cell.c;
+      if (a.alp && cell.al !== undefined && pix.alpha !== cell.al) pix.alpha = cell.al;
+    });
+    if (ch) PIXDIRTY = true;
+  }
+  return work;
 }
 /* the game works on the footprint pixels (acid, fire, heat, animation...). Pull results back into the body. */
 function watchProxies(b){
@@ -1468,6 +1529,7 @@ runEveryTick(function(){
     if (b.proxies.size <= 220 || ((pixelTicks + (b.slI || 0)) % 3) === 0) watchProxies(b);   // big bodies: every 3rd tick
   }
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead && b.dirty) fixBody(b); }
+  try { animateBodies(); } catch(e){}
   if ((pixelTicks % 30) === 0){                        /* materials that turned out not to be solids lose their body */
     var pids = Object.keys(BODIES);
     for (i = 0; i < pids.length; i++){
