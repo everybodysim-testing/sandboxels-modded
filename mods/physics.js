@@ -403,10 +403,15 @@ function raster(b, x, y, a){
   var c = Math.cos(a), s = Math.sin(a), r = b.rad;
   var gx0 = Math.floor(x - r), gx1 = Math.ceil(x + r), gy0 = Math.floor(y - r), gy1 = Math.ceil(y + r);
   var out = { gx: [], gy: [], ck: [] };
+  var used = new Set();                 /* one grid point per cell, always: rounding at an angle used to
+                                           bend two grid points onto the same cell, so two proxies shared
+                                           one cell and animated from the same value */
   for (var gx = gx0; gx <= gx1; gx++) for (var gy = gy0; gy <= gy1; gy++){
     var dx = gx - x, dy = gy - y;
     var k = K(Math.round(dx*c + dy*s), Math.round(-dx*s + dy*c));
-    if (b.cells.has(k)){ out.gx.push(gx); out.gy.push(gy); out.ck.push(k); }
+    if (!b.cells.has(k) || used.has(k)) continue;
+    used.add(k);
+    out.gx.push(gx); out.gy.push(gy); out.ck.push(k);
   }
   return out;
 }
@@ -661,12 +666,12 @@ function killBody(b){
    the cell's own location, so every copy of an object animates identically and in step */
 function bodyIsAnimated(b){
   if (b.animT !== undefined && pixelTicks - b.animT < 30) return b.anim;
-  var n = 0, out = false;
-  b.cells.forEach(function(cell){ if (out || n++ > 12) return; if (animOf(cell.e).anim) out = true; });
+  var out = false;
+  b.cells.forEach(function(cell){ if (out) return; if (animOf(cell.e).anim) out = true; });   /* any cell, not just the first few */
   b.anim = out; b.animT = pixelTicks;
   return out;
 }
-var ANIM_BUDGET = 4000;
+var ANIM_BUDGET = 60000;   /* the game's own pixel loop also ticks proxies; if we skip any, the two writers disagree */
 function animateBodies(){
   var ids = Object.keys(BODIES), budget = ANIM_BUDGET, work = 0;
   for (var i = 0; i < ids.length && budget > 0; i++){
