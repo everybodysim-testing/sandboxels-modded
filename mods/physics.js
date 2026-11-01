@@ -433,7 +433,7 @@ function raster(b, x, y, a){
       var mc = b.cells.get(miss[mi]);
       var wxx = x + mc.x*c - mc.y*s, wyy = y + mc.x*s + mc.y*c;
       var bx = Math.round(wxx), by = Math.round(wyy), found = false;
-      for (var rr2 = 0; rr2 <= 3 && !found; rr2++){
+      for (var rr2 = 0; rr2 <= 8 && !found; rr2++){
         for (var oy2 = -rr2; oy2 <= rr2 && !found; oy2++) for (var ox2 = -rr2; ox2 <= rr2; ox2++){
           if (Math.max(Math.abs(ox2), Math.abs(oy2)) !== rr2) continue;
           var tx = bx + ox2, ty = by + oy2, gk2 = GK(tx, ty);
@@ -651,7 +651,12 @@ function syncProxies(b, R0){
     var o = pixelMap[gx][gy];
     var cell = b.cells.get(R.ck[idx]); if (!cell) return;
     if (o){
-      if (occState(o) === 1) return;                        // overlap with a real solid: tolerated
+      if (occState(o) === 1){
+        /* the spot holds a loose pixel of the cell's own material - the stroke that made it is part of
+           this object, so take the spot. Refusing here is what left a hole in the shape. */
+        if (o.sub === undefined && o.element === cell.e){ dropPix(o); pixelMap[gx][gy] = undefined; }
+        else return;                                        // a different solid: leave it alone
+      }
       var gone = elements[o.element] && elements[o.element].state === "solid";
       var ox = o.x, oy = o.y;
       relocate(o, gx, gy, want, rr, b.x, b.y);
@@ -1075,6 +1080,22 @@ var SDIR = [[0,-1],[-1,0],[1,0],[0,1]];             // down is explored first (i
    liquids, gases and other physics bodies never hold anything up. */
 /* a cluster of a material that already has a body right next to it belongs to that body: adding a
    second overlapping object is how a duplicating material ends up fighting itself */
+function bodyHasMat(b, mat){
+  var it = b.cells.values(), n = 0;
+  while (n++ < 20000){ var v = it.next(); if (v.done) return false; if (v.value.e === mat) return true; }
+  return false;
+}
+/* how far a loose cluster is from an object's actual pixels. Using the object's centre made a patch
+   drawn beside a long object look "far away" and spawn a second object of its own. */
+function bodyGap(b, cx, cy){
+  var minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9, n = 0;
+  b.proxies.forEach(function(p){
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y; n++;
+  });
+  if (!n) return 1e9;
+  return Math.max(0, minX - cx, cx - maxX) + Math.max(0, minY - cy, cy - maxY);
+}
 function adoptIntoNearbyBody(grp){
   if (!grp || !grp.length) return false;
   var mat = grp[0] && grp[0].element;
@@ -1086,9 +1107,13 @@ function adoptIntoNearbyBody(grp){
   for (i = 0; i < ids.length; i++){
     var b = BODIES[ids[i]];
     if (!b || b.dead) continue;
-    var it = b.cells.values().next(); if (it.done || it.value.e !== mat) continue;
-    var d = Math.abs(b.x - cx) + Math.abs(b.y - cy);
-    if (d < best && d <= 6 + Math.sqrt(grp.length)){ best = d; host = b; }
+    /* match on the whole body, not just the cell that happens to come out of the map first: a body
+       made of two materials used to refuse its own second material and spawn a separate object */
+    if (Math.abs(b.x - cx) > b.rad + 14 || Math.abs(b.y - cy) > b.rad + 14) continue;
+    var d = bodyGap(b, cx, cy);
+    if (d >= best || d > 7) continue;
+    if (!bodyHasMat(b, mat)) continue;
+    best = d; host = b;
   }
   if (!host) return false;
   var joined = 0;
@@ -1126,14 +1151,12 @@ function checkSupport(p, checked){
   fall.forEach(function(x){ checked.add(x); });
   if (supported){ seen.forEach(function(x){ GC.add(x); }); return; }
   if (host){                                       // pixels beside a body join it instead of making a second one
-    var hmat = null;
-    var hIt = host.cells.values().next(); if (!hIt.done) hmat = hIt.value.e;
     var rest = [];
     fall.forEach(function(px){
       if (px.del || px.sub !== undefined) return;
-      var recent = (px.pa !== undefined && pixelTicks - px.pa <= 2);
-      /* freshly placed, or a copy of the body's own material: it is part of that object already */
-      if (recent || (hmat !== null && px.element === hmat)) joinPixel(host, px);
+      var recent = (px.pa !== undefined && pixelTicks - px.pa <= 12);
+      /* freshly placed, or a material the body already contains: it is part of that object already */
+      if (recent || bodyHasMat(host, px.element)) joinPixel(host, px);
       else rest.push(px);
     });
     fall = rest;
@@ -1416,6 +1439,9 @@ function line4(x0, y0, x1, y1){                    // 4-connected line: never le
   return pts;
 }
 function bodyNear(x, y, reach){
+  /* the pointer sits between pixels (the brush works in sub-cell space), and a fractional coordinate
+     indexes nothing in pixelMap - so look at the pixel the pointer is actually over */
+  x = Math.round(x); y = Math.round(y);
   for (var d = 0; d <= reach; d++){
     for (var dx = -d; dx <= d; dx++) for (var dy = -d; dy <= d; dy++){
       if (Math.max(Math.abs(dx), Math.abs(dy)) !== d) continue;
@@ -1486,7 +1512,10 @@ function placeLocal(b, set, el, replace){
     var w = toWorld(b, lx, ly), gx = Math.round(w.x), gy = Math.round(w.y);
     if (outOfBounds(gx, gy)) return;
     var o = pixelMap[gx][gy];
-    if (o && ((o.sub !== undefined && o.sub !== b.id) || (o.sub === undefined && occState(o) === 1))) return;
+    if (o){
+      if (o.sub === undefined && occState(o) === 1 && o.element === el){ dropPix(o); pixelMap[gx][gy] = undefined; }
+      else if ((o.sub !== undefined && o.sub !== b.id) || (o.sub === undefined && occState(o) === 1)) return;
+    }
     b.cells.set(k, { x: lx, y: ly, e: el, c: undefined, t: 20, s: pixelTicks }); added++;
   });
   if (!added) return;
