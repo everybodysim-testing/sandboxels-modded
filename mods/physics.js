@@ -547,9 +547,10 @@ function mkProxy(b, cell, gx, gy, spareBy){
   }
   else cell.c = pix.color;
   var ca = animOf(cell.e);
-  if (ca.anim) animStep(cell, cell.x, cell.y);            /* animate first, then hand the values over */
+  if (ca.anim) animStep(cell, gx, gy);                    /* animate first, then hand the values over */
   if (cell.al !== undefined) pix.alpha = cell.al;
   else if (pix.alpha !== undefined && !ca.alp) delete pix.alpha;
+  if (ca.anim && cell.s !== undefined) pix.start = cell.s;   /* same start the game would have used: hues agree */
   if (cell.c !== undefined && ca.col) pix.color = cell.c;
   return pix;
 }
@@ -684,7 +685,8 @@ function animateBodies(){
       var cell = b.cells.get(pix.ck); if (!cell) return;
       budget--; work++;
       var a = animOf(cell.e); if (!a.anim) return;
-      if (animStep(cell, cell.x, cell.y)) ch = true;
+      if (animStep(cell, pix.x, pix.y)) ch = true;   /* vanilla coords: the game's own tick of this pixel must agree */
+      if (a.anim && cell.s !== undefined && pix.start !== cell.s) pix.start = cell.s;
       if (a.col && cell.c !== undefined && pix.color !== cell.c) pix.color = cell.c;
       if (a.alp && cell.al !== undefined && pix.alpha !== cell.al) pix.alpha = cell.al;
     });
