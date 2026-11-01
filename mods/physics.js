@@ -1434,6 +1434,38 @@ function strokeBodies(x1, y1, x2, y2, reach){
   return out;
 }
 function brushSize(){ return (typeof mouseSize !== "undefined" && mouseSize) ? mouseSize : 1; }
+/* ONE rule for the square you see and the edit it performs. The brush only ever touches the object
+   whose pixels are under the brush at this instant, so the cursor turns with an object exactly when
+   the edit is going to land in that object's own grid - and never for the body the stroke passed
+   through a moment ago, which is what made an erase happen at an angle while the square sat straight. */
+function brushReachOf(el, ed, sz){
+  if (el === "erase") return Math.max(0, Math.floor(sz/2));
+  if (ed && (!ed.tool || ed.canPlace) && fallEl(el)) return Math.max(0, Math.floor(sz/2));
+  return -1;                                            // this tool never edits an object
+}
+function pointerPt(){
+  var F = pointerF();
+  if (F) return { x: F.x, y: F.y, px: F.px, py: F.py };
+  if (typeof mousePos !== "undefined" && mousePos) return { x: mousePos.x, y: mousePos.y, px: mousePos.x, py: mousePos.y };
+  return null;
+}
+function brushTarget(){
+  if (!world) return null;
+  var el = (typeof currentElement !== "undefined") ? currentElement : null;
+  if (!el) return null;
+  var reach = brushReachOf(el, elements[el], brushSize());
+  if (reach < 0) return null;
+  var P = pointerPt(); if (!P) return null;
+  return bodyNear(P.x, P.y, reach);
+}
+/* the line to sweep: only continues from the last pointer position when that position was on the
+   same object, so a stroke that wanders off never carves a line into the object it left behind */
+function strokeEnds(st, b, reach){
+  var P = pointerPt(), ep = endpoints(st);
+  if (!P) return ep;
+  if (!b || bodyNear(P.px, P.py, reach) !== b) return { x1: P.x, y1: P.y, x2: P.x, y2: P.y };
+  return ep;
+}
 function localBrush(b, x1, y1, x2, y2, size){
   var a = toLocal(b, x1, y1), z = toLocal(b, x2, y2);
   var pts = line4(Math.round(a.x), Math.round(a.y), Math.round(z.x), Math.round(z.y));
@@ -1497,10 +1529,10 @@ function strokeStart(e, mx, my, sp){
   return { x: mx, y: my, s: sp || lastPos };
 }
 function eraseStroke(o, self, e, st, sz){
-  var eb = strokeBodies(st.s.x, st.s.y, st.x, st.y, Math.floor(sz/2));
-  if (!eb.length) return false;
-  var ep = endpoints(st);
-  eb.forEach(function(b){ eraseLocal(b, localBrush(b, ep.x1, ep.y1, ep.x2, ep.y2, sz)); });
+  var target = brushTarget();
+  if (!target) return false;
+  var reach = Math.max(0, Math.floor(sz/2)), ep = strokeEnds(st, target, reach);
+  eraseLocal(target, localBrush(target, ep.x1, ep.y1, ep.x2, ep.y2, sz));
   ERASEGUARD = true;
   try { o.call(self, e, st.x, st.y, st.s); } finally { ERASEGUARD = false; }
   return true;
@@ -1509,10 +1541,10 @@ wrap("mouse1Action", function(o){ return function(e, mx, my, sp){
   if (!world) return o.apply(this, arguments);
   var st = strokeStart(e, mx, my, sp), el = currentElement, ed = elements[el], sz = brushSize();
   if (ed && (!ed.tool || ed.canPlace) && fallEl(el)){
-    var bs = strokeBodies(st.s.x, st.s.y, st.x, st.y, Math.min(5, 1 + Math.floor(sz/2)));
-    if (bs.length){
-      var near = bodyNear(st.x, st.y, 5) || bs[0], ep = endpoints(st);
-      placeLocal(near, localBrush(near, ep.x1, ep.y1, ep.x2, ep.y2, sz), el, typeof mode !== "undefined" && mode === "replace");
+    var target = brushTarget();
+    if (target){
+      var reach = Math.max(0, Math.floor(sz/2)), ep = strokeEnds(st, target, reach);
+      placeLocal(target, localBrush(target, ep.x1, ep.y1, ep.x2, ep.y2, sz), el, typeof mode !== "undefined" && mode === "replace");
       return;
     }
   } else if (el === "erase"){
@@ -1530,18 +1562,14 @@ wrap("mouse2Action", function(o){ return function(e, mx, my, sp){
 wrap("drawCursor", function(o){ return function(){
   var b = null;
   try {
-    if (world && typeof mousePos !== "undefined" && !(typeof shaping !== "undefined" && shaping)){
-      var el = currentElement, ed = elements[el], sz = brushSize();
-      if (el === "erase") b = bodyNear(mousePos.x, mousePos.y, Math.floor(sz/2));
-      else if (ed && (!ed.tool || ed.canPlace) && fallEl(el)) b = bodyNear(mousePos.x, mousePos.y, Math.min(5, 1 + Math.floor(sz/2)));
-    }
+    if (!(typeof shaping !== "undefined" && shaping)) b = brushTarget();
   } catch (err) { b = null; }
   if (!b) return o.apply(this, arguments);
   var sa = mouseAlpha; mouseAlpha = 0;
   try { o.apply(this, arguments); } finally { mouseAlpha = sa; }
   var lctx = canvasLayers.gui.getContext("2d"), ps = pixelSize, sz2 = brushSize();
-  var mo = sz2/2, mn = Math.trunc(mo), mx2 = mn - (mo % 1 ? 0 : 1), F = pointerF();
-  var l = toLocal(b, F ? F.x : mousePos.x, F ? F.y : mousePos.y), lx = Math.round(l.x), ly = Math.round(l.y);
+  var mo = sz2/2, mn = Math.trunc(mo), mx2 = mn - (mo % 1 ? 0 : 1), P = pointerPt();
+  var l = toLocal(b, P ? P.x : mousePos.x, P ? P.y : mousePos.y), lx = Math.round(l.x), ly = Math.round(l.y);
   lctx.save();
   lctx.globalAlpha = mouseAlpha;
   lctx.lineWidth = 2;
@@ -1836,7 +1864,7 @@ if (globalThis.__SUBLEVEL_TEST__){
     applyGravitySetting: applyGravitySetting, addGravitySetting: addGravitySetting,
     gravity: function(){ return GRAV_ON; },
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
-    GC: function(){ return GC; } };
+    GC: function(){ return GC; }, brushTarget: brushTarget, brushReachOf: brushReachOf, bodyNear: bodyNear, eraseStroke: eraseStroke, strokeEnds: strokeEnds };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
 
