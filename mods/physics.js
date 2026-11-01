@@ -283,16 +283,12 @@ function hashXY(lx, ly){
 function animStep(cell, gx, gy){
   var a = animOf(cell.e);
   if (!a.anim || !a.pure) return false;
-  var e = elements[cell.e];
-  /* the scratch pixel carries the tick the material was actually PLACED, so anything derived from it
-     (stained glass builds its hue from pixel.start) comes out exactly as it would on a normal pixel */
   var st = cell.s === undefined ? pixelTicks : cell.s;
-  var s = { x: gx, y: gy, element: cell.e, start: st, colorstart: st, temp: cell.t === undefined ? 20 : cell.t,
-            color: cell.c === undefined ? gx : cell.c, alpha: cell.al === undefined ? 1 : cell.al };
-  try { (e.tick1 || e.tick).call(e, s); } catch(err){ return false; }
+  var v = animValue(cell.e, st, gx, gy);
+  if (!v.ok) return false;
   var ch = false;
-  if (a.col && s.color !== undefined && s.color !== cell.c){ cell.c = s.color; ch = true; }
-  if (a.alp && s.alpha !== cell.al){ cell.al = s.alpha; ch = true; }
+  if (a.col && v.c !== undefined && v.c !== cell.c){ cell.c = v.c; ch = true; }
+  if (a.alp && v.a !== cell.al){ cell.al = v.a; ch = true; }
   return ch;
 }
 
@@ -552,6 +548,8 @@ function mkProxy(b, cell, gx, gy, spareBy){
   var list = spareBy[cell.e], pix;
   if (list && list.length){
     pix = list.pop(); pix.x = gx; pix.y = gy; pix.del = false; pixelMap[gx][gy] = pix;
+    /* a recycled pixel must not carry the previous owner's animation leftovers */
+    delete pix.colorstart; delete pix.alpha; delete pix.glow; delete pix.fff; delete pix.ffc; delete pix.emit;
     if (!pix.inPx && typeof currentPixels !== "undefined" && currentPixels){ currentPixels.push(pix); pix.inPx = true; }
   }
   else {
@@ -604,6 +602,7 @@ function refreshProxies(b){
   syncProxies(b);
 }
 function syncProxies(b, R0){
+  b.animT = undefined;
   var riders = (b.sx < 1e8) ? collectRiders(b) : [], i;
   for (i = 0; i < riders.length; i++){ var rp = riders[i].p; if (pixelMap[rp.x] && pixelMap[rp.x][rp.y] === rp) pixelMap[rp.x][rp.y] = undefined; }
   var R = R0 || raster(b, b.x, b.y, b.a), want = new Map(), rr = {};
@@ -651,6 +650,18 @@ function syncProxies(b, R0){
       if (pixelMap[gx][gy] !== undefined) return;            // grain would not move: leave the cell alone
     }
     var pix = mkProxy(b, cell, gx, gy, spareBy);
+    if (!pix && o === undefined && animOf(cell.e).anim){
+      /* FIX 8: another object's pixel owns this spot; take the closest free one so the cell still shows */
+      var found = null;
+      for (var rr8 = 1; rr8 <= 2 && !found; rr8++){
+        for (var oy8 = -rr8; oy8 <= rr8 && !found; oy8++) for (var ox8 = -rr8; ox8 <= rr8; ox8++){
+          if (Math.max(Math.abs(ox8), Math.abs(oy8)) !== rr8) continue;
+          if (outOfBounds(gx+ox8, gy+oy8)) continue;
+          if (pixelMap[gx+ox8][gy+oy8] === undefined){ found = [gx+ox8, gy+oy8]; break; }
+        }
+      }
+      if (found) pix = mkProxy(b, cell, found[0], found[1], spareBy);
+    }
     if (!pix) return;
     pix.sub = b.id; pix.ck = R.ck[idx]; cell.px = pix;
     b.proxies.set(gk, pix);
@@ -699,6 +710,40 @@ function killBody(b){
   if (GRAB && GRAB.b === b) GRAB = null;
   b.dead = true; delete BODIES[b.id];
 }
+/* ONE value per (material, placement tick, exact pixel position) per tick. Every pixel of an animated
+   material then gets the identical answer no matter who asks - a body proxy, a stray pixel, a hole. */
+var ANIM_TICK = -1, ANIM_TAB = {};
+function animValue(elId, st, gx, gy){
+  if (ANIM_TICK !== pixelTicks){ ANIM_TICK = pixelTicks; ANIM_TAB = {}; }
+  var k = elId + "@" + st + ":" + gx + "," + gy, v = ANIM_TAB[k];
+  if (v) return v;
+  v = { ok: false, c: undefined, a: undefined };
+  var a = animOf(elId), e = elements[elId];
+  if (a.anim && a.pure && e && typeof e.tick === "function"){
+    var s = { x: gx, y: gy, element: elId, start: st === undefined ? pixelTicks : st,
+              colorstart: st === undefined ? pixelTicks : st, temp: 20, color: "#000000", alpha: 1 };
+    try { (e.tick1 || e.tick).call(e, s); v.ok = true; v.c = s.color; v.a = s.alpha; } catch(err){}
+  }
+  ANIM_TAB[k] = v;
+  return v;
+}
+/* FIX 1: applied from inside the game's own pixel loop (runPerPixel), right after the material's tick,
+   to EVERY animated pixel - proxies, stray pixels, pixels in overlapping objects alike */
+function animPixelNow(pix){
+  if (!pix || pix.del || !pix.element) return;
+  var a = animOf(pix.element);
+  if (!a.anim || !a.pure) return;
+  var st = pix.start === undefined ? pixelTicks : pix.start;
+  var v = animValue(pix.element, st, pix.x, pix.y);
+  if (!v.ok) return;
+  if (a.col && v.c !== undefined && pix.color !== v.c) pix.color = v.c;
+  if (a.alp && v.a !== undefined && pix.alpha !== v.a) pix.alpha = v.a;
+  /* FIX 13: a stamped pixel is skipped by the engine's own per-pixel work for the rest of this frame,
+     so the value written here is the one that gets drawn - nothing can overwrite it afterwards */
+  pix.start = pixelTicks;
+}
+try { if (typeof runPerPixel === "function") runPerPixel(animPixelNow); } catch(e){}
+
 /* animated materials on a body: colours and alpha advance from the shared pixelTicks timer and from
    the cell's own location, so every copy of an object animates identically and in step */
 function bodyIsAnimated(b){
@@ -709,6 +754,31 @@ function bodyIsAnimated(b){
   b.cells.forEach(function(cell){ if (out) return; if (animOf(cell.e).anim) out = true; });   /* any cell, not just the first few */
   b.anim = out; b.animT = pixelTicks; b.animSize = b.cells.size;
   return out;
+}
+/* FIX 12: sweep the area an animated object covers and stamp EVERY pixel of an animated material in it,
+   whether or not it is one of the body's registered pixels. An orphan pixel that the game never ticks and
+   the mod never claimed used to sit there with a frozen colour forever. */
+var SWEEP_BUDGET = 30000;
+function animateMapSweep(){
+  var ids = Object.keys(BODIES), left = SWEEP_BUDGET;
+  for (var i = 0; i < ids.length && left > 0; i++){
+    var b = BODIES[ids[i]];
+    if (!b || b.dead || !b.cells.size) continue;
+    if (!bodyIsAnimated(b)) continue;
+    var r = (b.rad || 4) + 3;
+    var x0 = Math.max(0, Math.floor(b.x - r)), x1 = Math.min(width - 1, Math.ceil(b.x + r));
+    var y0 = Math.max(0, Math.floor(b.y - r)), y1 = Math.min(height - 1, Math.ceil(b.y + r));
+    for (var y = y0; y <= y1 && left > 0; y++){
+      var col = pixelMap[y] === undefined ? null : pixelMap;
+      for (var x = x0; x <= x1; x++){
+        var cc = pixelMap[x]; if (!cc) continue;
+        var p = cc[y]; if (!p || p.del) continue;
+        left--;
+        if (!animOf(p.element).anim) continue;
+        animPixelNow(p);
+      }
+    }
+  }
 }
 var ANIM_BUDGET = 60000;   /* the game's own pixel loop also ticks proxies; if we skip any, the two writers disagree */
 function animateBodies(){
@@ -723,10 +793,15 @@ function animateBodies(){
       var cell = b.cells.get(pix.ck); if (!cell) return;
       budget--; work++;
       var a = animOf(cell.e); if (!a.anim) return;
-      if (animStep(cell, pix.x, pix.y)) ch = true;   /* vanilla coords: the game's own tick of this pixel must agree */
       if (a.anim && cell.s !== undefined && pix.start !== cell.s) pix.start = cell.s;
-      if (a.col && cell.c !== undefined && pix.color !== cell.c) pix.color = cell.c;
-      if (a.alp && cell.al !== undefined && pix.alpha !== cell.al) pix.alpha = cell.al;
+      animPixelNow(pix);                       /* FIX 10: same table, so a proxy and a stray pixel always agree */
+      var cv = animValue(cell.e, cell.s === undefined ? pixelTicks : cell.s, pix.x, pix.y);
+      if (cv.ok){
+        if (a.col && cv.c !== undefined && pix.color !== cv.c) { pix.color = cv.c; ch = true; }
+        if (a.alp && cv.a !== undefined && pix.alpha !== cv.a) { pix.alpha = cv.a; ch = true; }
+        if (a.col) cell.c = cv.c;
+        if (a.alp) cell.al = cv.a;
+      }
     });
     if (ch) PIXDIRTY = true;
   }
@@ -739,16 +814,28 @@ function watchProxies(b){
     if (pix.del && pix.sub === b.id){
       b.proxies.delete(gk); if (b.cells.delete(pix.ck)) b.dirty = true; return;
     }
-    if (pix.sub !== b.id || !pixelMap[pix.x] || pixelMap[pix.x][pix.y] !== pix || GK(pix.x, pix.y) !== gk){
+    if (pix.sub !== b.id || !pixelMap[pix.x] || pixelMap[pix.x][pix.y] !== pix){
       b.proxies.delete(gk); b.needSync = true; return;
+    }
+    if (GK(pix.x, pix.y) !== gk){
+      /* FIX 7: the pixel drifted off its key. Re-derive the cell it now covers instead of throwing it away */
+      var lw = toLocal(b, pix.x, pix.y), nkw = K(Math.round(lw.x), Math.round(lw.y));
+      var ngk = GK(pix.x, pix.y);
+      if (b.cells.has(nkw) && !b.proxies.has(ngk)){ b.proxies.delete(gk); pix.ck = nkw; b.proxies.set(ngk, pix); }
+      else { b.proxies.delete(gk); b.needSync = true; }
+      return;
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
       var NE = pix.element;
-      if (fallEl(NE)){ cell.e = NE; b.dirty = true; }
+      if (fallEl(NE)){ cell.e = NE; b.dirty = true;
+        /* FIX 6: a material change invalidates every cached animation value of that cell */
+        cell.c = undefined; cell.al = undefined; cell.s = undefined;
+      }
       else { b.cells.delete(pix.ck); b.proxies.delete(gk); pix.sub = undefined; b.dirty = true; mark(pix.x, pix.y); return; }
     }
-    var an = animOf(cell.e); if (an.col) cell.c = pix.color; if (an.alp) cell.al = pix.alpha; cell.px = pix;
+    /* FIX 5: the mod computes animation values; the pixel is never allowed to teach the cell a value */
+    cell.px = pix;
     sum[pix.ck] = (sum[pix.ck] || 0) + pix.temp; cnt[pix.ck] = (cnt[pix.ck] || 0) + 1; if (pix.charge) chg[pix.ck] = 1;
   });
   b.cells.forEach(function(cell, k){ if (cnt[k]) cell.t = sum[k]/cnt[k]; cell.chg = chg[k] ? 1 : 0; });
@@ -1560,6 +1647,30 @@ function addGravitySetting(){
   host.appendChild(document.createTextNode(" "));
   host.appendChild(wrap);
 }
+/* FIX 11: a pixel that is not in currentPixels is never ticked by the game, so it keeps whatever colour
+   it had when it dropped out - the "a few specific pixels are the wrong colour forever" symptom.
+   Walk the map a few rows per tick and put every pixel back in the registry. */
+var IPX_ROW = 0, IPX_SET = null, IPX_SET_T = -999;
+function repairPixelRegistry(){
+  if (typeof currentPixels === "undefined" || !currentPixels || !pixelMap) return;
+  /* membership is decided by actually looking at the registry, never by a flag that can drift */
+  if (!IPX_SET || pixelTicks - IPX_SET_T > 10){
+    IPX_SET = new Set(); IPX_SET_T = pixelTicks;
+    for (var i = 0; i < currentPixels.length; i++){ var q = currentPixels[i]; if (q) IPX_SET.add(q); }
+  }
+  var rows = 10;
+  for (var r = 0; r < rows; r++){
+    var y = IPX_ROW; IPX_ROW = (IPX_ROW + 1) % height;
+    var col = pixelMap;
+    for (var x = 0; x < width; x++){
+      var cellc = col[x]; if (!cellc) continue;
+      var p = cellc[y]; if (!p || p.del) continue;
+      if (IPX_SET.has(p)) { p.inPx = true; continue; }
+      currentPixels.push(p); IPX_SET.add(p); p.inPx = true;
+      if (animOf(p.element).anim) animPixelNow(p);
+    }
+  }
+}
 runEveryTick(function(){
   if (!PL) loadPlanck();
   if (PL && !world) initWorld();
@@ -1600,7 +1711,11 @@ runEveryTick(function(){
        That is the only state in which every proxy is freshly created, and a fresh pixel is not ticked
        by the game on the frame it appears, so the object's own colours/alpha are what get drawn. */
     if (b.proxies && b.proxies.size && bodyIsAnimated(b)){
-      if (b.proxies.size <= 400 || (pixelTicks % 3) === 0){ refreshProxies(b); continue; }
+      /* FIX 2: no throttle - an animated object is rebuilt every single frame, like a moving one.
+         FIX 9: and it is never left held, frozen or asleep, which used to skip its pixels. */
+      b.hold = 0;
+      if (b.pb && b.pb.setAwake) { try { b.pb.setAwake(true); } catch(e){} }
+      if (b.cells.size <= 2000){ refreshProxies(b); continue; }
     }
     if (b.needSync){ b.needSync = false; syncProxies(b); }
   }
@@ -1714,6 +1829,8 @@ runEveryTick(function(){
     }
   }
   try { animateBodies(); } catch(e){}   /* last word on animated colours/alpha, after every rebuild */
+  try { animateMapSweep(); } catch(e){}
+  try { repairPixelRegistry(); } catch(e){}
 });
 runPerPixel(function(p){
   if (p.sub !== undefined){
