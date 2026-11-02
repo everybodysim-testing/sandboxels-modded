@@ -397,7 +397,7 @@ function physOf(id){
   return P;
 }
 /* ------------------------------------------------ debris: one small body per broken pixel */
-var DEBRIS = [], DEBRIS_MAX = 70;
+var DEBRIS = [], DEBRIS_MAX = 40;
 function freeSpotNear(gx, gy, r){
   if (!outOfBounds(gx, gy) && pixelMap[gx] && pixelMap[gx][gy] === undefined) return [gx, gy];
   for (var d = 1; d <= r; d++)
@@ -412,8 +412,13 @@ function freeSpotNear(gx, gy, r){
 function spawnDebris(el, gx, gy, vx, vy){
   if (!world || !elements[el]) return null;
   if (physOf(el).unbreakable) return null;
+  if (shardBudget <= 0) return null;
+  shardBudget--;
+  capBodies();
   var spot = freeSpotNear(Math.round(gx), Math.round(gy), 3); if (!spot) return null;
-  while (DEBRIS.length >= DEBRIS_MAX) retireDebris(DEBRIS[0]);
+  var dg = 0;
+  while (DEBRIS.length >= DEBRIS_MAX && dg++ < 90) retireDebris(DEBRIS[0], true);   // forced: never spin on a budget
+  if (DEBRIS.length >= DEBRIS_MAX) return null;
   var cells = new Map();
   cells.set(K(0, 0), { x: 0, y: 0, e: el, c: undefined, t: 20, s: pixelTicks });
   var b = makeBody(cells, 0);
@@ -428,8 +433,10 @@ function spawnDebris(el, gx, gy, vx, vy){
   return b;
 }
 /* once there are too many pieces the oldest one settles back into a plain pixel: it is still there */
-function retireDebris(b){
+function retireDebris(b, force){
   if (!b || b.dead){ return; }
+  if (!force && retireBudget <= 0) return;
+  retireBudget--;
   var el = null; b.cells.forEach(function(c){ if (!el) el = c.e; });
   var gx = Math.round(b.x), gy = Math.round(b.y);
   var i = DEBRIS.indexOf(b); if (i >= 0) DEBRIS.splice(i, 1);
@@ -818,7 +825,12 @@ function dissolveBody(b){
   } catch(e){}
   killBody(b);
 }
+var stepping = false, KILLQ = [], shardBudget = 4, retireBudget = 8, MAXBODIES = 240;
 function killBody(b){
+  if (!b || b.dead) return;
+  if (b.pb && world && stepping){                    /* destroying a body inside world.step corrupts the solver */
+    b.dead = true; delete BODIES[b.id]; KILLQ.push(b); return;
+  }
   releaseProxies(b);
   if (b.pb && world){ world.destroyBody(b.pb); b.pb = null; }
   if (GRAB && GRAB.b === b) GRAB = null;
@@ -1021,12 +1033,20 @@ function removeCell(b, k, debris){
   }
   if (gx === null){ var wpt = toWorld(b, cell.x, cell.y); gx = Math.round(wpt.x); gy = Math.round(wpt.y); }
   b.cells.delete(k); b.dirty = true;
-  if (debris){
+  if (debris && shardBudget > 0){
     var v = { x: 0, y: 0 };
     try { if (b.pb) v = b.pb.getLinearVelocity(); } catch(err){}
     spawnDebris(el, gx, gy, v.x, v.y);
   }
   return true;
+}
+/* keep the number of live objects sane: oldest loose piece goes first */
+function capBodies(){
+  var n = Object.keys(BODIES).length, guard = 0;
+  while (n > MAXBODIES && DEBRIS.length && guard++ < 60){
+    retireDebris(DEBRIS[0], true);
+    n = Object.keys(BODIES).length;
+  }
 }
 /* ---------------------------------------------------- fault lines and shards */
 /* Every object carries its own invisible fault lines: a jittered grid in its own cell grid, seeded per
@@ -1062,6 +1082,7 @@ function detachZones(b, groups, vx, vy){
     if (ents.length) picks.push(ents);
   }
   if (!picks.length) return 0;
+  capBodies();
   for (i = 0; i < picks.length; i++) for (j = 0; j < picks[i].length; j++) b.cells.delete(picks[i][j].k);
   b.dirty = true;
   syncProxies(b);                                  // the parent lets go of those grid spots first
@@ -1075,7 +1096,9 @@ function detachZones(b, groups, vx, vy){
       used.add(K(lx, ly));
       cm.set(K(lx, ly), { x: lx, y: ly, e: e.c.e, c: e.c.c, t: e.c.t !== undefined ? e.c.t : 20, s: e.c.s });
     }
-    while (DEBRIS.length >= DEBRIS_MAX) retireDebris(DEBRIS[0]);
+    var dg = 0;
+  while (DEBRIS.length >= DEBRIS_MAX && dg++ < 90) retireDebris(DEBRIS[0], true);   // forced: never spin on a budget
+  if (DEBRIS.length >= DEBRIS_MAX) return null;
     var nb = makeBody(cm, 0);
     nb.x = ox; nb.y = oy; nb.debris = 1; nb.hold = 0;
     ensurePB(nb);
@@ -1085,15 +1108,18 @@ function detachZones(b, groups, vx, vy){
     }
     syncProxies(nb);
     DEBRIS.push(nb);
+    shardBudget--;
     made++;
+    if (shardBudget <= 0) break;
   }
   return made;
 }
-/* an impact cracks an object along its fault lines. How much comes away depends on the material: glass
-   lets go in small shards, brick in chunks, wood barely cracks, and anything strong just loses a pixel
-   or two no matter how hard it is hit. Fibrous things like paper and cloth do not shatter at all. */
+/* An impact cracks an object along its fault lines, but quietly: it takes a real hit to start a crack,
+   most hits do nothing, and no single impact can ever break more than BREAK_CAP pixels. */
+var BREAK_CAP = 5;                 // hard ceiling: how many pixels one impact may break, ever
 function hurt(b, x, y, s, tH){
   if (!b || b.dead) return 0;
+  if (shardBudget <= 0) return 0;
   var mass = 1;
   try { if (b.pb && b.pb.getMass) mass = Math.max(0.3, b.pb.getMass()); } catch(err){}
   var sE = s * (0.7 + 0.3*Math.min(2.5, mass/6));
@@ -1105,13 +1131,14 @@ function hurt(b, x, y, s, tH){
   if (!near) return 0;
   var P = physOf(near.e);
   if (P.unbreakable || P.noshatter) return 0;
-  var thr = 0.55 + 4.6*P.hard;
+  var thr = 1.1 + 9.0*P.hard;                        // four times the old slope: only real smashes register
   if (sE <= thr) return 0;
-  var over = (sE - thr)/Math.max(0.4, thr);
+  var over = (sE - thr)/Math.max(0.6, thr);
+  if (!chance(Math.min(0.85, 0.25*(1 + over)))) return 0;   // and most hits still do nothing at all
 
-  /* strong material: a big hit knocks a pixel or two loose and that is the end of it */
+  /* strong material: one pixel comes loose, two if it was really hit hard */
   if (P.hard >= 0.68){
-    var take = sE > thr*2.4 ? 2 : 1, lost = 0, cand = [];
+    var take = Math.min(sE > thr*2.5 ? 2 : 1, BREAK_CAP), lost = 0, cand = [];
     b.cells.forEach(function(c, k){
       var dx = c.x - lc.x, dy = c.y - lc.y, d2 = dx*dx + dy*dy;
       if (d2 <= 6.25) cand.push([d2, k]);
@@ -1121,36 +1148,37 @@ function hurt(b, x, y, s, tH){
     return lost;
   }
 
-  /* breakable: whole fault-line shards come away around the contact */
+  /* breakable: the nearest fault-line shard opens up, trimmed to the cap */
   var size = Math.max(2, Math.round(2 + 2*(1 - P.brittle)));
-  var R = Math.min(6.5, 1.4 + over*2.4);
+  var R = Math.min(3.0, 0.9 + over*0.8);
   var zs = new Map();
   b.cells.forEach(function(c, k){
     var dx = c.x - lc.x, dy = c.y - lc.y;
-    var ent = zs.get(zoneKey(b, c, size));
-    if (!ent){ ent = { keys: [], d2: 1e9, cx: 0, cy: 0 }; zs.set(zoneKey(b, c, size), ent); }
-    ent.keys.push(k); ent.cx += c.x; ent.cy += c.y;
+    var z = zoneKey(b, c, size), ent = zs.get(z);
+    if (!ent){ ent = { keys: [], d: [], d2: 1e9 }; zs.set(z, ent); }
+    ent.keys.push(k); ent.d.push(dx*dx + dy*dy);
     if (dx*dx + dy*dy < ent.d2) ent.d2 = dx*dx + dy*dy;
   });
   var pickz = [];
   zs.forEach(function(ent){ if (ent.d2 <= R*R) pickz.push(ent); });
   pickz.sort(function(p, q){ return p.d2 - q.d2; });
-  var budget = Math.max(4, Math.floor(b.cells.size*0.4));
-  var maxZ = P.brittle > 0.6 ? (over > 1.6 ? 3 : 2) : 1;
-  var took = 0, groups = [], v = { x: 0, y: 0 };
-  try { if (b.pb) v = b.pb.getLinearVelocity(); } catch(err){}
+  if (!pickz.length) return 0;
+  var groups = [], took = 0, maxZ = over > 2.5 ? 2 : 1;
   for (i = 0; i < pickz.length && groups.length < maxZ; i++){
-    var ent2 = pickz[i], n = ent2.keys.length;
-    if (took + n > budget) continue;                 // never take the whole object apart in one hit
-    groups.push(ent2.keys); took += n;
+    var ent2 = pickz[i], keys = ent2.keys;
+    if (keys.length > BREAK_CAP - took){               // shard bigger than the cap: trim to its nearest pixels
+      var order = keys.map(function(k, j){ return [ent2.d[j], k]; }).sort(function(p, q){ return p[0] - q[0]; });
+      keys = order.slice(0, Math.max(1, BREAK_CAP - took)).map(function(p){ return p[1]; });
+    }
+    if (!keys.length) continue;
+    groups.push(keys); took += keys.length;
+    if (took >= BREAK_CAP) break;
   }
-  if (!groups.length && pickz.length && sE > thr*1.6){ groups.push(pickz[0].keys); took += pickz[0].keys.length; }
   if (!groups.length) return 0;
-  var kick = Math.min(2.2, 0.4 + over*0.5);
-  var prox = toLocal(b, x, y), ax = Math.round(prox.x), ay = Math.round(prox.y);
-  var sv = (b.pb && b.pb.getLinearVelocity) ? b.pb.getLinearVelocity() : { x: 0, y: 0 };
-  var cv = toWorld(b, 0, 0);
-  detachZones(b, groups, sv.x + (cv.x - x)*0 + (Math.random() - 0.5)*kick, sv.y + (Math.random() - 0.5)*kick - 0.2);
+  var sv = { x: 0, y: 0 };
+  try { if (b.pb) sv = b.pb.getLinearVelocity(); } catch(err){}
+  var kick = Math.min(1.6, 0.25 + over*0.35);
+  detachZones(b, groups, sv.x + (Math.random() - 0.5)*kick, sv.y + (Math.random() - 0.5)*kick - 0.15);
   return took;
 }
 function processImpacts(){
@@ -1438,6 +1466,7 @@ function startSweep(){
   return true;
 }
 function processSupport(){
+  shardBudget = 4; retireBudget = 8;
   if (DEBRIS.length) for (var dq = DEBRIS.length - 1; dq >= 0; dq--){ if (!DEBRIS[dq] || DEBRIS[dq].dead) DEBRIS.splice(dq, 1); }
   bodyBudget = 24;
   GC = new Set();
@@ -2035,7 +2064,9 @@ runEveryTick(function(){
       var al = Math.sqrt(ax*ax + ay*ay); if (al > 1.2){ ax *= 1.2/al; ay *= 1.2/al; }
       pb.applyForce(PL.Vec2(gm*ax, gm*ay - gm*G*gb.gf*0.95), pt, true);
     }
-    world.step(DT, 6, 2);
+    stepping = true;
+    try { world.step(DT, 6, 2); } finally { stepping = false; }
+    if (KILLQ.length) flushKills();
   }
   processImpacts(); processPushes();
   for (i = 0; i < ids.length; i++){
