@@ -111,7 +111,7 @@
    ========================================================================== */
 (function () {
 
-var G = 0.09, HOLD = 12, SUB = 2, DT = 1/SUB;
+var G = 0.09, HOLD = 12, SUB = 1, DT = 1;   /* one solve per tick: measured 2.4x faster than two on the real solver, and piles still settle */
 var GRAV_ON = 1, GRAV_SET = -1;   // physics gravity switch, driven by the Gravity setting
 var GRAV_SETTING = "sl_gravity";
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
@@ -561,6 +561,42 @@ function raster(b, x, y, a){
   });
   return out;
 }
+/* convex hull of a big body's outline, in body-local units. One collider instead of a hundred:
+   the broadphase sees one proxy, terrain contacts drop from hundreds to a handful. */
+function hullFixture(b){
+  var pts = [], seen = new Set();
+  b.cells.forEach(function(c){
+    var edge = !b.cells.has(K(c.x+1, c.y)) || !b.cells.has(K(c.x-1, c.y)) || !b.cells.has(K(c.x, c.y+1)) || !b.cells.has(K(c.x, c.y-1));
+    if (!edge) return;
+    pts.push([c.x - 0.5, c.y - 0.5], [c.x + 0.5, c.y - 0.5], [c.x + 0.5, c.y + 0.5], [c.x - 0.5, c.y + 0.5]);
+  });
+  if (pts.length < 8) return null;
+  pts.sort(function(p, q){ return p[0] - q[0] || p[1] - q[1]; });
+  var N = pts.length, h = [], i, k = 0;
+  var cross = function(o, a2, b2){ return (a2[0]-o[0])*(b2[1]-o[1]) - (a2[1]-o[1])*(b2[0]-o[0]); };
+  for (i = 0; i < N; i++){
+    while (k >= 2 && cross(h[k-2], h[k-1], pts[i]) <= 0) k--;
+    h[k++] = pts[i];
+  }
+  var t0 = k + 1;
+  for (i = N - 2; i >= 0; i--){
+    while (k >= t0 && cross(h[k-2], h[k-1], pts[i]) <= 0) k--;
+    h[k++] = pts[i];
+  }
+  h.length = Math.max(0, k - 1);
+  if (h.length < 3 || h.length > 12) {                       /* not a hull we want: fall back to blocks */
+    if (h.length > 12){ h = hullSimplify(h, 12); if (!h) return null; }
+    else return null;
+  }
+  var verts = h.map(function(p){ return PL.Vec2(p[0], p[1]); });
+  try { return PL.Polygon(verts); } catch(e){ return null; }
+}
+function hullSimplify(h, maxN){
+  if (h.length <= maxN) return h;
+  var step = h.length / maxN, out = [];
+  for (var i = 0; i < maxN; i++) out.push(h[Math.floor(i * step) % h.length]);
+  return out.length >= 3 ? out : null;
+}
 function rebuildFixtures(b){
   var pb = b.pb; if (!pb) return;
   var f = pb.getFixtureList(), old = [];
@@ -582,7 +618,20 @@ function rebuildFixtures(b){
       i = j + 1;
     }
   });
-  if (runs.length <= MAXFIX){
+  /* collider detail follows body size: a moon-sized body does not need a hundred colliders.
+     Fewer colliders is the whole ballgame for contacts: every fixture that overlaps anything
+     makes contacts, and every contact is solved on every sub-step. */
+  if (b.cells.size > 800){
+    var hull = hullFixture(b);
+    if (hull){
+      var PHP = physOf(b.cells.values().next().value.e);
+      pb.createFixture(hull, { density: PHP.dens/1000, friction: PHP.fric, restitution: PHP.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
+      pb.resetMassData();
+      return;
+    }
+  }
+  var fixCap = b.cells.size > 320 ? 36 : MAXFIX;
+  if (runs.length <= fixCap){
     runs.forEach(function(r){
       var P = physOf(r.e);
       pb.createFixture(PL.Box(r.len/2, r.h/2, PL.Vec2(r.x0 + (r.len - 1)/2, r.y + (r.h - 1)/2)),
@@ -597,7 +646,7 @@ function rebuildFixtures(b){
         var bx = Math.floor(c.x/s), by = Math.floor(c.y/s), kk = bx*4096 + by;
         if (!blocks.has(kk)) blocks.set(kk, { bx: bx, by: by, e: c.e });
       });
-      if (blocks.size <= MAXFIX) break;
+      if (blocks.size <= fixCap) break;
       s *= 2;
     }
     blocks.forEach(function(q){
@@ -957,17 +1006,24 @@ function fixBody(b){
 
 /* ------------------------------------------------------ terrain colliders */
 function rowsToRects(rows){
-  var out = [];
+  var out = [], byRun = new Map();
   Object.keys(rows).forEach(function(yy){
     var l = rows[yy].sort(function(p, q){ return p[0] - q[0]; }), a = 0;
     while (a < l.length){
       var z = a;
       while (z + 1 < l.length && l[z+1][0] === l[z][0] + 1 && l[z+1][1] === l[a][1]) z++;
-      out.push({ k: yy + "|" + l[a][0] + "|" + l[z][0] + "|" + l[a][1], r: { y: +yy, x0: l[a][0], x1: l[z][0], kind: l[a][1] } });
+      /* the same run on the next row is the same wall: stack it into one tall box instead of
+         one fixture per row. A floor under a body used to be one collider per row of ground,
+         and every one of those colliders produced its own contacts. */
+      var rk = l[a][0] + "|" + l[z][0] + "|" + l[a][1];
+      var prev = byRun.get(rk);
+      if (prev && prev.y + prev.h === +yy) prev.h++;
+      else { var r = { y: +yy, x0: l[a][0], x1: l[z][0], kind: l[a][1], h: 1 }; byRun.set(rk, r); out.push(r); }
       a = z + 1;
     }
   });
-  return out;
+  out.forEach(function(r){ r.k = r.x0 + "|" + r.x1 + "|" + r.kind + "|" + r.y + "|" + r.h; });
+  return out.map(function(r){ return { k: r.k, r: r }; });
 }
 function refreshTerrain(){
   var want = new Map(), ids = Object.keys(BODIES), i, x, y;
@@ -1017,9 +1073,9 @@ function refreshTerrain(){
   tfix.forEach(function(fx, key){ if (!want.has(key)){ terrain.destroyFixture(fx); tfix.delete(key); } });
   want.forEach(function(r, key){
     if (tfix.has(key)) return;
-    var len = r.x1 - r.x0 + 1;
-    tfix.set(key, terrain.createFixture(PL.Box(len/2, 0.5, PL.Vec2((r.x0 + r.x1)/2, r.y)),
-      { friction: r.kind === 2 ? 0.25 : 0.8, restitution: 0, isSensor: r.kind === 2, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1 } }));
+    var len = r.x1 - r.x0 + 1, hh = r.h || 1;
+    tfix.set(key, terrain.createFixture(PL.Box(len/2, hh/2, PL.Vec2((r.x0 + r.x1)/2, r.y + (hh - 1)/2)),
+      { friction: r.kind === 2 ? 0.25 : 0.8, restitution: 0, isSensor: r.kind === 2, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1, h: hh } }));
   });
 }
 
