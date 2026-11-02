@@ -111,7 +111,7 @@
    ========================================================================== */
 (function () {
 
-var G = 0.09, HOLD = 12, SUB = 1, DT = 1;   /* one solve per tick: measured 2.4x faster than two on the real solver, and piles still settle */
+var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB;
 var GRAV_ON = 1, GRAV_SET = -1;   // physics gravity switch, driven by the Gravity setting
 var GRAV_SETTING = "sl_gravity";
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
@@ -120,7 +120,7 @@ var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Se
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedCount = 0;
 var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
-var MAXFIX = 140, DEBRIS_GROUP = -7;   /* shards share a negative group: shard on shard never costs a contact */              // collider budget per body
+var MAXFIX = 260;              // collider budget per body
 var PROXYCAP = 400;            // proxies looked at per body per scan
 var bodyBudget = 6;            // new bodies allowed per tick (keeps a save load smooth)
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
@@ -494,8 +494,7 @@ function playableBounds(){
 }
 function initWorld(){
   if (world || !PL) return;
-  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: true });
-  try { if (world.setContinuousPhysics) world.setContinuousPhysics(false); } catch(e){}   /* no swept tests stacked on top of the sub-steps */   // resting objects stop costing anything
+  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: true });   // resting objects stop costing anything
   terrain = world.createBody({ type: "static" });
   var B = playableBounds(), my = (B.y0 + B.y1)/2, mx = (B.x0 + B.x1)/2, bd = { friction: 0.8, userData: { t: 1, kind: 1, border: 1 } };
   terrain.createFixture(PL.Box(50, 2000, PL.Vec2(B.x0 - 0.5 - 50, my)), bd);
@@ -509,10 +508,6 @@ function bodyVelAt(pb, pt){ var v = pb.getLinearVelocityFromWorldPoint(pt); retu
 function onBegin(contact){
   var fa = contact.getFixtureA(), fb = contact.getFixtureB(), ua = fa.getUserData(), ub = fb.getUserData();
   if (!ua || !ub) return;
-  try {                                            /* most contacts are quiet: check the bodies before building a manifold */
-    var ca = fa.getBody().getLinearVelocity(), cb = fb.getBody().getLinearVelocity();
-    if (Math.abs(ca.x - cb.x) + Math.abs(ca.y - cb.y) < 0.3) return;
-  } catch(e){}
   var wm = contact.getWorldManifold(null); if (!wm || !wm.points || !wm.points.length) return;
   var n = wm.normal, pt = wm.points[0];
   var va = bodyVelAt(fa.getBody(), pt), vb = bodyVelAt(fb.getBody(), pt);
@@ -527,7 +522,6 @@ function onPost(contact, impulse){
   if (!body || !soil) return;
   var ni = impulse && impulse.normals, imp = 0, i;
   if (ni) for (i = 0; i < ni.length; i++) imp += ni[i];
-  if (imp <= 0) return;                            /* nothing was pushed: skip the manifold */
   var wm = contact.getWorldManifold(null); if (!wm || !wm.points || !wm.points.length) return;
   pushes.push({ f: imp/DT, x: wm.points[0].x, y: wm.points[0].y, run: soil, b: body.b });
 }
@@ -561,42 +555,6 @@ function raster(b, x, y, a){
   });
   return out;
 }
-/* convex hull of a big body's outline, in body-local units. One collider instead of a hundred:
-   the broadphase sees one proxy, terrain contacts drop from hundreds to a handful. */
-function hullFixture(b){
-  var pts = [], seen = new Set();
-  b.cells.forEach(function(c){
-    var edge = !b.cells.has(K(c.x+1, c.y)) || !b.cells.has(K(c.x-1, c.y)) || !b.cells.has(K(c.x, c.y+1)) || !b.cells.has(K(c.x, c.y-1));
-    if (!edge) return;
-    pts.push([c.x - 0.5, c.y - 0.5], [c.x + 0.5, c.y - 0.5], [c.x + 0.5, c.y + 0.5], [c.x - 0.5, c.y + 0.5]);
-  });
-  if (pts.length < 8) return null;
-  pts.sort(function(p, q){ return p[0] - q[0] || p[1] - q[1]; });
-  var N = pts.length, h = [], i, k = 0;
-  var cross = function(o, a2, b2){ return (a2[0]-o[0])*(b2[1]-o[1]) - (a2[1]-o[1])*(b2[0]-o[0]); };
-  for (i = 0; i < N; i++){
-    while (k >= 2 && cross(h[k-2], h[k-1], pts[i]) <= 0) k--;
-    h[k++] = pts[i];
-  }
-  var t0 = k + 1;
-  for (i = N - 2; i >= 0; i--){
-    while (k >= t0 && cross(h[k-2], h[k-1], pts[i]) <= 0) k--;
-    h[k++] = pts[i];
-  }
-  h.length = Math.max(0, k - 1);
-  if (h.length < 3 || h.length > 12) {                       /* not a hull we want: fall back to blocks */
-    if (h.length > 12){ h = hullSimplify(h, 12); if (!h) return null; }
-    else return null;
-  }
-  var verts = h.map(function(p){ return PL.Vec2(p[0], p[1]); });
-  try { return PL.Polygon(verts); } catch(e){ return null; }
-}
-function hullSimplify(h, maxN){
-  if (h.length <= maxN) return h;
-  var step = h.length / maxN, out = [];
-  for (var i = 0; i < maxN; i++) out.push(h[Math.floor(i * step) % h.length]);
-  return out.length >= 3 ? out : null;
-}
 function rebuildFixtures(b){
   var pb = b.pb; if (!pb) return;
   var f = pb.getFixtureList(), old = [];
@@ -618,24 +576,11 @@ function rebuildFixtures(b){
       i = j + 1;
     }
   });
-  /* collider detail follows body size: a moon-sized body does not need a hundred colliders.
-     Fewer colliders is the whole ballgame for contacts: every fixture that overlaps anything
-     makes contacts, and every contact is solved on every sub-step. */
-  if (b.cells.size > 800){
-    var hull = hullFixture(b);
-    if (hull){
-      var PHP = physOf(b.cells.values().next().value.e);
-      pb.createFixture(hull, { density: PHP.dens/1000, friction: PHP.fric, restitution: PHP.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
-      pb.resetMassData();
-      return;
-    }
-  }
-  var fixCap = b.cells.size > 320 ? 36 : MAXFIX;
-  if (runs.length <= fixCap){
+  if (runs.length <= MAXFIX){
     runs.forEach(function(r){
       var P = physOf(r.e);
       pb.createFixture(PL.Box(r.len/2, r.h/2, PL.Vec2(r.x0 + (r.len - 1)/2, r.y + (r.h - 1)/2)),
-        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
+        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, userData: { b: b } });
     });
   }
   else {                                   /* gnarly shape: coarse blocks, still bounded */
@@ -646,13 +591,13 @@ function rebuildFixtures(b){
         var bx = Math.floor(c.x/s), by = Math.floor(c.y/s), kk = bx*4096 + by;
         if (!blocks.has(kk)) blocks.set(kk, { bx: bx, by: by, e: c.e });
       });
-      if (blocks.size <= fixCap) break;
+      if (blocks.size <= MAXFIX) break;
       s *= 2;
     }
     blocks.forEach(function(q){
       var P = physOf(q.e);
       pb.createFixture(PL.Box(s/2, s/2, PL.Vec2(q.bx*s + s/2, q.by*s + s/2)),
-        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
+        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, userData: { b: b } });
     });
   }
   pb.resetMassData();
@@ -877,7 +822,6 @@ function dissolveBody(b){
   killBody(b);
 }
 var stepping = false, KILLQ = [], shardBudget = 4, retireBudget = 8, MAXBODIES = 240;
-var ANIM_ANY = false;   /* is there anything animated to write per pixel this frame? */
 function killBody(b){
   if (!b || b.dead) return;
   if (b.pb && world && stepping){                    /* destroying a body inside world.step corrupts the solver */
@@ -956,7 +900,6 @@ function watchProxies(b){
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
-      pix.ax = undefined;                                  /* material changed: recompute the animation verdict */
       acceptProxyElement(b, pix);
       cell = b.cells.get(pix.ck); if (!cell) return;   /* it left the body: nothing left to watch here */
     }
@@ -1008,24 +951,17 @@ function fixBody(b){
 
 /* ------------------------------------------------------ terrain colliders */
 function rowsToRects(rows){
-  var out = [], byRun = new Map();
+  var out = [];
   Object.keys(rows).forEach(function(yy){
     var l = rows[yy].sort(function(p, q){ return p[0] - q[0]; }), a = 0;
     while (a < l.length){
       var z = a;
       while (z + 1 < l.length && l[z+1][0] === l[z][0] + 1 && l[z+1][1] === l[a][1]) z++;
-      /* the same run on the next row is the same wall: stack it into one tall box instead of
-         one fixture per row. A floor under a body used to be one collider per row of ground,
-         and every one of those colliders produced its own contacts. */
-      var rk = l[a][0] + "|" + l[z][0] + "|" + l[a][1];
-      var prev = byRun.get(rk);
-      if (prev && prev.y + prev.h === +yy) prev.h++;
-      else { var r = { y: +yy, x0: l[a][0], x1: l[z][0], kind: l[a][1], h: 1 }; byRun.set(rk, r); out.push(r); }
+      out.push({ k: yy + "|" + l[a][0] + "|" + l[z][0] + "|" + l[a][1], r: { y: +yy, x0: l[a][0], x1: l[z][0], kind: l[a][1] } });
       a = z + 1;
     }
   });
-  out.forEach(function(r){ r.k = r.x0 + "|" + r.x1 + "|" + r.kind + "|" + r.y + "|" + r.h; });
-  return out.map(function(r){ return { k: r.k, r: r }; });
+  return out;
 }
 function refreshTerrain(){
   var want = new Map(), ids = Object.keys(BODIES), i, x, y;
@@ -1075,9 +1011,9 @@ function refreshTerrain(){
   tfix.forEach(function(fx, key){ if (!want.has(key)){ terrain.destroyFixture(fx); tfix.delete(key); } });
   want.forEach(function(r, key){
     if (tfix.has(key)) return;
-    var len = r.x1 - r.x0 + 1, hh = r.h || 1;
-    tfix.set(key, terrain.createFixture(PL.Box(len/2, hh/2, PL.Vec2((r.x0 + r.x1)/2, r.y + (hh - 1)/2)),
-      { friction: r.kind === 2 ? 0.25 : 0.8, restitution: 0, isSensor: r.kind === 2, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1, h: hh } }));
+    var len = r.x1 - r.x0 + 1;
+    tfix.set(key, terrain.createFixture(PL.Box(len/2, 0.5, PL.Vec2((r.x0 + r.x1)/2, r.y)),
+      { friction: r.kind === 2 ? 0.25 : 0.8, restitution: 0, isSensor: r.kind === 2, userData: { t: 1, kind: r.kind, y: r.y, x0: r.x0, x1: r.x1 } }));
   });
 }
 
@@ -2029,7 +1965,6 @@ runEveryTick(function(){
     }
   }
   ids = Object.keys(BODIES);
-  ANIM_ANY = false;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]];
     if (!b || b.dead) continue;
@@ -2038,7 +1973,6 @@ runEveryTick(function(){
        That is the only state in which every proxy is freshly created, and a fresh pixel is not ticked
        by the game on the frame it appears, so the object's own colours/alpha are what get drawn. */
     if (b.proxies && b.proxies.size && bodyIsAnimated(b)){
-      ANIM_ANY = true;
       if (b.proxies.size <= 400 || (pixelTicks % 3) === 0){ refreshProxies(b); continue; }
     }
     if (b.needSync){ b.needSync = false; syncProxies(b); }
@@ -2156,16 +2090,6 @@ runEveryTick(function(){
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var ps = b.pb.getPosition(); b.x = ps.x; b.y = ps.y; b.a = b.pb.getAngle();
-    /* a calm body is put to sleep at once: a heap of contacts then costs nothing at all,
-       which is the difference between a pile being free and a pile eating the frame */
-    try {
-      if (b.pb.isAwake() && !b.noSleep){
-        var qv = b.pb.getLinearVelocity(), qw = b.pb.getAngularVelocity();
-        var qs = Math.abs(qv.x) + Math.abs(qv.y) + Math.abs(qw) * 0.4;
-        if (qs < 0.045){ if (++b.calm > (b.debris ? 3 : 8)){ b.pb.setAwake(false); b.calm = 0; } }
-        else b.calm = 0;
-      }
-    } catch(e){}
     var sdx = Math.abs(b.x - b.sx) + Math.abs(b.y - b.sy), sda = Math.abs(b.a - b.sa);
     if (b.dirty || b.needSync || sdx > 0.14 || sda > 0.02){
       var R0 = (b.Rtick && b.Rt === pixelTicks && Math.abs(b.Rx - b.x) < 0.06 && Math.abs(b.Ry - b.y) < 0.06 && Math.abs(b.Ra - b.a) < 0.04) ? b.Rtick : null;
@@ -2176,32 +2100,31 @@ runEveryTick(function(){
 });
 var PX_S = { x:0, y:0, element:"", start:0, colorstart:0, temp:20, color:0, alpha:1 };
 runPerPixel(function(p){
-  if (p.sub === undefined){
-    if (p.pvx !== undefined) flyGrain(p);
-    return;
-  }
-  if (!ANIM_ANY) return;                    /* no animated object on the board: the pixel pass has nothing to say */
-  if (p.ax === 0) return;                   /* plain pixel of an animated object: nothing to do, every frame */
-  var b = BODIES[p.sub];
-  if (!b || b.dead || pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){ p.sub = undefined; return; }
-  if (!b.anim && b.anim !== undefined) return;   /* plain material: nothing per pixel to do */
-  var c0 = b.cells.get(p.ck);
-  if (!c0){ p.ax = 0; return; }
-  var a0 = animOf(c0.e);
-  if (!(a0.anim && a0.pure)){ p.ax = 0; return; }  /* decided once, then it is a single property read */
-  p.ax = 1;
-  /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
-  var ph0 = animPhase(b, c0), s0 = PX_S;
-  s0.x = ph0[0]; s0.y = ph0[1]; s0.element = c0.e;
-  s0.start = c0.s === undefined ? pixelTicks : c0.s; s0.colorstart = s0.start;
-  s0.temp = c0.t === undefined ? 20 : c0.t; s0.color = p.color; s0.alpha = p.alpha === undefined ? 1 : p.alpha;
-  try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
-  if (s0){
-    if (a0.col && s0.color !== undefined) p.color = s0.color;
-    if (a0.alp && s0.alpha !== undefined) p.alpha = s0.alpha;
-    if (a0.col) c0.c = s0.color;
-    if (a0.alp) c0.al = s0.alpha;
-  }
+  if (p.sub !== undefined){
+    var b = BODIES[p.sub];
+    if (!b || b.dead || pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){ p.sub = undefined; return; }
+    if (!b.anim && b.anim !== undefined) return;             /* plain material: nothing per pixel to do */
+    {
+      /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
+      var c0 = b.cells.get(p.ck);
+      if (c0){
+        var a0 = animOf(c0.e);
+        if (a0.anim && a0.pure){
+          var ph0 = animPhase(b, c0), s0 = PX_S;
+          s0.x = ph0[0]; s0.y = ph0[1]; s0.element = c0.e;
+          s0.start = c0.s === undefined ? pixelTicks : c0.s; s0.colorstart = s0.start;
+          s0.temp = c0.t === undefined ? 20 : c0.t; s0.color = p.color; s0.alpha = p.alpha === undefined ? 1 : p.alpha;
+          try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
+          if (s0){
+            if (a0.col && s0.color !== undefined) p.color = s0.color;
+            if (a0.alp && s0.alpha !== undefined) p.alpha = s0.alpha;
+            if (a0.col) c0.c = s0.color;
+            if (a0.alp) c0.al = s0.alpha;
+          }
+        }
+      }
+    }
+  } else if (p.pvx !== undefined) flyGrain(p);
 });
 runAfterReset(function(){
   BODIES = {}; dirtyA.length = 0; dirtyS.clear(); impacts.length = 0; pushes.length = 0; tfix.clear(); RIDERS.clear(); GC = new Set(); GRAB = null;
