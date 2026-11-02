@@ -360,6 +360,7 @@ var SOLID_TUNE = {
   zinc:              { w: 1.05, s: 0.58, b: 0.22 },                       // 7068 kg/m3
 };
 
+var NOSHATTER = { paper: 1, cloth: 1, straw: 1, sponge: 1, insulation: 1, hair: 1, skin: 1 };
 function physOf(id){
   var P = PC[id]; if (P) return P;
   var e = elements[id] || {}, h = hash(id);
@@ -390,11 +391,13 @@ function physOf(id){
   var br = e.breakInto; if (Array.isArray(br)) br = br[0];
   var debris = (br && elements[br]) ? br : (elements.gravel ? "gravel" : null);
   P = PC[id] = { dens: dens, bounce: bounce, fric: fric, hard: hard, brittle: brittle,
-                 damp: damp, debris: debris, unbreakable: hard >= 1 };
+                 damp: damp, debris: debris, unbreakable: hard >= 1,
+                 /* fibres and foams are too light to shatter: they fold, they do not crack */
+                 noshatter: NOSHATTER[id] === 1 };
   return P;
 }
 /* ------------------------------------------------ debris: one small body per broken pixel */
-var DEBRIS = [], DEBRIS_MAX = 150;
+var DEBRIS = [], DEBRIS_MAX = 70;
 function freeSpotNear(gx, gy, r){
   if (!outOfBounds(gx, gy) && pixelMap[gx] && pixelMap[gx][gy] === undefined) return [gx, gy];
   for (var d = 1; d <= r; d++)
@@ -1025,30 +1028,130 @@ function removeCell(b, k, debris){
   }
   return true;
 }
-/* an impact shatters pixels around the contact. How many depends on the material's own strength and
-   brittleness: a glass pane gives up, a lead block does not notice. The speed a body needs also grows
-   with its mass, so the same 2000-pixel glass slab hitting a wall at 4 kills far more than a shard. */
+/* ---------------------------------------------------- fault lines and shards */
+/* Every object carries its own invisible fault lines: a jittered grid in its own cell grid, seeded per
+   body and never drawn. An impact does not delete pixels one by one, it runs along those lines and whole
+   shards come away, so a pane of glass cracks into a few pieces instead of exploding into dust. */
+function faultOf(b){
+  if (b.fseed === undefined){
+    b.fseed = (Math.random()*4294967296) >>> 0;
+    b.fox = Math.random()*64; b.foy = Math.random()*64;
+  }
+  return b;
+}
+function zoneKey(b, cell, size){
+  if (cell.zs === size && cell.z !== undefined) return cell.z;     // remembered per cell: no hashing per frame
+  faultOf(b);
+  var gy = Math.floor((cell.y + b.foy) / size);
+  var rowShift = ((hash(b.fseed + ":" + gy) % 997) / 997) * size;
+  var gx = Math.floor((cell.x + b.fox + rowShift) / size);
+  cell.zs = size; cell.z = gx + ":" + gy;
+  return cell.z;
+}
+/* cut several shards out of one body in a single pass: the parent is re-fitted once, not once per shard */
+function detachZones(b, groups, vx, vy){
+  if (!groups || !groups.length) return 0;
+  var picks = [], i, j;
+  for (i = 0; i < groups.length; i++){
+    var want = new Set(groups[i]), ents = [];
+    b.cells.forEach(function(c, k){
+      if (!want.has(k)) return;
+      var w = c.px ? null : toWorld(b, c.x, c.y);
+      ents.push({ k: k, c: c, gx: c.px ? c.px.x : Math.round(w.x), gy: c.px ? c.px.y : Math.round(w.y) });
+    });
+    if (ents.length) picks.push(ents);
+  }
+  if (!picks.length) return 0;
+  for (i = 0; i < picks.length; i++) for (j = 0; j < picks[i].length; j++) b.cells.delete(picks[i][j].k);
+  b.dirty = true;
+  syncProxies(b);                                  // the parent lets go of those grid spots first
+  if (!b.cells.size) killBody(b);
+  var made = 0;
+  for (i = 0; i < picks.length; i++){
+    var ents2 = picks[i], ox = ents2[0].gx, oy = ents2[0].gy, cm = new Map(), used = new Set();
+    for (j = 0; j < ents2.length; j++){
+      var e = ents2[j], lx = e.gx - ox, ly = e.gy - oy, guard = 0;
+      while (used.has(K(lx, ly)) && guard++ < 64) lx += 1;
+      used.add(K(lx, ly));
+      cm.set(K(lx, ly), { x: lx, y: ly, e: e.c.e, c: e.c.c, t: e.c.t !== undefined ? e.c.t : 20, s: e.c.s });
+    }
+    while (DEBRIS.length >= DEBRIS_MAX) retireDebris(DEBRIS[0]);
+    var nb = makeBody(cm, 0);
+    nb.x = ox; nb.y = oy; nb.debris = 1; nb.hold = 0;
+    ensurePB(nb);
+    if (nb.pb){
+      nb.pb.setLinearVelocity(PL.Vec2((vx || 0) + (Math.random() - 0.5)*0.8, (vy || 0) + (Math.random() - 0.5)*0.8));
+      nb.pb.setAngularVelocity((Math.random() - 0.5)*2.4);
+    }
+    syncProxies(nb);
+    DEBRIS.push(nb);
+    made++;
+  }
+  return made;
+}
+/* an impact cracks an object along its fault lines. How much comes away depends on the material: glass
+   lets go in small shards, brick in chunks, wood barely cracks, and anything strong just loses a pixel
+   or two no matter how hard it is hit. Fibrous things like paper and cloth do not shatter at all. */
 function hurt(b, x, y, s, tH){
   if (!b || b.dead) return 0;
   var mass = 1;
   try { if (b.pb && b.pb.getMass) mass = Math.max(0.3, b.pb.getMass()); } catch(err){}
   var sE = s * (0.7 + 0.3*Math.min(2.5, mass/6));
-  var lc = toLocal(b, x, y), dead = [], i;
-  b.cells.forEach(function(cell, k){
-    var P = physOf(cell.e);
-    if (P.unbreakable) return;
-    var thr = 0.55 + 4.6*P.hard;
-    if (sE <= thr) return;
-    var dx = cell.x - lc.x, dy = cell.y - lc.y, d2 = dx*dx + dy*dy;
-    var over = (sE - thr)/Math.max(0.4, thr);
-    var rad = Math.min(5.5, 1.1 + over*2.6);
-    if (d2 > rad*rad) return;
-    var fall = 1 - Math.sqrt(d2)/rad;
-    var p = Math.min(0.95, (0.2 + over*0.75) * (0.3 + 0.7*P.brittle)) * (0.45 + 0.55*fall);
-    if (chance(p)) dead.push(k);
+  var lc = toLocal(b, x, y), near = null, nd = 1e9, i;
+  b.cells.forEach(function(c){
+    var dx = c.x - lc.x, dy = c.y - lc.y, d2 = dx*dx + dy*dy;
+    if (d2 < nd){ nd = d2; near = c; }
   });
-  for (i = 0; i < dead.length; i++) removeCell(b, dead[i], true);
-  return dead.length;
+  if (!near) return 0;
+  var P = physOf(near.e);
+  if (P.unbreakable || P.noshatter) return 0;
+  var thr = 0.55 + 4.6*P.hard;
+  if (sE <= thr) return 0;
+  var over = (sE - thr)/Math.max(0.4, thr);
+
+  /* strong material: a big hit knocks a pixel or two loose and that is the end of it */
+  if (P.hard >= 0.68){
+    var take = sE > thr*2.4 ? 2 : 1, lost = 0, cand = [];
+    b.cells.forEach(function(c, k){
+      var dx = c.x - lc.x, dy = c.y - lc.y, d2 = dx*dx + dy*dy;
+      if (d2 <= 6.25) cand.push([d2, k]);
+    });
+    cand.sort(function(p, q){ return p[0] - q[0]; });
+    for (i = 0; i < cand.length && lost < take; i++) if (removeCell(b, cand[i][1], true)) lost++;
+    return lost;
+  }
+
+  /* breakable: whole fault-line shards come away around the contact */
+  var size = Math.max(2, Math.round(2 + 2*(1 - P.brittle)));
+  var R = Math.min(6.5, 1.4 + over*2.4);
+  var zs = new Map();
+  b.cells.forEach(function(c, k){
+    var dx = c.x - lc.x, dy = c.y - lc.y;
+    var ent = zs.get(zoneKey(b, c, size));
+    if (!ent){ ent = { keys: [], d2: 1e9, cx: 0, cy: 0 }; zs.set(zoneKey(b, c, size), ent); }
+    ent.keys.push(k); ent.cx += c.x; ent.cy += c.y;
+    if (dx*dx + dy*dy < ent.d2) ent.d2 = dx*dx + dy*dy;
+  });
+  var pickz = [];
+  zs.forEach(function(ent){ if (ent.d2 <= R*R) pickz.push(ent); });
+  pickz.sort(function(p, q){ return p.d2 - q.d2; });
+  var budget = Math.max(4, Math.floor(b.cells.size*0.4));
+  var maxZ = P.brittle > 0.6 ? (over > 1.6 ? 3 : 2) : 1;
+  var took = 0, groups = [], v = { x: 0, y: 0 };
+  try { if (b.pb) v = b.pb.getLinearVelocity(); } catch(err){}
+  for (i = 0; i < pickz.length && groups.length < maxZ; i++){
+    var ent2 = pickz[i], n = ent2.keys.length;
+    if (took + n > budget) continue;                 // never take the whole object apart in one hit
+    groups.push(ent2.keys); took += n;
+  }
+  if (!groups.length && pickz.length && sE > thr*1.6){ groups.push(pickz[0].keys); took += pickz[0].keys.length; }
+  if (!groups.length) return 0;
+  var kick = Math.min(2.2, 0.4 + over*0.5);
+  var prox = toLocal(b, x, y), ax = Math.round(prox.x), ay = Math.round(prox.y);
+  var sv = (b.pb && b.pb.getLinearVelocity) ? b.pb.getLinearVelocity() : { x: 0, y: 0 };
+  var cv = toWorld(b, 0, 0);
+  detachZones(b, groups, sv.x + (cv.x - x)*0 + (Math.random() - 0.5)*kick, sv.y + (Math.random() - 0.5)*kick - 0.2);
+  return took;
 }
 function processImpacts(){
   impacts.forEach(function(im){
