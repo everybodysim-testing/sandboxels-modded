@@ -306,25 +306,132 @@ function animStep(cell, gx, gy){
 
 /* ------------------------------------- per-element physics characteristics */
 function hash(s){ var h = 2166136261; for (var i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; } return h >>> 0; }
+/* Every material in the Solids tab gets its own weight (w: a multiplier on its real density), its own
+   strength (s: how fast something has to hit it before a pixel cracks) and its own brittleness
+   (b: how violently it lets go once it does). Tuned so the same slam leaves lead and steel alone,
+   chips brick and wood, and takes a glass pane apart pixel by pixel. */
+var SOLID_TUNE = {
+  adobe:             { w: 0.9, s: 0.3, b: 0.75 },                       // 1946 kg/m3
+  aluminum:          { w: 0.6, s: 0.48, b: 0.3 },                       // 2710 kg/m3
+  amber:             { w: 0.7, s: 0.2, b: 0.9 },                       // - kg/m3
+  bamboo:            { w: 0.5, s: 0.28, b: 0.3 },                       // 686 kg/m3
+  blue_gold:         { w: 1.3, s: 0.7, b: 0.1 },                       // 12900 kg/m3
+  brass:             { w: 1.15, s: 0.7, b: 0.16 },                       // 8550 kg/m3
+  brick:             { w: 0.95, s: 0.45, b: 0.45 },                       // 1650 kg/m3
+  bronze:            { w: 1.12, s: 0.74, b: 0.16 },                       // 8150 kg/m3
+  cloth:             { w: 0.4, s: 0.04, b: 0.1 },                       // 1314 kg/m3
+  copper:            { w: 1.2, s: 0.7, b: 0.16 },                       // 8960 kg/m3
+  dry_ice:           { w: 0.55, s: 0.08, b: 0.92 },                       // 1562 kg/m3
+  electrum:          { w: 1.35, s: 0.68, b: 0.1 },                       // 13750 kg/m3
+  gallium:           { w: 0.8, s: 0.22, b: 0.65 },                       // 5100 kg/m3
+  galvanized_steel:  { w: 1.15, s: 0.9, b: 0.12 },                       // 7850 kg/m3
+  glass:             { w: 0.8, s: 0.12, b: 1.0 },                       // 2500 kg/m3
+  gold:              { w: 1.45, s: 0.7, b: 0.1 },                       // 19300 kg/m3
+  hair:              { w: 0.5, s: 0.05, b: 0.05 },                       // 2395 kg/m3
+  ice:               { w: 0.5, s: 0.1, b: 0.95 },                       // 917 kg/m3
+  insulation:        { w: 0.15, s: 0.05, b: 0.2 },                       // 160 kg/m3
+  invar:             { w: 1.15, s: 0.85, b: 0.12 },                       // 8100 kg/m3
+  iron:              { w: 1.2, s: 0.82, b: 0.2 },                       // 7860 kg/m3
+  lead:              { w: 1.4, s: 0.9, b: 0.04 },                       // 11343 kg/m3
+  nickel:            { w: 1.2, s: 0.8, b: 0.16 },                       // 8900 kg/m3
+  nitrogen_ice:      { w: 0.55, s: 0.08, b: 0.92 },                       // 1562 kg/m3
+  paper:             { w: 0.35, s: 0.03, b: 0.25 },                       // 1201 kg/m3
+  particleboard:     { w: 0.5, s: 0.24, b: 0.45 },                       // 700 kg/m3
+  plastic:           { w: 0.55, s: 0.24, b: 0.3 },                       // 1052 kg/m3
+  porcelain:         { w: 0.85, s: 0.18, b: 0.95 },                       // 2403 kg/m3
+  purple_gold:       { w: 1.25, s: 0.66, b: 0.12 },                       // 11005 kg/m3
+  pyrite:            { w: 1.05, s: 0.55, b: 0.5 },                       // 4900 kg/m3
+  rad_glass:         { w: 0.8, s: 0.14, b: 0.98 },                       // 2500 kg/m3
+  rime:              { w: 0.2, s: 0.06, b: 0.9 },                       // 250 kg/m3
+  rose_gold:         { w: 1.3, s: 0.7, b: 0.1 },                       // 12900 kg/m3
+  ruins:             { w: 1.05, s: 0.4, b: 0.6 },                       // 2400 kg/m3
+  silver:            { w: 1.25, s: 0.66, b: 0.12 },                       // 10497 kg/m3
+  skin:              { w: 0.5, s: 0.06, b: 0.05 },                       // 1019.5 kg/m3
+  solder:            { w: 1.1, s: 0.4, b: 0.35 },                       // 8885 kg/m3
+  sponge:            { w: 0.1, s: 0.04, b: 0.1 },                       // 65 kg/m3
+  stained_glass:     { w: 0.8, s: 0.16, b: 0.95 },                       // 2500 kg/m3
+  steel:             { w: 1.15, s: 0.9, b: 0.12 },                       // 7850 kg/m3
+  sterling:          { w: 1.25, s: 0.68, b: 0.12 },                       // 10375.25 kg/m3
+  straw:             { w: 0.15, s: 0.05, b: 0.15 },                       // 67.5 kg/m3
+  tin:               { w: 0.95, s: 0.42, b: 0.3 },                       // 7260 kg/m3
+  tungsten:          { w: 1.55, s: 0.98, b: 0.06 },                       // 19300 kg/m3
+  wall:              { w: 1.0, s: 1.0, b: 0.0 },                       // 20000 kg/m3
+  wood:              { w: 0.55, s: 0.32, b: 0.2 },                       // 600 kg/m3
+  zinc:              { w: 1.05, s: 0.58, b: 0.22 },                       // 7068 kg/m3
+};
+
 function physOf(id){
   var P = PC[id]; if (P) return P;
   var e = elements[id] || {}, h = hash(id);
   var r1 = (h & 255)/255, r2 = ((h >>> 8) & 255)/255, r3 = ((h >>> 16) & 255)/255;
-  var dens = Math.max(30, Math.min(20000, e.density || 1500));
-  var hard = e.hardness !== undefined ? e.hardness : 0.3 + 0.6*r1;
-  var bounce = 0.02 + 0.2*r2, fric = 0.3 + 0.5*r3;
-  if (/rubber|slime|jelly|gummy|tire|ball|bounc/.test(id)){ bounce = 0.75 + 0.2*r2; fric = 0.9; hard = Math.max(hard, 0.7); }
-  else if (/ice|rime/.test(id)){ bounce = 0.05; fric = 0.04; hard = Math.min(hard, 0.3); }
-  else if (/glass|porcelain|crystal|ceramic|pyrite|ruby|sapphire|quartz/.test(id)){ bounce = 0.04 + 0.1*r2; hard = Math.min(hard, 0.25); fric = 0.35 + 0.2*r3; }
-  else if (/steel|titan|tungsten|adamant|iron/.test(id)){ bounce = 0.02 + 0.04*r2; fric = 0.35 + 0.15*r3; hard = Math.max(hard, 0.93); }
-  else if (/copper|gold|silver|lead|zinc|tin|nickel|alumin|brass|bronze|platin|metal|cobalt|chrom/.test(id)){ bounce = 0.02 + 0.06*r2; fric = 0.3 + 0.2*r3; hard = Math.max(hard, 0.75); }
-  else if (/wood|plank|bamboo|board|paper|cork|foam|sponge|bone|straw/.test(id)){ bounce = 0.08 + 0.1*r2; fric = 0.55 + 0.15*r3; hard = Math.min(Math.max(hard, 0.3), 0.5); }
-  else if (/stone|rock|brick|concrete|cement|marble|granite/.test(id)){ bounce = 0.03 + 0.06*r2; fric = 0.55 + 0.25*r3; hard = Math.max(hard, 0.65); }
-  hard = clamp(hard, 0.05, 0.98);
+  var T = SOLID_TUNE[id], dens, hard, brittle, bounce, fric;
+  if (T){
+    dens = Math.round((e.density || 1500) * T.w);
+    hard = T.s; brittle = T.b;
+    bounce = 0.02 + 0.1*brittle;
+    fric = 0.85 - 0.45*brittle;
+  } else {
+    dens = Math.max(30, Math.min(20000, e.density || 1500));
+    hard = e.hardness !== undefined ? e.hardness : 0.3 + 0.6*r1;
+    bounce = 0.02 + 0.2*r2; fric = 0.3 + 0.5*r3;
+    if (/rubber|slime|jelly|gummy|tire|ball|bounc/.test(id)){ bounce = 0.75 + 0.2*r2; fric = 0.9; hard = Math.max(hard, 0.7); }
+    else if (/ice|rime/.test(id)){ bounce = 0.05; fric = 0.04; hard = Math.min(hard, 0.3); }
+    else if (/glass|porcelain|crystal|ceramic|pyrite|ruby|sapphire|quartz/.test(id)){ bounce = 0.04 + 0.1*r2; hard = Math.min(hard, 0.25); fric = 0.35 + 0.2*r3; }
+    else if (/steel|titan|tungsten|adamant|iron/.test(id)){ bounce = 0.02 + 0.04*r2; fric = 0.35 + 0.15*r3; hard = Math.max(hard, 0.93); }
+    else if (/copper|gold|silver|lead|zinc|tin|nickel|alumin|brass|bronze|platin|metal|cobalt|chrom/.test(id)){ bounce = 0.02 + 0.06*r2; fric = 0.3 + 0.2*r3; hard = Math.max(hard, 0.75); }
+    else if (/wood|plank|bamboo|board|paper|cork|foam|sponge|bone|straw/.test(id)){ bounce = 0.08 + 0.1*r2; fric = 0.55 + 0.15*r3; hard = Math.min(Math.max(hard, 0.3), 0.5); }
+    else if (/stone|rock|brick|concrete|cement|marble|granite/.test(id)){ bounce = 0.03 + 0.06*r2; fric = 0.55 + 0.25*r3; hard = Math.max(hard, 0.65); }
+    brittle = clamp((0.55 - hard)*1.5, 0, 1);
+  }
+  dens = Math.max(30, Math.min(30000, dens));
+  hard = clamp(hard, 0.02, 1);
+  /* light stuff floats down instead of dropping like a rock: weight you can feel without touching physics */
+  var damp = dens < 400 ? 0.055 : (dens < 1000 ? 0.018 : 0.002);
   var br = e.breakInto; if (Array.isArray(br)) br = br[0];
   var debris = (br && elements[br]) ? br : (elements.gravel ? "gravel" : null);
-  P = PC[id] = { dens: dens, bounce: bounce, fric: fric, hard: hard, debris: debris };
+  P = PC[id] = { dens: dens, bounce: bounce, fric: fric, hard: hard, brittle: brittle,
+                 damp: damp, debris: debris, unbreakable: hard >= 1 };
   return P;
+}
+/* ------------------------------------------------ debris: one small body per broken pixel */
+var DEBRIS = [], DEBRIS_MAX = 150;
+function freeSpotNear(gx, gy, r){
+  if (!outOfBounds(gx, gy) && pixelMap[gx] && pixelMap[gx][gy] === undefined) return [gx, gy];
+  for (var d = 1; d <= r; d++)
+    for (var dx = -d; dx <= d; dx++) for (var dy = -d; dy <= d; dy++){
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== d) continue;
+      var x = gx + dx, y = gy + dy;
+      if (!outOfBounds(x, y) && pixelMap[x] && pixelMap[x][y] === undefined) return [x, y];
+    }
+  return null;
+}
+/* a broken pixel does not vanish: it becomes its own single-pixel object of the same material */
+function spawnDebris(el, gx, gy, vx, vy){
+  if (!world || !elements[el]) return null;
+  if (physOf(el).unbreakable) return null;
+  var spot = freeSpotNear(Math.round(gx), Math.round(gy), 3); if (!spot) return null;
+  while (DEBRIS.length >= DEBRIS_MAX) retireDebris(DEBRIS[0]);
+  var cells = new Map();
+  cells.set(K(0, 0), { x: 0, y: 0, e: el, c: undefined, t: 20, s: pixelTicks });
+  var b = makeBody(cells, 0);
+  b.x = spot[0]; b.y = spot[1]; b.debris = 1; b.hold = 0;
+  ensurePB(b);
+  if (b.pb){
+    b.pb.setLinearVelocity(PL.Vec2((vx || 0) + (Math.random() - 0.5)*1.6, (vy || 0) - Math.random()*1.2));
+    b.pb.setAngularVelocity((Math.random() - 0.5)*3);
+  }
+  syncProxies(b);
+  DEBRIS.push(b);
+  return b;
+}
+/* once there are too many pieces the oldest one settles back into a plain pixel: it is still there */
+function retireDebris(b){
+  if (!b || b.dead){ return; }
+  var el = null; b.cells.forEach(function(c){ if (!el) el = c.e; });
+  var gx = Math.round(b.x), gy = Math.round(b.y);
+  var i = DEBRIS.indexOf(b); if (i >= 0) DEBRIS.splice(i, 1);
+  killBody(b);
+  if (el && !outOfBounds(gx, gy) && pixelMap[gx] && pixelMap[gx][gy] === undefined) createPixel(el, gx, gy);
 }
 
 /* ------------------------------------------------------------ transforms */
@@ -494,7 +601,9 @@ function ensurePB(b){
   b.pb = world.createBody({ type: (b.frozen || pixelTicks < b.hold) ? "static" : "dynamic",
     position: PL.Vec2(b.x, b.y), angle: b.a });
   b.pb.setGravityScale(b.gf);
-  b.pb.setLinearDamping(0.002); b.pb.setAngularDamping(0.02);
+  var dp = 0.002, firstC = b.cells.values().next();
+  if (!firstC.done){ var q0 = physOf(firstC.value.e); if (q0 && q0.damp !== undefined) dp = q0.damp; }
+  b.pb.setLinearDamping(dp); b.pb.setAngularDamping(0.02);
   rebuildFixtures(b);
   if (b.pend){ b.pend(b.pb); b.pend = null; }
 }
@@ -900,23 +1009,46 @@ function smash(p){
   if (t && elements[t]) changePixel(p, t);
 }
 function removeCell(b, k, debris){
-  var cell = b.cells.get(k); if (!cell) return;
-  b.cells.delete(k); b.dirty = true;
-  if (debris && chance(0.55)){
-    var w = toWorld(b, cell.x, cell.y), d = physOf(cell.e).debris;
-    if (d && isEmpty(Math.round(w.x), Math.round(w.y))) createPixel(d, Math.round(w.x), Math.round(w.y));
+  var cell = b.cells.get(k); if (!cell) return false;
+  var el = cell.e, pix = cell.px, gx = null, gy = null;
+  if (pix && pixelMap[pix.x] && pixelMap[pix.x][pix.y] === pix){
+    gx = pix.x; gy = pix.y;
+    pixelMap[gx][gy] = undefined; dropPix(pix);
+    var gk = GK(gx, gy); if (b.proxies.get(gk) === pix) b.proxies.delete(gk);
   }
+  if (gx === null){ var wpt = toWorld(b, cell.x, cell.y); gx = Math.round(wpt.x); gy = Math.round(wpt.y); }
+  b.cells.delete(k); b.dirty = true;
+  if (debris){
+    var v = { x: 0, y: 0 };
+    try { if (b.pb) v = b.pb.getLinearVelocity(); } catch(err){}
+    spawnDebris(el, gx, gy, v.x, v.y);
+  }
+  return true;
 }
+/* an impact shatters pixels around the contact. How many depends on the material's own strength and
+   brittleness: a glass pane gives up, a lead block does not notice. The speed a body needs also grows
+   with its mass, so the same 2000-pixel glass slab hitting a wall at 4 kills far more than a shard. */
 function hurt(b, x, y, s, tH){
-  if (!b || b.dead) return;
-  var lc = toLocal(b, x, y);
+  if (!b || b.dead) return 0;
+  var mass = 1;
+  try { if (b.pb && b.pb.getMass) mass = Math.max(0.3, b.pb.getMass()); } catch(err){}
+  var sE = s * (0.7 + 0.3*Math.min(2.5, mass/6));
+  var lc = toLocal(b, x, y), dead = [], i;
   b.cells.forEach(function(cell, k){
-    var dx = cell.x - lc.x, dy = cell.y - lc.y;
-    if (dx*dx + dy*dy > 2.9) return;
-    var thr = 0.4 + 2.6*physOf(cell.e).hard;
-    if (s <= thr) return;
-    if (chance(Math.min(0.8, (s - thr)*0.45) * (0.5 + 0.5*(1 - tH)))) removeCell(b, k, true);
+    var P = physOf(cell.e);
+    if (P.unbreakable) return;
+    var thr = 0.55 + 4.6*P.hard;
+    if (sE <= thr) return;
+    var dx = cell.x - lc.x, dy = cell.y - lc.y, d2 = dx*dx + dy*dy;
+    var over = (sE - thr)/Math.max(0.4, thr);
+    var rad = Math.min(5.5, 1.1 + over*2.6);
+    if (d2 > rad*rad) return;
+    var fall = 1 - Math.sqrt(d2)/rad;
+    var p = Math.min(0.95, (0.2 + over*0.75) * (0.3 + 0.7*P.brittle)) * (0.45 + 0.55*fall);
+    if (chance(p)) dead.push(k);
   });
+  for (i = 0; i < dead.length; i++) removeCell(b, dead[i], true);
+  return dead.length;
 }
 function processImpacts(){
   impacts.forEach(function(im){
@@ -1106,7 +1238,7 @@ function adoptIntoNearbyBody(grp){
   var ids = Object.keys(BODIES), host = null, best = 1e9;
   for (i = 0; i < ids.length; i++){
     var b = BODIES[ids[i]];
-    if (!b || b.dead) continue;
+    if (!b || b.dead || b.debris) continue;
     /* match on the whole body, not just the cell that happens to come out of the map first: a body
        made of two materials used to refuse its own second material and spawn a separate object */
     if (Math.abs(b.x - cx) > b.rad + 14 || Math.abs(b.y - cy) > b.rad + 14) continue;
@@ -1131,7 +1263,7 @@ function checkSupport(p, checked){
       if (outOfBounds(nx, ny)){ supported = true; break; }
       var n = pixelMap[nx][ny];
       if (!n || n.del) continue;
-      if (n.sub !== undefined){ if (!host && BODIES[n.sub]) host = BODIES[n.sub]; continue; }
+      if (n.sub !== undefined){ if (!host && BODIES[n.sub] && !BODIES[n.sub].debris) host = BODIES[n.sub]; continue; }
       if (seen.has(n)) continue;
       if (GC.has(n)){ supported = true; break; }
       scanNodes++;
@@ -1203,6 +1335,7 @@ function startSweep(){
   return true;
 }
 function processSupport(){
+  if (DEBRIS.length) for (var dq = DEBRIS.length - 1; dq >= 0; dq--){ if (!DEBRIS[dq] || DEBRIS[dq].dead) DEBRIS.splice(dq, 1); }
   bodyBudget = 24;
   GC = new Set();
   var checked = sweepChecked || new Set(), n = 0, i;
@@ -1893,7 +2026,8 @@ if (globalThis.__SUBLEVEL_TEST__){
     applyGravitySetting: applyGravitySetting, addGravitySetting: addGravitySetting,
     gravity: function(){ return GRAV_ON; },
     processSupport: processSupport, placeLocal: placeLocal, localBrush: localBrush, eraseLocal: eraseLocal, world: function(){ return world; },
-    GC: function(){ return GC; }, brushTarget: brushTarget, brushReachOf: brushReachOf, bodyNear: bodyNear, eraseStroke: eraseStroke, strokeEnds: strokeEnds };
+    GC: function(){ return GC; }, brushTarget: brushTarget, brushReachOf: brushReachOf, bodyNear: bodyNear, eraseStroke: eraseStroke, strokeEnds: strokeEnds,
+    hurt: hurt, removeCell: removeCell, spawnDebris: spawnDebris, DEBRIS: function(){ return DEBRIS; }, physOf: physOf };
 }
 if (typeof logMessage === "function") logMessage("Sublevel Physics v18 loaded (Planck.js). Load it LAST in the mod list.");
 
