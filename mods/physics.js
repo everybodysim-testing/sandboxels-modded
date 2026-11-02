@@ -111,7 +111,7 @@
    ========================================================================== */
 (function () {
 
-var G = 0.09, HOLD = 12, SUB = 4, DT = 1/SUB;
+var G = 0.09, HOLD = 12, SUB = 2, DT = 1/SUB;
 var GRAV_ON = 1, GRAV_SET = -1;   // physics gravity switch, driven by the Gravity setting
 var GRAV_SETTING = "sl_gravity";
 var PDRAG = 0.85, SETTLE_SP = 0.22, SETTLE_N = 8;   // powder drag strength, settle speed, quiet ticks before it settles
@@ -120,7 +120,7 @@ var tfix = new Map(), impacts = [], pushes = [], RIDERS = new Set(), GC = new Se
 var baseId = Math.floor(Math.random()*1e8) * 100, idc = 1;
 var NOJOIN = false, ERASEGUARD = false, dirtyA = [], dirtyS = new Set(), hookedCount = 0;
 var sweepQ = null, sweepChecked = null, scanNodes = 0, sweepAt = 2, sweepTries = 0;   // full-map support sweep state
-var MAXFIX = 260;              // collider budget per body
+var MAXFIX = 140, DEBRIS_GROUP = -7;   /* shards share a negative group: shard on shard never costs a contact */              // collider budget per body
 var PROXYCAP = 400;            // proxies looked at per body per scan
 var bodyBudget = 6;            // new bodies allowed per tick (keeps a save load smooth)
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
@@ -494,7 +494,8 @@ function playableBounds(){
 }
 function initWorld(){
   if (world || !PL) return;
-  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: true });   // resting objects stop costing anything
+  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: true });
+  try { if (world.setContinuousPhysics) world.setContinuousPhysics(false); } catch(e){}   /* no swept tests stacked on top of the sub-steps */   // resting objects stop costing anything
   terrain = world.createBody({ type: "static" });
   var B = playableBounds(), my = (B.y0 + B.y1)/2, mx = (B.x0 + B.x1)/2, bd = { friction: 0.8, userData: { t: 1, kind: 1, border: 1 } };
   terrain.createFixture(PL.Box(50, 2000, PL.Vec2(B.x0 - 0.5 - 50, my)), bd);
@@ -508,6 +509,10 @@ function bodyVelAt(pb, pt){ var v = pb.getLinearVelocityFromWorldPoint(pt); retu
 function onBegin(contact){
   var fa = contact.getFixtureA(), fb = contact.getFixtureB(), ua = fa.getUserData(), ub = fb.getUserData();
   if (!ua || !ub) return;
+  try {                                            /* most contacts are quiet: check the bodies before building a manifold */
+    var ca = fa.getBody().getLinearVelocity(), cb = fb.getBody().getLinearVelocity();
+    if (Math.abs(ca.x - cb.x) + Math.abs(ca.y - cb.y) < 0.3) return;
+  } catch(e){}
   var wm = contact.getWorldManifold(null); if (!wm || !wm.points || !wm.points.length) return;
   var n = wm.normal, pt = wm.points[0];
   var va = bodyVelAt(fa.getBody(), pt), vb = bodyVelAt(fb.getBody(), pt);
@@ -522,6 +527,7 @@ function onPost(contact, impulse){
   if (!body || !soil) return;
   var ni = impulse && impulse.normals, imp = 0, i;
   if (ni) for (i = 0; i < ni.length; i++) imp += ni[i];
+  if (imp <= 0) return;                            /* nothing was pushed: skip the manifold */
   var wm = contact.getWorldManifold(null); if (!wm || !wm.points || !wm.points.length) return;
   pushes.push({ f: imp/DT, x: wm.points[0].x, y: wm.points[0].y, run: soil, b: body.b });
 }
@@ -580,7 +586,7 @@ function rebuildFixtures(b){
     runs.forEach(function(r){
       var P = physOf(r.e);
       pb.createFixture(PL.Box(r.len/2, r.h/2, PL.Vec2(r.x0 + (r.len - 1)/2, r.y + (r.h - 1)/2)),
-        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, userData: { b: b } });
+        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
     });
   }
   else {                                   /* gnarly shape: coarse blocks, still bounded */
@@ -597,7 +603,7 @@ function rebuildFixtures(b){
     blocks.forEach(function(q){
       var P = physOf(q.e);
       pb.createFixture(PL.Box(s/2, s/2, PL.Vec2(q.bx*s + s/2, q.by*s + s/2)),
-        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, userData: { b: b } });
+        { density: P.dens/1000, friction: P.fric, restitution: P.bounce, filterGroupIndex: b.debris ? DEBRIS_GROUP : 0, userData: { b: b } });
     });
   }
   pb.resetMassData();
@@ -2090,6 +2096,16 @@ runEveryTick(function(){
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var ps = b.pb.getPosition(); b.x = ps.x; b.y = ps.y; b.a = b.pb.getAngle();
+    /* a calm body is put to sleep at once: a heap of contacts then costs nothing at all,
+       which is the difference between a pile being free and a pile eating the frame */
+    try {
+      if (b.pb.isAwake() && !b.noSleep){
+        var qv = b.pb.getLinearVelocity(), qw = b.pb.getAngularVelocity();
+        var qs = Math.abs(qv.x) + Math.abs(qv.y) + Math.abs(qw) * 0.4;
+        if (qs < 0.045){ if (++b.calm > (b.debris ? 3 : 8)){ b.pb.setAwake(false); b.calm = 0; } }
+        else b.calm = 0;
+      }
+    } catch(e){}
     var sdx = Math.abs(b.x - b.sx) + Math.abs(b.y - b.sy), sda = Math.abs(b.a - b.sa);
     if (b.dirty || b.needSync || sdx > 0.14 || sda > 0.02){
       var R0 = (b.Rtick && b.Rt === pixelTicks && Math.abs(b.Rx - b.x) < 0.06 && Math.abs(b.Ry - b.y) < 0.06 && Math.abs(b.Ra - b.a) < 0.04) ? b.Rtick : null;
