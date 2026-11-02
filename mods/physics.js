@@ -150,7 +150,17 @@ function liq(x,y){
   var p = pixelMap[x][y]; if (!p || p.sub !== undefined) return null;
   var e = elements[p.element]; return (e && e.state === "liquid") ? p : null;
 }
-function mark(x,y){ if (INPROXY) return; var gk = GK(x,y); TERRAIN_DIRTY = 1; if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
+function wakeAt(x, y){
+  for (var wi = 0; wi < 5; wi++){
+    var wx = x + (wi === 1 ? -1 : wi === 2 ? 1 : 0), wy = y + (wi === 3 ? -1 : wi === 4 ? 1 : 0);
+    var cp = pixelMap[wx], pp = cp && cp[wy];
+    if (pp && pp.sub !== undefined){
+      var wb = BODIES[pp.sub];
+      if (wb && wb.pb && !wb.dead){ try { if (!wb.pb.isAwake()) wb.pb.setAwake(true); } catch(e){} }
+    }
+  }
+}
+function mark(x,y){ if (INPROXY) return; var gk = GK(x,y); TERRAIN_DIRTY = 1; wakeAt(x, y); if (dirtyA.length > 6000) return; if (!dirtyS.has(gk)){ dirtyS.add(gk); dirtyA.push(gk); } }
 
 /* ------------------------------------------------ which blocks get physics */
 /* anything that does not actively move on its own */
@@ -480,7 +490,7 @@ function playableBounds(){
 }
 function initWorld(){
   if (world || !PL) return;
-  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: false });
+  world = new PL.World({ gravity: PL.Vec2(0, G), allowSleep: true });   // resting objects stop costing anything
   terrain = world.createBody({ type: "static" });
   var B = playableBounds(), my = (B.y0 + B.y1)/2, mx = (B.x0 + B.x1)/2, bd = { friction: 0.8, userData: { t: 1, kind: 1, border: 1 } };
   terrain.createFixture(PL.Box(50, 2000, PL.Vec2(B.x0 - 0.5 - 50, my)), bd);
@@ -525,43 +535,20 @@ function makeBody(cells, ang){
   calc(b); BODIES[b.id] = b; return b;
 }
 function raster(b, x, y, a){
-  var c = Math.cos(a), s = Math.sin(a), r = b.rad;
-  var gx0 = Math.floor(x - r), gx1 = Math.ceil(x + r), gy0 = Math.floor(y - r), gy1 = Math.ceil(y + r);
-  var out = { gx: [], gy: [], ck: [] };
-  var used = new Set(), placed = new Set();
-  /* Every cell gets exactly one pixel. When rounding sends two cells to the same spot the second one
-     takes the nearest free spot instead of being dropped - dropping it left HOLES in the shape, and a
-     hole in a still shape shows the background in a regular pattern on the sandbox grid. */
-  for (var gx = gx0; gx <= gx1; gx++) for (var gy = gy0; gy <= gy1; gy++){
-    var dx = gx - x, dy = gy - y;
-    var k = K(Math.round(dx*c + dy*s), Math.round(-dx*s + dy*c));
-    if (!b.cells.has(k) || used.has(k)) continue;
-    used.add(k);
-    if (placed.has(GK(gx, gy))) continue;
-    placed.add(GK(gx, gy));
-    out.gx.push(gx); out.gy.push(gy); out.ck.push(k);
-  }
-  /* second pass: cells that were squeezed out by rounding get the closest free grid point */
-  if (used.size < b.cells.size){
-    for (var kk in b.cells){ }
-    var miss = [];
-    b.cells.forEach(function(cell, ck){ if (!used.has(ck)) miss.push(ck); });
-    for (var mi = 0; mi < miss.length; mi++){
-      var mc = b.cells.get(miss[mi]);
-      var wxx = x + mc.x*c - mc.y*s, wyy = y + mc.x*s + mc.y*c;
-      var bx = Math.round(wxx), by = Math.round(wyy), found = false;
-      for (var rr2 = 0; rr2 <= 8 && !found; rr2++){
-        for (var oy2 = -rr2; oy2 <= rr2 && !found; oy2++) for (var ox2 = -rr2; ox2 <= rr2; ox2++){
-          if (Math.max(Math.abs(ox2), Math.abs(oy2)) !== rr2) continue;
-          var tx = bx + ox2, ty = by + oy2, gk2 = GK(tx, ty);
-          if (placed.has(gk2)) continue;
-          placed.add(gk2); used.add(miss[mi]);
-          out.gx.push(tx); out.gy.push(ty); out.ck.push(miss[mi]);
-          found = true; break;
-        }
-      }
+  /* One grid point per cell, computed straight from the cell. The old version scanned the body's whole
+     bounding box and inverted the rotation for every point in it: (2r+1)^2 work for a shape that might
+     only have a few hundred pixels. This is one multiply and one round() per cell, no scan. */
+  var c = Math.cos(a), s = Math.sin(a), out = { gx: [], gy: [], ck: [] };
+  var placed = b.cells.size > 240 ? new Set() : null;
+  b.cells.forEach(function(cell, ck){
+    var gx = Math.round(x + cell.x*c - cell.y*s), gy = Math.round(y + cell.x*s + cell.y*c);
+    if (placed){
+      var gk = gx*4096 + gy, guard = 0;
+      if (placed.has(gk)){ do { gx += 1; gk = gx*4096 + gy; } while (placed.has(gk) && guard++ < 8); }
+      placed.add(gk);
     }
-  }
+    out.gx.push(gx); out.gy.push(gy); out.ck.push(ck);
+  });
   return out;
 }
 function rebuildFixtures(b){
@@ -571,19 +558,24 @@ function rebuildFixtures(b){
   old.forEach(function(x){ pb.destroyFixture(x); });
   var rows = {}, runs = [];
   b.cells.forEach(function(c){ (rows[c.y] = rows[c.y] || []).push(c); });
+  var byKey = new Map();
   Object.keys(rows).forEach(function(y){
     var list = rows[y].sort(function(p, q){ return p.x - q.x; }), i = 0;
     while (i < list.length){
       var j = i;
       while (j + 1 < list.length && list[j+1].x === list[j].x + 1 && list[j+1].e === list[i].e) j++;
-      runs.push({ x0: list[i].x, y: +y, len: j - i + 1, e: list[i].e });
+      var r = { x0: list[i].x, y: +y, len: j - i + 1, e: list[i].e, h: 1 };
+      var key = r.x0 + "," + r.len + "," + r.e;
+      var prev = byKey.get(key);
+      if (prev && prev.y + prev.h === r.y){ prev.h++; }        // identical run on the next row: make the box taller
+      else { byKey.set(key, r); runs.push(r); }
       i = j + 1;
     }
   });
   if (runs.length <= MAXFIX){
     runs.forEach(function(r){
       var P = physOf(r.e);
-      pb.createFixture(PL.Box(r.len/2, 0.5, PL.Vec2(r.x0 + (r.len - 1)/2, r.y)),
+      pb.createFixture(PL.Box(r.len/2, r.h/2, PL.Vec2(r.x0 + (r.len - 1)/2, r.y + (r.h - 1)/2)),
         { density: P.dens/1000, friction: P.fric, restitution: P.bounce, userData: { b: b } });
     });
   }
@@ -741,7 +733,7 @@ function syncProxies(b, R0){
   if (b.sx < 1e8){
     var mdx = b.x - b.sx, mdy = b.y - b.sy, md = Math.sqrt(mdx*mdx + mdy*mdy) + Math.abs(b.a - b.sa)*b.rad*0.5;
     if (md > 1.2){
-      var nst = Math.min(8, Math.ceil(md));
+      var nst = Math.min(5, Math.ceil(md));
       if (b.cells.size > 700) nst = Math.min(3, nst);          // big bodies: fewer interpolation passes
       for (var st = 1; st < nst; st++){
         var tt = st/nst, qx = b.sx + mdx*tt, qy = b.sy + mdy*tt, SR = raster(b, qx, qy, b.sa + (b.a - b.sa)*tt);
@@ -1006,6 +998,11 @@ function refreshTerrain(){
       (rows[y] = rows[y] || []).push([x, kind]);
     }
     b.trects = rowsToRects(rows);
+    /* the ground the body is standing on changed shape: it must notice, or it keeps sleeping in mid-air */
+    var sig = "";
+    for (var sg2 = 0; sg2 < b.trects.length; sg2++) sig += b.trects[sg2].k + ";";
+    if (b.tsig !== undefined && b.tsig !== sig && b.pb && !b.pb.isAwake()){ try { b.pb.setAwake(true); } catch(e){} }
+    b.tsig = sig;
     for (var ri = 0; ri < b.trects.length; ri++) if (!want.has(b.trects[ri].k)) want.set(b.trects[ri].k, b.trects[ri].r);
   }
   tfix.forEach(function(fx, key){ if (!want.has(key)){ terrain.destroyFixture(fx); tfix.delete(key); } });
@@ -1939,7 +1936,9 @@ runEveryTick(function(){
   var ids = Object.keys(BODIES), i, b;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead) continue;
-    if (b.proxies.size <= 220 || ((pixelTicks + (b.slI || 0)) % 3) === 0) watchProxies(b);   // big bodies: every 3rd tick
+    var asleep = b.pb && !b.pb.isAwake(), ph0 = (pixelTicks + (b.slI || 0)) % 3;
+    if (asleep ? ph0 === 0
+              : (b.proxies.size > 220 ? ph0 === 0 : ((pixelTicks + (b.slI || 0)) % 2) === 0)) watchProxies(b);   // every 2nd tick, big bodies every 3rd
   }
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead && b.dirty) fixBody(b); }
   if ((pixelTicks % 30) === 0){                        /* materials that turned out not to be solids lose their body */
@@ -1975,12 +1974,19 @@ runEveryTick(function(){
     var stat = b.frozen || pixelTicks < b.hold, want = stat ? "static" : "dynamic";
     if (b.pb.getType() !== want){ b.pb.setType(want); if (!stat){ b.pb.setGravityScale(b.gf); b.pb.setAwake(true); } }
     if (stat) continue;
+    /* asleep: planck already skipped it, and there is nothing to measure or push. Skip the whole body. */
+    if (!b.pb.isAwake() && !b.dirty && !b.needSync){ b.settled = true; continue; }
     var R;
     if (b.Rtick && Math.abs(b.x - b.Rx) < 0.02 && Math.abs(b.y - b.Ry) < 0.02 && Math.abs(b.a - b.Ra) < 0.005) R = b.Rtick;
     else R = raster(b, b.x, b.y, b.a);                 // geometry only: surrounding pixels are read live
-    var fl = fluidInfo(b, R); b.wet = fl.n;
     var m = b.pb.getMass(), lin = 0.002, ang = 0.02, Fb = 0, v = b.pb.getLinearVelocity();
     var sp = Math.sqrt(v.x*v.x + v.y*v.y);
+    /* what surrounds the body only needs measuring again when it moves or something changed */
+    var freshF = b.flT === undefined || b.dirty || sp > 0.45 || (pixelTicks - b.flT) >= 3 ||
+                 (Math.abs(b.x - b.flX) + Math.abs(b.y - b.flY)) > 0.6;
+    var fl = freshF ? fluidInfo(b, R) : b.fl;
+    b.wet = fl.n;
+    if (freshF){ b.fl = fl; b.flT = pixelTicks; b.flX = b.x; b.flY = b.y; }
     b.Rt = pixelTicks; b.Rx = b.x; b.Ry = b.y; b.Ra = b.a; b.Rtick = R;
     maxSp = Math.max(maxSp, sp + Math.abs(b.pb.getAngularVelocity())*b.rad*0.5);
     if (fl.n > 0){
@@ -1992,8 +1998,8 @@ runEveryTick(function(){
     }
     /* powder drag: only the grains UNDER the body hold it back, and more contact = more drag.
        Slowed to a crawl for a few ticks, it settles where it is instead of creeping down forever. */
-    var pu = powderUnder(b); b.pf = pu.hit; b.pfb = pu.bot;
-    var pfr = pu.bot > 0 ? Math.min(1, pu.hit/pu.bot) : 0;
+    if (freshF){ var pu = powderUnder(b); b.pf = pu.hit; b.pfb = pu.bot; }
+    var pfr = b.pfb > 0 ? Math.min(1, b.pf/b.pfb) : 0;
     if (pfr > 0 && b.gf > 0){
       var dragK = PDRAG*pfr*(1 + Math.min(1.4, sp*1.2));      // faster = thicker, roughly a squared drag law
       if (dragK > lin) lin = dragK;
@@ -2012,7 +2018,7 @@ runEveryTick(function(){
         if (b.stT >= SETTLE_N){ b.settled = true; b.stT = 0; b.pb.setLinearVelocity(PL.Vec2(0, 0)); b.pb.setAngularVelocity(0); }
       } else b.stT = 0;
     } else { b.settled = false; b.stT = 0; }
-    if (GRAB && GRAB.b === b){ ang = Math.max(ang, 0.25); lin = Math.max(lin, 0.02); b.pb.setAwake(true); maxSp = 1; b.settled = false; b.stT = 0; }
+    if (GRAB && GRAB.b === b){ b.pb.setAwake(true); ang = Math.max(ang, 0.25); lin = Math.max(lin, 0.02); b.pb.setAwake(true); maxSp = 1; b.settled = false; b.stT = 0; }
     b.pb.setLinearDamping(lin); b.pb.setAngularDamping(ang);
     /* in powder the support pushes through the centre of mass: applied at the contact
        centroid it would be a permanent off-centre force, i.e. an endless slow spin */
@@ -2024,7 +2030,7 @@ runEveryTick(function(){
   else if (pixelTicks % 3 === 0 || maxSp > 0.6) refreshTerrain();
   /* direct powder push: scan the surface of each body's proxy footprint (uses live velocity pre-step) */
   for (i = 0; i < ids.length; i++){
-    b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic") continue;
+    b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic" || !b.pb.isAwake()) continue;
     var bvp = b.pb.getLinearVelocity(), bsp = Math.sqrt(bvp.x*bvp.x + bvp.y*bvp.y);
     if (bsp < 0.08) continue;
     var bvLen = Math.sqrt(bvp.x*bvp.x+bvp.y*bvp.y)||1, bdx=bvp.x/bvLen, bdy=bvp.y/bvLen;
