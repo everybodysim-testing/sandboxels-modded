@@ -877,6 +877,7 @@ function dissolveBody(b){
   killBody(b);
 }
 var stepping = false, KILLQ = [], shardBudget = 4, retireBudget = 8, MAXBODIES = 240;
+var ANIM_ANY = false;   /* is there anything animated to write per pixel this frame? */
 function killBody(b){
   if (!b || b.dead) return;
   if (b.pb && world && stepping){                    /* destroying a body inside world.step corrupts the solver */
@@ -955,6 +956,7 @@ function watchProxies(b){
     }
     var cell = b.cells.get(pix.ck); if (!cell) return;
     if (pix.element !== cell.e){
+      pix.ax = undefined;                                  /* material changed: recompute the animation verdict */
       acceptProxyElement(b, pix);
       cell = b.cells.get(pix.ck); if (!cell) return;   /* it left the body: nothing left to watch here */
     }
@@ -2027,6 +2029,7 @@ runEveryTick(function(){
     }
   }
   ids = Object.keys(BODIES);
+  ANIM_ANY = false;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]];
     if (!b || b.dead) continue;
@@ -2035,6 +2038,7 @@ runEveryTick(function(){
        That is the only state in which every proxy is freshly created, and a fresh pixel is not ticked
        by the game on the frame it appears, so the object's own colours/alpha are what get drawn. */
     if (b.proxies && b.proxies.size && bodyIsAnimated(b)){
+      ANIM_ANY = true;
       if (b.proxies.size <= 400 || (pixelTicks % 3) === 0){ refreshProxies(b); continue; }
     }
     if (b.needSync){ b.needSync = false; syncProxies(b); }
@@ -2172,31 +2176,32 @@ runEveryTick(function(){
 });
 var PX_S = { x:0, y:0, element:"", start:0, colorstart:0, temp:20, color:0, alpha:1 };
 runPerPixel(function(p){
-  if (p.sub !== undefined){
-    var b = BODIES[p.sub];
-    if (!b || b.dead || pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){ p.sub = undefined; return; }
-    if (!b.anim && b.anim !== undefined) return;             /* plain material: nothing per pixel to do */
-    {
-      /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
-      var c0 = b.cells.get(p.ck);
-      if (c0){
-        var a0 = animOf(c0.e);
-        if (a0.anim && a0.pure){
-          var ph0 = animPhase(b, c0), s0 = PX_S;
-          s0.x = ph0[0]; s0.y = ph0[1]; s0.element = c0.e;
-          s0.start = c0.s === undefined ? pixelTicks : c0.s; s0.colorstart = s0.start;
-          s0.temp = c0.t === undefined ? 20 : c0.t; s0.color = p.color; s0.alpha = p.alpha === undefined ? 1 : p.alpha;
-          try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
-          if (s0){
-            if (a0.col && s0.color !== undefined) p.color = s0.color;
-            if (a0.alp && s0.alpha !== undefined) p.alpha = s0.alpha;
-            if (a0.col) c0.c = s0.color;
-            if (a0.alp) c0.al = s0.alpha;
-          }
-        }
-      }
-    }
-  } else if (p.pvx !== undefined) flyGrain(p);
+  if (p.sub === undefined){
+    if (p.pvx !== undefined) flyGrain(p);
+    return;
+  }
+  if (!ANIM_ANY) return;                    /* no animated object on the board: the pixel pass has nothing to say */
+  if (p.ax === 0) return;                   /* plain pixel of an animated object: nothing to do, every frame */
+  var b = BODIES[p.sub];
+  if (!b || b.dead || pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){ p.sub = undefined; return; }
+  if (!b.anim && b.anim !== undefined) return;   /* plain material: nothing per pixel to do */
+  var c0 = b.cells.get(p.ck);
+  if (!c0){ p.ax = 0; return; }
+  var a0 = animOf(c0.e);
+  if (!(a0.anim && a0.pure)){ p.ax = 0; return; }  /* decided once, then it is a single property read */
+  p.ax = 1;
+  /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
+  var ph0 = animPhase(b, c0), s0 = PX_S;
+  s0.x = ph0[0]; s0.y = ph0[1]; s0.element = c0.e;
+  s0.start = c0.s === undefined ? pixelTicks : c0.s; s0.colorstart = s0.start;
+  s0.temp = c0.t === undefined ? 20 : c0.t; s0.color = p.color; s0.alpha = p.alpha === undefined ? 1 : p.alpha;
+  try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
+  if (s0){
+    if (a0.col && s0.color !== undefined) p.color = s0.color;
+    if (a0.alp && s0.alpha !== undefined) p.alpha = s0.alpha;
+    if (a0.col) c0.c = s0.color;
+    if (a0.alp) c0.al = s0.alpha;
+  }
 });
 runAfterReset(function(){
   BODIES = {}; dirtyA.length = 0; dirtyS.clear(); impacts.length = 0; pushes.length = 0; tfix.clear(); RIDERS.clear(); GC = new Set(); GRAB = null;
