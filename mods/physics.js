@@ -125,8 +125,11 @@ var PROXYCAP = 400;            // proxies looked at per body per scan
 var bodyBudget = 6;            // new bodies allowed per tick (keeps a save load smooth)
 var TE = 0, TERRAIN_DIRTY = 0; // terrain refresh epoch / dirty flag
 /* evenly-sampled proxies: cost of a scan no longer grows with body size */
-function sampleProxies(b, cap){
-  var out = [], n = b.proxies.size;
+var SMP_SCRATCH = [];
+function sampleProxies(b, cap, out){
+  out = out || [];
+  out.length = 0;
+  var n = b.proxies.size;
   if (!n) return out;
   if (n <= cap){ b.proxies.forEach(function(p){ out.push(p); }); return out; }
   var stride = Math.ceil(n/cap), i = 0;
@@ -254,9 +257,10 @@ function isPowderPix(p){
 
 /* how much powder is holding a body up: grains directly UNDER its footprint. nothing above
    counts (that is a rider, e.g. sand in a cup). bot = open underside cells, hit = those on powder */
+var PU_SCRATCH = [];
 function powderUnder(b){
   var hit = 0, bot = 0;
-  var smp = sampleProxies(b, PROXYCAP);
+  var smp = sampleProxies(b, PROXYCAP, PU_SCRATCH);
   for (var si = 0; si < smp.length; si++){
     var pix = smp[si];
     var q = pxAt(pix.x, pix.y + 1);
@@ -833,10 +837,10 @@ function killBody(b){
 function bodyIsAnimated(b){
   /* the cached answer is dropped as soon as the body gains or loses cells: a body that was empty (or
      plain) when we last looked must not be ignored for the next 30 ticks */
-  if (b.animT !== undefined && b.animSize === b.cells.size && pixelTicks - b.animT < 30) return b.anim;
+  if (b.anim !== undefined && !b.animDirty) return b.anim;
   var out = false;
   b.cells.forEach(function(cell){ if (out) return; if (animOf(cell.e).anim) out = true; });   /* any cell, not just the first few */
-  b.anim = out; b.animT = pixelTicks; b.animSize = b.cells.size;
+  b.anim = out; b.animDirty = 0;
   return out;
 }
 var ANIM_BUDGET = 60000;   /* the game's own pixel loop also ticks proxies; if we skip any, the two writers disagree */
@@ -878,7 +882,7 @@ function acceptProxyElement(b, pix){
     if (pix.alpha !== undefined) cell.al = pix.alpha;
     if (pix.start !== undefined) cell.s = pix.start;
     if (pix.temp !== undefined) cell.t = pix.temp;
-    cell.px = pix; b.dirty = true;
+    cell.px = pix; b.dirty = true; b.animDirty = 1;
     return true;
   }
   b.cells.delete(pix.ck); b.proxies.delete(gk);
@@ -887,7 +891,6 @@ function acceptProxyElement(b, pix){
   return true;
 }
 function watchProxies(b){
-  var sum = {}, cnt = {}, chg = {};
   b.proxies.forEach(function(pix, gk){
     if (pix.del && pix.sub === b.id){
       b.proxies.delete(gk); if (b.cells.delete(pix.ck)) b.dirty = true; return;
@@ -901,9 +904,9 @@ function watchProxies(b){
       cell = b.cells.get(pix.ck); if (!cell) return;   /* it left the body: nothing left to watch here */
     }
     var an = animOf(cell.e); if (an.col) cell.c = pix.color; if (an.alp) cell.al = pix.alpha; cell.px = pix;
-    sum[pix.ck] = (sum[pix.ck] || 0) + pix.temp; cnt[pix.ck] = (cnt[pix.ck] || 0) + 1; if (pix.charge) chg[pix.ck] = 1;
+    cell.t = pix.temp; cell.chg = pix.charge ? 1 : 0;      /* one pixel per cell: no averaging to do */
   });
-  b.cells.forEach(function(cell, k){ if (cnt[k]) cell.t = sum[k]/cnt[k]; cell.chg = chg[k] ? 1 : 0; });
+  if (b.animDirty && b.anim) b.anim = undefined;           /* a material change may add or remove animation */
 }
 
 /* ---------------------------------------------------- dirty / splitting */
@@ -1262,30 +1265,39 @@ function surfaceNear(minX, maxX, minY, maxY){
   }
   return null;
 }
+var FI_ROWS = new Map(), FI_USED = [], FI_OUT = { n:0, cx:0, cy:0, rho:1000 };
 function fluidInfo(b, R){
-  var rows = {}, i, gx, gy, k, own = new Set(), minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  var rows = FI_ROWS, used = FI_USED, i, gx, gy, k, minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+  for (i = 0; i < used.length; i++){ var ua = rows.get(used[i]); ua[0] = 1e9; ua[1] = -1e9; }
+  used.length = 0;
   for (i = 0; i < R.gx.length; i++){
-    gx = R.gx[i]; gy = R.gy[i]; own.add(GK(gx, gy));
+    gx = R.gx[i]; gy = R.gy[i];
     if (gx < minX) minX = gx; if (gx > maxX) maxX = gx; if (gy < minY) minY = gy; if (gy > maxY) maxY = gy;
-    var r = rows[gy]; if (!r) rows[gy] = [gx,gx]; else { if (gx < r[0]) r[0] = gx; if (gx > r[1]) r[1] = gx; }
+    var r = rows.get(gy);
+    if (!r){ r = [gx, gx]; rows.set(gy, r); used.push(gy); }
+    else { if (gx < r[0]) r[0] = gx; if (gx > r[1]) r[1] = gx; }
   }
+  var out = b.flR || (b.flR = { n:0, cx:0, cy:0, rho:1000 });
   var S = surfaceNear(minX, maxX, minY, maxY);
-  if (!S || maxY + 0.5 <= S.edge) return { n:0, cx: b.x, cy: b.y, rho: 1000 };
+  if (!S || maxY + 0.5 <= S.edge){ out.n = 0; out.cx = b.x; out.cy = b.y; out.rho = 1000; return out; }
   var cnt = 0, sx = 0, sy = 0;
   for (i = 0; i < R.gx.length; i++){
     var f = clamp(R.gy[i] + 0.5 - S.edge, 0, 1);
     if (f > 0){ cnt += f; sx += R.gx[i]*f; sy += R.gy[i]*f; }
   }
-  for (k in rows){
-    var f2 = clamp(+k + 0.5 - S.edge, 0, 1); if (f2 <= 0) continue;
-    var row = rows[k];
+  for (var ui = 0; ui < used.length; ui++){
+    k = used[ui];
+    var f2 = clamp(k + 0.5 - S.edge, 0, 1); if (f2 <= 0) continue;
+    var row = rows.get(k);
     for (var x = row[0] + 1; x < row[1]; x++){
-      if (own.has(GK(x, +k))) continue;
-      var q = outOfBounds(x, +k) ? null : pixelMap[x][+k];
-      if (!q || (q.sub === undefined && elements[q.element] && elements[q.element].state === "gas")){ cnt += f2; sx += x*f2; sy += (+k)*f2; }
+      if (outOfBounds(x, k)) continue;
+      var q = pixelMap[x][k];
+      if (q && q.sub === b.id) continue;                       // this body's own cell
+      if (!q || (q.sub === undefined && elements[q.element] && elements[q.element].state === "gas")){ cnt += f2; sx += x*f2; sy += k*f2; }
     }
   }
-  return { n:cnt, cx: cnt ? sx/cnt : b.x, cy: cnt ? sy/cnt : b.y, rho: S.rho };
+  out.n = cnt; out.cx = cnt ? sx/cnt : b.x; out.cy = cnt ? sy/cnt : b.y; out.rho = S.rho;
+  return out;
 }
 
 /* ------------------------------------------------ falling: support detection */
@@ -1936,9 +1948,9 @@ runEveryTick(function(){
   var ids = Object.keys(BODIES), i, b;
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead) continue;
-    var asleep = b.pb && !b.pb.isAwake(), ph0 = (pixelTicks + (b.slI || 0)) % 3;
+    var asleep = b.pb && !b.pb.isAwake(), ph0 = (pixelTicks + (b.slI || 0)) % 6;
     if (asleep ? ph0 === 0
-              : (b.proxies.size > 220 ? ph0 === 0 : ((pixelTicks + (b.slI || 0)) % 2) === 0)) watchProxies(b);   // every 2nd tick, big bodies every 3rd
+              : (b.proxies.size > 220 ? ph0 === 0 : ((pixelTicks + (b.slI || 0)) % 3) === 0)) watchProxies(b);   // small bodies every 3rd tick, big ones every 6th
   }
   for (i = 0; i < ids.length; i++){ b = BODIES[ids[i]]; if (b && !b.dead && b.dirty) fixBody(b); }
   if ((pixelTicks % 30) === 0){                        /* materials that turned out not to be solids lose their body */
@@ -2027,7 +2039,7 @@ runEveryTick(function(){
   }
   if (pixelTicks % 20 === 0) TERRAIN_DIRTY = 1;               // safety net for changes no hook sees (acid, fire, saves)
   if (TERRAIN_DIRTY){ TERRAIN_DIRTY = 0; TE++; refreshTerrain(); }
-  else if (pixelTicks % 3 === 0 || maxSp > 0.6) refreshTerrain();
+  else if (pixelTicks % 2 === 0) refreshTerrain();
   /* direct powder push: scan the surface of each body's proxy footprint (uses live velocity pre-step) */
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb || b.pb.getType() !== "dynamic" || !b.pb.isAwake()) continue;
@@ -2078,27 +2090,30 @@ runEveryTick(function(){
   for (i = 0; i < ids.length; i++){
     b = BODIES[ids[i]]; if (!b || b.dead || !b.pb) continue;
     var ps = b.pb.getPosition(); b.x = ps.x; b.y = ps.y; b.a = b.pb.getAngle();
-    if (Math.abs(b.x - b.sx) + Math.abs(b.y - b.sy) > 0.02 || Math.abs(b.a - b.sa) > 0.01){
+    var sdx = Math.abs(b.x - b.sx) + Math.abs(b.y - b.sy), sda = Math.abs(b.a - b.sa);
+    if (b.dirty || b.needSync || sdx > 0.14 || sda > 0.02){
       var R0 = (b.Rtick && b.Rt === pixelTicks && Math.abs(b.Rx - b.x) < 0.06 && Math.abs(b.Ry - b.y) < 0.06 && Math.abs(b.Ra - b.a) < 0.04) ? b.Rtick : null;
       syncProxies(b, R0);
     }
   }
   try { animateBodies(); } catch(e){}   /* last word on animated colours/alpha, after every rebuild */
 });
+var PX_S = { x:0, y:0, element:"", start:0, colorstart:0, temp:20, color:0, alpha:1 };
 runPerPixel(function(p){
   if (p.sub !== undefined){
     var b = BODIES[p.sub];
-    if (!b || b.proxies.get(GK(p.x, p.y)) !== p) p.sub = undefined;
-    else {
+    if (!b || b.dead || pixelMap[p.x] === undefined || pixelMap[p.x][p.y] !== p){ p.sub = undefined; return; }
+    if (!b.anim && b.anim !== undefined) return;             /* plain material: nothing per pixel to do */
+    {
       /* last word for this pixel in the frame: the object's own phase, never the engine's rounded one */
       var c0 = b.cells.get(p.ck);
       if (c0){
         var a0 = animOf(c0.e);
         if (a0.anim && a0.pure){
-          var ph0 = animPhase(b, c0);
-          var s0 = { x: ph0[0], y: ph0[1], element: c0.e,
-                     start: c0.s === undefined ? pixelTicks : c0.s, colorstart: c0.s === undefined ? pixelTicks : c0.s,
-                     temp: c0.t === undefined ? 20 : c0.t, color: p.color, alpha: p.alpha === undefined ? 1 : p.alpha };
+          var ph0 = animPhase(b, c0), s0 = PX_S;
+          s0.x = ph0[0]; s0.y = ph0[1]; s0.element = c0.e;
+          s0.start = c0.s === undefined ? pixelTicks : c0.s; s0.colorstart = s0.start;
+          s0.temp = c0.t === undefined ? 20 : c0.t; s0.color = p.color; s0.alpha = p.alpha === undefined ? 1 : p.alpha;
           try { (elements[c0.e].tick1 || elements[c0.e].tick).call(elements[c0.e], s0); } catch(err){ s0 = null; }
           if (s0){
             if (a0.col && s0.color !== undefined) p.color = s0.color;
